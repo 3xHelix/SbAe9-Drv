@@ -26,6 +26,9 @@ playback.
   ACM head unit connected.
 - Developed/tested on Fedora 44 KDE, kernels `7.2.13` and `7.2.14`
   (`-200.fc44.x86_64`).
+- No `iommu=pt` needed: tested on an AMD system with the IOMMU in its
+  default translated mode, with no IOMMU page faults from the card. (Drivers
+  built on the kernel's ca0132 code report needing it; this one doesn't.)
 - Only tested on the IDT-bridge version of the card. AE-9s exist with an
   IDT/Tundra Tsi381 (`10e3:8111`) or an ASMedia ASM1083/1085 (`1b21:1080`)
   PCIe-to-PCI bridge. To see which one sits above your card:
@@ -144,7 +147,8 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   DSP ("tail replay done: ... N failed", DBGCNTL 0x00003400 instead of
   0x004d0000): playback works but recording is dead (arecord EIO), and a
   warm reboot doesn't clear it. Power off at the PSU for ~30 s to recover.
-  Reboot instead of reloading where you can.
+  Reboot instead of reloading where you can. The log line `DSP health:`
+  after each startup warns when this has happened.
 - A very small PipeWire quantum (64) can drop out under heavy CPU load
   (`pw-top` ERR column); 128 or more is fine.
 - After one warm reboot the first playback was silent until a new stream
@@ -170,7 +174,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 |---|---|
 | `creative_ae9_core.c` | PCI probe, bus reset, HDA reset, codec detection, Windows replays (pre-download, post-boot), head-unit poll/display/knob and ALSA volume controls, debugfs, module params |
 | `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands |
-| `creative_ae9_i2c.c` | Head-unit SPI frames |
+| `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
 | `creative_ae9_pcm.c` | ALSA PCM playback and capture (2 ch S32_LE 48 kHz) |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |

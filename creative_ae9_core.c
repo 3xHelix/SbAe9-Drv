@@ -888,6 +888,44 @@ static void retry_add(struct tail_msg *retry, unsigned int *nretry,
 	(*nretry)++;
 }
 
+/*
+ * One-line DSP health summary after the startup tail, for the log only.
+ * Word 5 of the overlay's jump table at XRAM 0x3f3a0 is written only by the
+ * overlay transfer and reads 0x04000086 when it landed (the value the other
+ * AE-9 projects check; same overlay file). DBGCNTL 0x00003400 is what we see
+ * when the DSP has stalled after repeated reloads (healthy boots show
+ * 0x00470000 / 0x00490000 / 0x004d0000). Nothing acts on the result.
+ */
+#define AE9_OVL_CHECK_ADDR	0x3f3b4
+#define AE9_OVL_CHECK_WANT	0x04000086
+#define AE9_DBGCNTL_STALLED	0x00003400
+
+static void creative_ae9_dsp_health(struct creative_chip *chip, u32 dbgcntl)
+{
+	unsigned int ovl = 0;
+	bool ovl_ok, stalled = dbgcntl == AE9_DBGCNTL_STALLED;
+
+	if (!chip->overlay_sent) {
+		dev_info(chip->dev, "DSP health: overlay not sent, not checked; DBGCNTL 0x%08x%s\n",
+			 dbgcntl, stalled ? " (stall pattern)" : "");
+		return;
+	}
+	if (creative_dsp_chipio_read(chip, AE9_OVL_CHECK_ADDR, &ovl) < 0) {
+		dev_warn(chip->dev, "DSP health: overlay check read failed; DBGCNTL 0x%08x%s\n",
+			 dbgcntl, stalled ? " (stall pattern)" : "");
+		return;
+	}
+	creative_dsp_chipio_addr_invalidate();
+	ovl_ok = ovl == AE9_OVL_CHECK_WANT;
+	if (ovl_ok && !stalled)
+		dev_info(chip->dev, "DSP health: ok (overlay 0x%08x, DBGCNTL 0x%08x)\n",
+			 ovl, dbgcntl);
+	else
+		dev_warn(chip->dev, "DSP health: overlay 0x%08x (%s), DBGCNTL 0x%08x (%s); if recording is dead, power off at the PSU\n",
+			 ovl, ovl_ok ? "ok" : "want 0x04000086",
+			 dbgcntl, stalled ? "stall pattern" : "ok");
+}
+
 static void creative_ae9_post_fw(struct creative_chip *chip)
 {
 	struct tail_msg *retry;
@@ -979,6 +1017,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	dev_info(chip->dev,
 		 "fw_split: tail replay done: %u SCP msgs (%u failed, %u skipped), %u verbs (%u failed); DBGCNTL 0x%08x\n",
 		 msgs, msg_err, msg_skipped, verbs, verb_err, dbg);
+	creative_ae9_dsp_health(chip, dbg);
 	if (nretry) {
 		unsigned int k, ok = 0;
 
@@ -1968,7 +2007,12 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 
 /* Knob turn: c2 reply f0 c2 04 <dir> <steps> .., dir 0 = clockwise, ~2
  * steps per click. Button: bit 7 of the 83 01 02 reply's status byte reads
- * 0 while held (b5 -> 35). Returns the signed step count. */
+ * 0 while held (b5 -> 35). Plugs, same byte, 0 = plugged in (checked on the
+ * card 2026-11-03): bit 5 = 3.5 mm headphone jack, bit 4 = 3.5 mm mic jack.
+ * The 6.3 mm headphone jack, the XLR/TRS combo jack (a TRS plug set bit 4
+ * once in 4 tries) and XLR plugs are effectively not reported. Plug changes
+ * are only logged; the driver never switches output on them. Returns the
+ * signed step count. */
 static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 				 int n, int *press_ms)
 {
@@ -1976,6 +2020,21 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 		return r[3] ? -r[4] : r[4];
 	if (r[1] == 0x83 && n >= 6 && r[3] == 0x02) {
 		bool down = !(r[4] & 0x80);
+		u8 st = r[4] & 0x7f;
+		u8 chg = chip->hu_status_valid ? st ^ chip->hu_status : 0x30;
+
+		if (chg & 0x20)
+			dev_info(chip->dev, "head unit: 3.5 mm headphone plug %s\n",
+				 (st & 0x20) ? "out" : "in");
+		if (chg & 0x10)
+			dev_info(chip->dev, "head unit: mic/line plug %s\n",
+				 (st & 0x10) ? "out" : "in");
+		/* bit 6 (headphone amp) follows every output switch: not logged */
+		if (chg & ~0x70)
+			dev_info(chip->dev, "head unit: status 0x%02x (other bits changed: 0x%02x)\n",
+				 r[4], chg & ~0x70);
+		chip->hu_status = st;
+		chip->hu_status_valid = true;
 
 		if (down && !chip->hu_btn_down) {
 			chip->hu_btn_since = jiffies;

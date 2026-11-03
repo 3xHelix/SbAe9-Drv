@@ -3,6 +3,29 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.2.1 (2026-11-03)
+
+Small update: better logging, and fewer slow starts.
+
+- Fixed: a needless firmware retry on about half of startups and resumes.
+  The DSP briefly reports a firmware chunk as finished while it is still
+  loading; the driver now double-checks before moving on, so startup no
+  longer stalls 2-4 s for a retry.
+- New log line after every startup: `DSP health: ok`, or a warning when the
+  DSP did not come up right (with a hint to power off at the PSU if
+  recording is dead).
+- New log lines when a plug goes in or out of the head unit's 3.5 mm
+  headphone or 3.5 mm mic jack. Logging only: the driver never switches
+  between speakers and headphones by itself. (The 6.3 mm headphone jack and
+  the XLR/TRS combo jack are not reported by the head unit.)
+- Groundwork for sample rates other than 48 kHz (the stream format is now
+  built for 8-192 kHz). Playback and recording still run at 48 kHz only.
+- README: `iommu=pt` is not needed (tested on AMD with the IOMMU on).
+- Tested on kernel 7.2.14 (Fedora 44): boot, sleep and wake on speakers and
+  headphones, playback, recording, output switching.
+
+Upgrading from 0.2.0: replace the module, `sudo depmod -a`, reboot.
+
 ## 0.2.0 (2026-11-03)
 
 Stability release: every item from a full code review, plus fixes found

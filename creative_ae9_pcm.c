@@ -26,19 +26,47 @@
 #define CREATIVE_PCM_BDL_SIZE		(CREATIVE_PCM_BDL_ENTRIES * 16)
 
 /*
- * Build the 8-bit SD_FORMAT value (standard HDA encoding).
- * Bit 7   : sample base rate (0 = 48 kHz, 1 = 44.1 kHz)
- * Bits 6:4: bits per sample  (1 = 16, 2 = 20, 3 = 24, 4 = 32)
- * Bits 3:0: number of channels minus 1
+ * Build the 16-bit SDnFMT value (HD-Audio spec 3.7.1, same as the codec's
+ * converter format):
+ * Bit 14    : base rate (0 = 48 kHz, 1 = 44.1 kHz)
+ * Bits 13:11: base multiplier minus 1 (x1..x4)
+ * Bits 10:8 : base divisor minus 1 (/1../8)
+ * Bits 6:4  : bits per sample (1 = 16, 2 = 20, 3 = 24, 4 = 32)
+ * Bits 3:0  : number of channels minus 1
+ * 2 ch, 24-bit, 48 kHz is 0x0031. The PCM only offers 48 kHz today; the
+ * other rates are here for when the per-rate clock setup is added.
  */
-static unsigned char creative_ae9_format_val(unsigned int channels,
-					     unsigned int bits,
-					     unsigned int rate)
-{
-	unsigned char val = 0;
+static const struct {
+	unsigned int rate;
+	u16 bits;
+} creative_ae9_rate_bits[] = {
+	{   8000, (0 << 14) | (0 << 11) | (5 << 8) },	/* 48k / 6 */
+	{  11025, (1 << 14) | (0 << 11) | (3 << 8) },	/* 44.1k / 4 */
+	{  16000, (0 << 14) | (0 << 11) | (2 << 8) },	/* 48k / 3 */
+	{  22050, (1 << 14) | (0 << 11) | (1 << 8) },	/* 44.1k / 2 */
+	{  32000, (0 << 14) | (1 << 11) | (2 << 8) },	/* 48k * 2 / 3 */
+	{  44100, (1 << 14) },
+	{  48000, 0 },
+	{  88200, (1 << 14) | (1 << 11) },		/* 44.1k * 2 */
+	{  96000, (0 << 14) | (1 << 11) },		/* 48k * 2 */
+	{ 176400, (1 << 14) | (3 << 11) },		/* 44.1k * 4 */
+	{ 192000, (0 << 14) | (3 << 11) },		/* 48k * 4 */
+};
 
-	if (rate > 48000)
-		val |= BIT(7);
+static u16 creative_ae9_format_val(unsigned int channels, unsigned int bits,
+				   unsigned int rate)
+{
+	u16 val = 0;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(creative_ae9_rate_bits); i++)
+		if (creative_ae9_rate_bits[i].rate == rate)
+			break;
+	if (i < ARRAY_SIZE(creative_ae9_rate_bits))
+		val |= creative_ae9_rate_bits[i].bits;
+	else
+		WARN_ONCE(1, "creative-ae9: no SDnFMT encoding for %u Hz, using 48 kHz\n",
+			  rate);
 	switch (bits) {
 	case 16: val |= (1 << 4); break;
 	case 20: val |= (2 << 4); break;
@@ -251,7 +279,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	unsigned int base = chip->playback_stream_base;
 	unsigned int buf_size = snd_pcm_lib_buffer_bytes(substream);
 	unsigned int period_size = snd_pcm_lib_period_bytes(substream);
-	unsigned char format;
+	u16 format;
 	dma_addr_t addr;
 	int i;
 
@@ -519,6 +547,8 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	if (!chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, true);
 		chip->cap_start_sent = 1;
+		dev_info(chip->dev, "capture prepare: SD_FMT=0x%04x\n",
+			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));
 	}
 	return 0;
 }

@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Creative AE-9 DSP I2C / ACM (Audio Control Module) communication
+// Creative AE-9 ACM (Audio Control Module, the head unit) communication
 //
-// The AE-9 head unit (front-panel -AE9- display, ESS DAC, XAMP) is
-// controlled via I2C through DSP registers in the extension BAR.
+// The head unit (display, knob, buttons, headphone amp) talks to the card
+// over a serial port: a 16550-style UART in BAR2, with 32-bit registers at a
+// stride of 4. Messages are MIDI-style sysex frames, 0xf0 <cmd> <len> [data]
+// 0xf7. Early in this project the link was taken for I2C and then SPI; the
+// function and constant names (creative_spi_frame*, I2C_START, DSP_REG_*)
+// still say so. The UART layout comes from the sb-ae9 projects' decompile
+// of Windows' CtxHdb.sys and matches every access in our captures.
 //
-// Register map (all offsets relative to BAR2):
-//   0xC00 = I2C_CMD   — write I2C transaction bytes here
-//   0xC04 = I2C_DATA  — auxiliary data / trigger
-//   0xC08 = I2C_FIFO  — FIFO writes for DSP init
-//   0xC0C = I2C_CTRL  — control/status (0x03 = I2C mode, 0x80|mode = init)
-//   0xC14 = I2C_RESP  — response data (polled after I2C stop)
-//   0xC7C = DSP_STS   — DSP status (0x6 = ready, 0x3 = ready, 0x7 = busy)
-//   0x320 = STREAM_PARAM — stream parameter (select I2C target?)
+// Register map (BAR2 offsets):
+//   0xC00 = data (THR on write, RBR on read)        our DSP_REG_CMD
+//   0xC04 = interrupt enable (IER)                   our DSP_REG_DATA
+//   0xC08 = FIFO control (FCR)                       our DSP_REG_FIFO
+//   0xC0C = line control (LCR): 0x83 = divisor-latch access (baud setup),
+//           0x03 = 8 data bits, no parity, 1 stop   our DSP_REG_CTRL
+//   0xC14 = line status (LSR): 0x40 = transmitter empty, bit 0 = byte
+//           received. The "0x40 ACK / 0x41 byte ready" handshake below is
+//           these two bits.                          our DSP_REG_RESP
+//   0xC7C = not a UART register; polled by Windows as a busy/ready status
+//   0x320 = card GPIO (not part of the UART)
 //
-// Reference: ae9_mmio_capture.txt lines 68-108, 63986-64059+
+// Reference: ae9_mmio_capture.txt lines 68-108, 63986-64059+;
+// DarkNikGr/sb-ae9 docs/reverse-engineering/ctxhda-acm-analysis.md §3.2.
 //
 
 #include <linux/delay.h>
@@ -38,7 +47,7 @@ unsigned int acm_i2c_debug;
 module_param(acm_i2c_debug, uint, 0644);
 MODULE_PARM_DESC(acm_i2c_debug, "Log per-transaction ACM I2C handshake (1=on)");
 
-/* DSP I2C register offsets in extension BAR */
+/* Head-unit UART registers in BAR2 (historical names, see the top) */
 #define DSP_REG_CMD		0xC00
 #define DSP_REG_DATA		0xC04
 #define DSP_REG_FIFO		0xC08
@@ -47,7 +56,7 @@ MODULE_PARM_DESC(acm_i2c_debug, "Log per-transaction ACM I2C handshake (1=on)");
 #define DSP_REG_STS		0xC7C
 #define DSP_REG_STREAM_PARAM	0x320
 
-/* I2C transaction markers */
+/* Sysex frame start / end bytes (historical names) */
 #define I2C_START	0xf0
 #define I2C_STOP	0xf7
 

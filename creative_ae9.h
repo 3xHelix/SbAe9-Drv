@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.2.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.2.1"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -252,6 +252,11 @@ struct creative_chip {
 	unsigned int		hu_btn_down;
 	unsigned long		hu_btn_since;
 	unsigned long		hu_btn_seen;	/* last press seen by the fast poll */
+	/* 83 01 02 status byte without bit 7 (knob button), for the plug
+	 * log. Logged only; output switching stays manual. */
+	bool			hu_status_valid;
+	u8			hu_status;
+	bool			overlay_sent;	/* overlay transfer ran this bring-up */
 	unsigned long		hu_next_full;
 };
 

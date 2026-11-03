@@ -1196,6 +1196,7 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			chan = ~0U;
 			if (overlay)
 				ret = dsp_overlay_xfer(chip, &chan);
+			chip->overlay_sent = (ret == 0);
 			if (ret && chan == ~0U) {
 				ret = scp_get_u32(chip, MASTERCONTROL, 0x0a, &chan);
 				dev_info(chip->dev,
@@ -1258,6 +1259,14 @@ static bool dsp_is_dma_active(struct creative_chip *chip, unsigned int dma_chan)
 
 	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &reg);
 	return (reg & (1 << (DSPDMAC_CHNLSTART_EN_LOBIT + dma_chan))) != 0;
+}
+
+/* Read the channel's active bit again 1 ms later, to confirm a first read. */
+static bool dsp_dma_active_again(struct creative_chip *chip,
+				 unsigned int dma_chan)
+{
+	usleep_range(1000, 1500);
+	return dsp_is_dma_active(chip, dma_chan);
 }
 
 static int dsp_dma_setup_common(struct creative_chip *chip,
@@ -3069,6 +3078,7 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 
 	while (words_to_write != 0) {
 		u32 lpib0, lpib1;
+		unsigned int flicker;
 
 		run_size_words = min(buffer_size_words, words_to_write);
 		if (dl_reset_chunks)
@@ -3126,21 +3136,37 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 			hci_write = NULL;
 		}
 
+		/*
+		 * Wait for the DSP DMA channel to go idle. A single "idle" read
+		 * can be wrong while the chunk is still running (seen on resume:
+		 * the loop stopped after 21 ms and the next read said busy), so
+		 * only trust "idle" when a second read 1 ms later agrees.
+		 */
 		timeout = jiffies + msecs_to_jiffies(2000);
+		flicker = 0;
 		do {
-			if (!dsp_is_dma_active(chip, dma_chan))
-				break;
+			if (!dsp_is_dma_active(chip, dma_chan)) {
+				if (!dsp_dma_active_again(chip, dma_chan))
+					break;
+				flicker++;
+			}
 			msleep(20);
 		} while (time_before(jiffies, timeout));
+		if (flicker)
+			dev_info(chip->dev,
+				 "dspxfr: chunk addx=0x%x: %u idle read(s) not confirmed, kept waiting\n",
+				 chip_addx, flicker);
 
 		dma_run(dma, false);
 		/*
 		 * A chunk the DSP never finished is a partial firmware image:
 		 * the DSP then boots but runs broken (seen as a clipped,
 		 * full-scale XLR capture after a resume). Fail the load so the
-		 * bring-up retry starts over, rather than carrying on.
+		 * bring-up retry starts over, rather than carrying on. Two busy
+		 * reads in a row, for the same reason as above.
 		 */
-		if (dsp_is_dma_active(chip, dma_chan)) {
+		if (dsp_is_dma_active(chip, dma_chan) &&
+		    dsp_dma_active_again(chip, dma_chan)) {
 			dev_warn(chip->dev,
 				 "dspxfr: chunk addx=0x%x (%u words) did not complete (LPIB %x->%x); failing the firmware load\n",
 				 chip_addx, run_size_words, lpib0, lpib1);
