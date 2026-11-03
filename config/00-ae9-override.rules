@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1102", ATTR{device}=="0x0010", ATTR{subsystem_device}=="0x0071", ATTR{driver_override}="snd-hda-codec-creative-ae9"
