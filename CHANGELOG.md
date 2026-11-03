@@ -3,6 +3,30 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.3.0 (2026-11-03)
+
+High-resolution playback: 96 and 192 kHz.
+
+- **New, opt-in:** playback at 96 kHz and 192 kHz (24-bit), alongside 48 kHz.
+  Turn it on with `pcm_rates=1` (in `config/ae9-options.conf`, or at
+  runtime through `/sys/module/snd_hda_codec_creative_ae9/parameters/pcm_rates`),
+  then let PipeWire use the rates, e.g.
+  `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 ]'`
+  or `clock.force-rate 96000`. See README -> Using it.
+- The card is re-clocked for each stream the way Windows does it (rate
+  codes, I2S clock settings, full PLL program); going back to 48 kHz
+  restores the startup clock setup.
+- 44.1 and 88.2 kHz are not offered yet: they play sharp on this card, so
+  Windows does something more for that clock family. Leave them out of
+  PipeWire's allowed rates and it resamples those files (they play fine).
+- Recording stays at 48 kHz; it works at the same time as 96 kHz playback.
+- With the option off (the default) nothing changes from 0.2.1.
+- Tested on kernel 7.2.14: pitch at 48/96/192 kHz, PipeWire at 96 kHz,
+  mic during 96 kHz playback, output switching, sleep and wake.
+
+Upgrading from 0.2.x: replace the module, `sudo depmod -a`, reboot, then
+turn on `pcm_rates` if you want the higher rates.
+
 ## 0.2.1 (2026-11-03)
 
 Small update: better logging, and fewer slow starts.

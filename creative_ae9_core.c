@@ -720,7 +720,52 @@ static void creative_ae9_verb_block_replay(struct creative_chip *chip,
  * 0x80, 1, as in Windows' switch) and boost, or every new stream would
  * undo a headphone switch.
  */
-void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic)
+/*
+ * Per-rate values for the playback start block (pcm_rates=1). The block
+ * was captured at 48 kHz; for another rate the connection point 0xd0 rate
+ * code, node 0x02's converter format and the I2S clock descriptors
+ * (0x189000/04/08, 0x189024) are patched, and BAR2 0x100 bits 31:29 get the
+ * I2S rate code. Descriptors and rate codes are from DarkNikGr/sb-ae9's
+ * decompile of Windows' I2SM Start and their measurements; the 48 kHz row
+ * is exactly what our capture writes, and the startup tail writes the
+ * 96 kHz descriptors. Connection point codes are ca0132's sample-rate enum.
+ * 176.4 kHz is left out (reported silent), 384 kHz can't cross the HDA link.
+ * The 44.1/88.2 kHz rows play sharp and crackly on our card even with the
+ * connection point 0x70 rate and full PLL tail below, so the PCM doesn't
+ * offer them (pcm_rates); kept for when a capture shows the missing step.
+ */
+static const struct {
+	unsigned int rate;
+	u8 cp_code;	/* connection point sample-rate code */
+	u32 i2s_clk;	/* 0x189000/04/08 */
+	u32 i2s_rate;	/* 0x189024 */
+	u8 bar2_code;	/* BAR2 0x100 bits 31:29 */
+} ae9_pcm_rates[] = {
+	{  44100, 0x08, 0x0001f100, 0x00008005, 1 },
+	{  48000, 0x09, 0x0001f100, 0x00008005, 0 },
+	{  88200, 0x0a, 0x0001f101, 0x00014004, 3 },
+	{  96000, 0x0b, 0x0001f101, 0x00014004, 2 },
+	{ 192000, 0x0e, 0x0001f102, 0x00022003, 4 },
+};
+
+/* ASI 8, connection point 0x70's rate (startup sets 96 kHz; entry 6 is
+ * patched), Windows' full PLL/PMU program (as at boot), ASI 0xf. Verbs in
+ * the captured block's own encoding: 0x717/0x718 = ChipIO param id/value
+ * (0x1d select connection point, 0x1e its rate), 0x70d/0x70c = 8051
+ * PLL/PMU address/data, 0xf01 = status poll. */
+#define AE9_RATE_TAIL_CP70	6
+static const u32 ae9_rate_pll_tail[] = {
+	0x115f0100, 0x11571717, 0x11571808,
+	0x1157171d, 0x11571870, 0x1157171e, 0x1157180b,
+	0x11570d44, 0x11570cc8, 0x11570d43, 0x11570ccc,
+	0x11570d45, 0x11570ccb, 0x11570d40, 0x11570cc7,
+	0x11570d42, 0x11570ccd, 0x11570d41, 0x11570cce,
+	0x11570d51, 0x11570cdb,
+	0x115f0100, 0x11571717, 0x1157180f,
+};
+
+void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
+				  unsigned int rate)
 {
 	bool hp = chip->hu_output;
 
@@ -743,12 +788,60 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 	if (start) {
 		u32 *t = kmemdup(ae9_cold_pcm_start, sizeof(ae9_cold_pcm_start),
 				 atomic ? GFP_ATOMIC : GFP_KERNEL);
+		unsigned int r = 1;	/* the 48 kHz row: the block as captured */
+		u32 addr = 0, data = 0;
 		size_t i;
+		u32 b100;
 
 		if (!t)
 			return;
+		for (i = 0; i < ARRAY_SIZE(ae9_pcm_rates); i++)
+			if (ae9_pcm_rates[i].rate == rate)
+				r = i;
+		if (ae9_pcm_rates[r].rate != rate && rate)
+			dev_warn(chip->dev, "pcm_rates: no clock setup for %u Hz, using 48 kHz\n",
+				 rate);
+		b100 = creative_ext_readl(chip, 0x100);
+		creative_ext_writel(chip, 0x100, (b100 & 0x1fffffff) |
+				    ((u32)ae9_pcm_rates[r].bar2_code << 29));
+		if (ae9_pcm_rates[r].rate != 48000)
+			dev_info(chip->dev, "pcm_rates: playback at %u Hz (rate code 0x%02x, I2S 0x%05x/0x%05x, BAR2 0x100 0x%08x -> 0x%08x)\n",
+				 ae9_pcm_rates[r].rate, ae9_pcm_rates[r].cp_code,
+				 ae9_pcm_rates[r].i2s_clk, ae9_pcm_rates[r].i2s_rate,
+				 b100, creative_ext_readl(chip, 0x100));
 		for (i = 0; i < ARRAY_SIZE(ae9_cold_pcm_start); i++) {
 			u32 v = t[i];
+
+			/* ChipIO memory writes: address lo/hi, then data lo/hi */
+			if ((v & 0xffff0000) == 0x11500000)
+				addr = (addr & 0xffff0000) | (v & 0xffff);
+			else if ((v & 0xffff0000) == 0x11510000)
+				addr = (addr & 0xffff) | ((v & 0xffff) << 16);
+			if (addr == 0x189000 || addr == 0x189004 || addr == 0x189008)
+				data = ae9_pcm_rates[r].i2s_clk;
+			else if (addr == 0x189024)
+				data = ae9_pcm_rates[r].i2s_rate;
+			else
+				data = 0;
+			if (data && (v & 0xffff0000) == 0x11530000) {
+				t[i] = 0x11530000 | (data & 0xffff);
+				continue;
+			}
+			if (data && (v & 0xffff0000) == 0x11540000) {
+				t[i] = 0x11540000 | (data >> 16);
+				continue;
+			}
+			/* node 0x02 converter format (captured 0x0031) */
+			if (v == 0x10220031) {
+				t[i] = 0x10220000 | creative_ae9_stream_format(2, 24,
+						ae9_pcm_rates[r].rate);
+				continue;
+			}
+			/* connection point 0xd0 rate code (captured 0x09) */
+			if (i && v == 0x11571809 && t[i - 1] == 0x1157171e) {
+				t[i] = 0x11571800 | ae9_pcm_rates[r].cp_code;
+				continue;
+			}
 
 			/* ChipIO 0x718 data after 0x717 index 0x0d: output select */
 			if (i && (v & 0xffffff00) == 0x11571800 &&
@@ -764,6 +857,26 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 					       "pcm_windows: playback start block (headphones)" :
 					       "pcm_windows: playback start block");
 		kfree(t);
+		/*
+		 * The captured block only trims the PLL (0x40/0x42/0x41) before
+		 * the descriptors. Windows' rate change ends with the rate code,
+		 * the full PLL program and ASI on (I2SM Start step 8). Without it
+		 * the 44.1 kHz family stays on the 48 kHz clock (sharp, crackly).
+		 */
+		if (ae9_pcm_rates[r].rate != 48000 || chip->pcm_reclocked) {
+			u32 tail[ARRAY_SIZE(ae9_rate_pll_tail)];
+			bool fresh = ae9_pcm_rates[r].rate == 48000;
+
+			memcpy(tail, ae9_rate_pll_tail, sizeof(tail));
+			/* back at 48 kHz: 0x70 to 96 kHz (0x0b), as at boot */
+			tail[AE9_RATE_TAIL_CP70] = 0x11571800 |
+				(fresh ? 0x0b : ae9_pcm_rates[r].cp_code);
+			creative_ae9_verb_block_replay(chip, tail, ARRAY_SIZE(tail), atomic,
+						       fresh ?
+						       "pcm_rates: clocks back to the boot setup" :
+						       "pcm_rates: connection point 0x70 + full PLL program");
+			chip->pcm_reclocked = !fresh;
+		}
 	}
 	else
 		creative_ae9_verb_block_replay(chip, ae9_cold_pcm_stop,
@@ -3447,6 +3560,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 		chip->standup_done = 0;
 		chip->pcm_start_sent = 0;
 		chip->cap_start_sent = 0;
+		chip->pcm_reclocked = false;	/* the bring-up redoes the clocks */
 		atomic_set(&chip->scp_unsol, 0);
 		chip->scp_unsol_done = 0;
 		creative_dsp_chipio_addr_invalidate();

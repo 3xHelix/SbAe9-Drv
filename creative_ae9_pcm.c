@@ -33,8 +33,8 @@
  * Bits 10:8 : base divisor minus 1 (/1../8)
  * Bits 6:4  : bits per sample (1 = 16, 2 = 20, 3 = 24, 4 = 32)
  * Bits 3:0  : number of channels minus 1
- * 2 ch, 24-bit, 48 kHz is 0x0031. The PCM only offers 48 kHz today; the
- * other rates are here for when the per-rate clock setup is added.
+ * 2 ch, 24-bit, 48 kHz is 0x0031. Playback offers 48/96/192 kHz with
+ * pcm_rates=1; the other entries are unused.
  */
 static const struct {
 	unsigned int rate;
@@ -53,8 +53,8 @@ static const struct {
 	{ 192000, (0 << 14) | (3 << 11) },		/* 48k * 4 */
 };
 
-static u16 creative_ae9_format_val(unsigned int channels, unsigned int bits,
-				   unsigned int rate)
+u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
+				unsigned int rate)
 {
 	u16 val = 0;
 	unsigned int i;
@@ -147,6 +147,19 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 /* PCM open / close						  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * pcm_rates: 0 (default) = playback at 48 kHz only, as Windows' captured
+ * start block. 1 = playback also at 96 and 192 kHz: the start block is
+ * re-clocked for the stream's rate (creative_ae9_cold_pcm_replay). The
+ * 44.1 kHz family (44.1, 88.2) is not offered: with the same clock steps it
+ * plays sharp and crackly, so Windows changes something more for it (next
+ * capture). PipeWire resamples those files. Recording stays at 48 kHz.
+ * Writable at runtime; applies to streams opened afterwards.
+ */
+static unsigned int pcm_rates;
+module_param(pcm_rates, uint, 0644);
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only (default), 1 = 48/96/192 kHz");
+
 static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -165,9 +178,16 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	runtime->hw.rates = SNDRV_PCM_RATE_48000;
-	runtime->hw.rate_min = 48000;
-	runtime->hw.rate_max = 48000;
+	if (pcm_rates) {
+		runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000 |
+				    SNDRV_PCM_RATE_192000;
+		runtime->hw.rate_min = 48000;
+		runtime->hw.rate_max = 192000;
+	} else {
+		runtime->hw.rates = SNDRV_PCM_RATE_48000;
+		runtime->hw.rate_min = 48000;
+		runtime->hw.rate_max = 48000;
+	}
 	runtime->hw.buffer_bytes_max = 128 * 1024;
 	runtime->hw.period_bytes_min = 4096;
 	runtime->hw.period_bytes_max = 64 * 1024;
@@ -251,7 +271,7 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	 * re-prepare would otherwise leave node 0x02 unbound) */
 	if (chip->pcm_start_sent) {
 		if (pcm_stop_block)
-			creative_ae9_cold_pcm_replay(chip, false, false);
+			creative_ae9_cold_pcm_replay(chip, false, false, 0);
 		else
 			dev_info(chip->dev, "PCM hw_free: stop block skipped (pcm_stop_block=0)\n");
 		chip->pcm_start_sent = 0;
@@ -326,7 +346,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 			    CREATIVE_PCM_BDL_ENTRIES - 1);
 
 	/* pcm_windows: S32_LE container, 24-bit stream format (0x31) */
-	format = creative_ae9_format_val(runtime->channels,
+	format = creative_ae9_stream_format(runtime->channels,
 					 24,
 					 runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
@@ -341,9 +361,10 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	 * 0x02 to tag 1 itself. Once per open: xrun recovery re-prepares,
 	 * and replaying the block (12 SCP messages) each time flooded the
 	 * DSP. */
-	if (!chip->pcm_start_sent) {
-		creative_ae9_cold_pcm_replay(chip, true, false);
+	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate) {
+		creative_ae9_cold_pcm_replay(chip, true, false, runtime->rate);
 		chip->pcm_start_sent = 1;
+		chip->pcm_start_rate = runtime->rate;
 		dev_info(chip->dev, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
 	}
@@ -537,7 +558,7 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, period * periods);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, periods - 1);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT,
-			    creative_ae9_format_val(runtime->channels, 24,
+			    creative_ae9_stream_format(runtime->channels, 24,
 						    runtime->rate));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
