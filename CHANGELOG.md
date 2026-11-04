@@ -3,6 +3,30 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.6 (2026-11-04)
+
+Remember this morning? New kernel lands, I reboot, and before I can hear
+a thing I'm rebuilding the driver by hand. Never again.
+
+### Added
+
+- **DKMS.** `sudo scripts/dkms-install.sh` hands the driver to DKMS, and
+  from then on every new kernel gets it rebuilt automatically when dnf
+  installs it. Update the kernel, reboot, music. Run the script again
+  when you update the driver; `--remove` takes it back out. It cleans up
+  a hand-copied module so you never end up with two, and the driver stays
+  out of the initramfs like before (checked).
+
+Tested on kernel 7.2.15: install, reboot, the DKMS-built module loaded
+(same srcversion as the source). The real test is the next kernel update,
+and I'm kind of looking forward to it.
+
+Upgrading from 0.6.5: `sudo dnf install dkms kernel-devel` if you don't
+have them, then `sudo scripts/dkms-install.sh` and reboot. That's the last
+time you copy a .ko by hand.
+
+-- Joe
+
 ## 0.6.5 (2026-11-04)
 
 Spent the evening throwing music on and rebooting for fun, and the card

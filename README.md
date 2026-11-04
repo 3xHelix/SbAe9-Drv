@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.5):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.6):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -69,12 +69,28 @@ refuse a different one unless you pass `--force`.
 
 ### 2. Build and install
 
+**With DKMS (recommended):** new kernels get the driver rebuilt
+automatically, nothing to redo after a kernel update.
+
+```sh
+sudo dnf install dkms kernel-devel     # once
+sudo scripts/dkms-install.sh
+```
+
+Run the script again after updating the driver source (it replaces the
+old version). `sudo scripts/dkms-install.sh --remove` takes it out of
+DKMS. `dkms status` shows what's built for which kernel.
+
+**By hand:**
+
 ```sh
 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 sudo cp snd-hda-codec-creative-ae9.ko /lib/modules/$(uname -r)/extra/ && sudo depmod -a
 ```
 
-Redo both after every code change and kernel update.
+Redo both after every code change and kernel update. (The DKMS script
+deletes a hand-copied module for the kernels it installs for, so the two
+don't clash.)
 
 ### 3. Keep `snd_hda_intel` off the card
 
