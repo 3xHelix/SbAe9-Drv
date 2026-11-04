@@ -33,8 +33,11 @@
  * Bits 10:8 : base divisor minus 1 (/1../8)
  * Bits 6:4  : bits per sample (1 = 16, 2 = 20, 3 = 24, 4 = 32)
  * Bits 3:0  : number of channels minus 1
- * 2 ch, 24-bit, 48 kHz is 0x0031. Playback offers 48/96/192 kHz with
- * pcm_rates=1; the other entries are unused.
+ * 2 ch, 24-bit, 48 kHz is 0x0031. 384 kHz is beyond the link's x4
+ * multiplier: Windows sends it as 192 kHz with twice the channels (two
+ * stereo samples per frame, the same bytes in the same order), 0x1833.
+ * Playback offers 44.1-384 kHz with pcm_rates=1; the other entries are
+ * unused.
  */
 static const struct {
 	unsigned int rate;
@@ -51,6 +54,7 @@ static const struct {
 	{  96000, (0 << 14) | (1 << 11) },		/* 48k * 2 */
 	{ 176400, (1 << 14) | (3 << 11) },		/* 44.1k * 4 */
 	{ 192000, (0 << 14) | (3 << 11) },		/* 48k * 4 */
+	{ 384000, (0 << 14) | (3 << 11) },		/* 192k, 2x channels */
 };
 
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
@@ -74,6 +78,8 @@ u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 	case 32: val |= (4 << 4); break;
 	default: val |= (1 << 4); break;
 	}
+	if (rate == 384000)
+		channels *= 2;
 	val |= (channels - 1) & 0xf;
 
 	return val;
@@ -149,16 +155,23 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 
 /*
  * pcm_rates: 0 (default) = playback at 48 kHz only, as Windows' captured
- * start block. 1 = playback also at 96 and 192 kHz: the start block is
- * re-clocked for the stream's rate (creative_ae9_cold_pcm_replay). The
- * 44.1 kHz family (44.1, 88.2) is not offered: with the same clock steps it
- * plays sharp and crackly, so Windows changes something more for it (next
- * capture). PipeWire resamples those files. Recording stays at 48 kHz.
- * Writable at runtime; applies to streams opened afterwards.
+ * start block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the
+ * way Windows does it (creative_ae9_cold_pcm_replay). 2 = also 44.1 and
+ * 88.2 kHz through the card's sample-rate converter: EXPERIMENTAL, it plays
+ * silent or garbled on our card so far (Windows played its first 44.1 kHz
+ * stream straight after startup; the clock state before it seems to
+ * matter). PipeWire resamples 44.1 kHz files when those rates are left out.
+ * Recording stays at 48 kHz.
+ * pcm_bits: 24 (default, as Windows' default format) or 32: the samples'
+ * full 32 bits go to the card (format 0x41..., which Windows also uses).
+ * Both writable at runtime; they apply to streams opened afterwards.
  */
 static unsigned int pcm_rates;
 module_param(pcm_rates, uint, 0644);
-MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only (default), 1 = 48/96/192 kHz");
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only (default), 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz (experimental)");
+static unsigned int pcm_bits = 24;
+module_param(pcm_bits, uint, 0644);
+MODULE_PARM_DESC(pcm_bits, "Playback sample bits sent to the card: 24 (default) or 32");
 
 static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 {
@@ -178,11 +191,17 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	if (pcm_rates) {
+	if (pcm_rates == 2) {
+		runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+				    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+				    SNDRV_PCM_RATE_192000 | SNDRV_PCM_RATE_384000;
+		runtime->hw.rate_min = 44100;
+		runtime->hw.rate_max = 384000;
+	} else if (pcm_rates) {
 		runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000 |
-				    SNDRV_PCM_RATE_192000;
+				    SNDRV_PCM_RATE_192000 | SNDRV_PCM_RATE_384000;
 		runtime->hw.rate_min = 48000;
-		runtime->hw.rate_max = 192000;
+		runtime->hw.rate_max = 384000;
 	} else {
 		runtime->hw.rates = SNDRV_PCM_RATE_48000;
 		runtime->hw.rate_min = 48000;
@@ -193,7 +212,8 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	runtime->hw.period_bytes_max = 64 * 1024;
 	runtime->hw.periods_min = 2;
 	runtime->hw.periods_max = 2;
-	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
+	chip->pcm_bits = pcm_bits == 32 ? 32 : 24;
+	snd_pcm_hw_constraint_msbits(runtime, 0, 32, chip->pcm_bits);
 	chip->pcm_start_sent = 0;
 
 	return 0;
@@ -271,7 +291,7 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	 * re-prepare would otherwise leave node 0x02 unbound) */
 	if (chip->pcm_start_sent) {
 		if (pcm_stop_block)
-			creative_ae9_cold_pcm_replay(chip, false, false, 0);
+			creative_ae9_cold_pcm_replay(chip, false, false, 0, 0);
 		else
 			dev_info(chip->dev, "PCM hw_free: stop block skipped (pcm_stop_block=0)\n");
 		chip->pcm_start_sent = 0;
@@ -345,10 +365,9 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI,
 			    CREATIVE_PCM_BDL_ENTRIES - 1);
 
-	/* pcm_windows: S32_LE container, 24-bit stream format (0x31) */
-	format = creative_ae9_stream_format(runtime->channels,
-					 24,
-					 runtime->rate);
+	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41) */
+	format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
+					    runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
 
 	/* Write BDL pointer as fallback */
@@ -361,10 +380,12 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	 * 0x02 to tag 1 itself. Once per open: xrun recovery re-prepares,
 	 * and replaying the block (12 SCP messages) each time flooded the
 	 * DSP. */
-	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate) {
-		creative_ae9_cold_pcm_replay(chip, true, false, runtime->rate);
+	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate ||
+	    chip->pcm_start_fmt != format) {
+		creative_ae9_cold_pcm_replay(chip, true, false, runtime->rate, format);
 		chip->pcm_start_sent = 1;
 		chip->pcm_start_rate = runtime->rate;
+		chip->pcm_start_fmt = format;
 		dev_info(chip->dev, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
 	}

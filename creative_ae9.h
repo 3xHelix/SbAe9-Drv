@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.3.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.4.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -229,7 +229,8 @@ struct creative_chip {
 	unsigned int		hs_done;	/* boot handshake already run */
 	unsigned int		pcm_start_sent;	/* pcm_windows start block sent since open */
 	unsigned int		pcm_start_rate;	/* stream rate that block was sent for */
-	bool			pcm_reclocked;	/* clocks left off the boot (96 kHz DSP) setup */
+	u16			pcm_start_fmt;	/* and its stream format */
+	unsigned int		pcm_bits;	/* 24 or 32, latched at open */
 	unsigned int		scp_unsol_done;
 	/* head unit (post_windows): volume as attenuation in 0.5 dB steps,
 	 * mute, pending apply, heartbeat ticks, last reply per poll frame */
@@ -332,7 +333,7 @@ int creative_dsp_post_relay_dac_levels(struct creative_chip *chip);
 int creative_dsp_select_out_params(struct creative_chip *chip);
 void creative_ae9_vlog(u32 val, u32 ex, bool is_resp);
 void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
-				  unsigned int rate);
+				  unsigned int rate, u16 format);
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);

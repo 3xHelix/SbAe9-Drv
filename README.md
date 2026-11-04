@@ -15,8 +15,9 @@ playback.
 > headphone jack, and a long hold toggles the knob light.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
-> 96 and 192 kHz is available as an option (`pcm_rates=1`); 44.1/88.2 kHz and
-> recording above 48 kHz are not done yet.
+> 96, 192 and 384 kHz, 24- or 32-bit, is available as an option
+> (`pcm_rates=1`, `pcm_bits=32`); 44.1/88.2 kHz playback and recording above
+> 48 kHz are not done yet.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -102,17 +103,19 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   desktop volume slider and mute drive the card (hardware volume), and the
   knob moves the slider and OSD. "Pro Audio" also plays, but uses software
   volume only.
-- The PCM takes 2 channels, S32_LE (24 significant bits; the card's output
-  converter takes 24-bit, like Windows). 48 kHz by default; with
-  `pcm_rates=1` playback also runs at 96 and 192 kHz (see below). Recording
-  is 48 kHz. PipeWire converts other rates.
-- Higher playback rates (opt-in): `pcm_rates=1` in `config/ae9-options.conf`,
-  or at runtime `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/pcm_rates`
+- The PCM takes 2 channels, S32_LE: 24 significant bits by default (as
+  Windows' default format), all 32 with `pcm_bits=32`. 48 kHz by default;
+  with `pcm_rates=1` playback also runs at 96, 192 and 384 kHz (see below).
+  Recording is 48 kHz. PipeWire converts other rates.
+- Higher playback rates (opt-in): `pcm_rates=1` (and `pcm_bits=32` for
+  32-bit) in `config/ae9-options.conf`, or at runtime, e.g.
+  `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/pcm_rates`
   (applies to streams opened afterwards). Then let PipeWire use them, e.g.
-  `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 ]'`
-  to follow 96/192 kHz files, or `clock.force-rate 96000` to always run at
-  96 kHz. Don't add 44100/88200: the card can't play that family yet (it
-  plays sharp), and PipeWire resamples those files when they're left out.
+  `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`
+  to follow 48 kHz-family files, or `clock.force-rate 96000` to always run
+  at 96 kHz. Don't add 44100/88200: that family isn't working yet
+  (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
+  PipeWire resamples those files when they're left out.
 - Recording: the head unit's XLR mic input (`arecord -D hw:AE9 -c 2 -r 48000
   -f S32_LE`, or the AE-9 input in PipeWire/Audacity). "XLR Gain" sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows). It is separate

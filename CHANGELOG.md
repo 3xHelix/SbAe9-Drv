@@ -3,6 +3,31 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.4.0 (2026-11-03)
+
+Higher rates and 32-bit, set up exactly as the Windows driver does it.
+
+- **384 kHz playback** (with `pcm_rates=1`). Windows sends it over the card's
+  link as 192 kHz with two samples per frame; the driver does the same.
+- **True 32-bit playback** with `pcm_bits=32` (default stays 24-bit, as
+  Windows). All 32 sample bits reach the card.
+- **Fixed: 192 kHz was slightly quieter** than 96 kHz. The card needs more
+  internal routing set up at higher rates (4 routes at 96, 8 at 192, 16 at
+  384); 0.3.0 only set the 48 kHz pair.
+- Rate changes now follow a new Windows capture step for step; steps that
+  came from guesswork (an extra clock register, a DSP rate and a PLL
+  reprogram) are gone.
+- 44.1 and 88.2 kHz are still not offered: Windows routes them through a
+  sample-rate converter in the card, which doesn't play right on Linux yet
+  (`pcm_rates=2` turns them on for testing only). PipeWire resamples those
+  files, so they play fine.
+- In PipeWire: `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`.
+- Tested on kernel 7.2.14: same pitch and level at 48/96/192/384 kHz in 24-
+  and 32-bit, PipeWire following file rates, playback through VLC.
+
+Upgrading from 0.3.0: replace the module, `sudo depmod -a`, reboot. Your
+`pcm_rates=1` keeps working and now includes 384 kHz.
+
 ## 0.3.0 (2026-11-03)
 
 High-resolution playback: 96 and 192 kHz.
