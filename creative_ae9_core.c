@@ -1061,10 +1061,11 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 	if (chip->pcm_start_sent)
 		creative_ae9_dsp_mode_start(chip, chip->pcm_start_fmt);
 	/*
-	 * The audio now passes the DSP's speaker volume (module 0x32), which
-	 * the start block leaves at Windows' capture-time -36.19 dB (bypassed
-	 * in Direct Mode). Our volume is the DAC's (the knob), so unity here.
-	 * Windows keeps 0x32 in step with its own volume instead.
+	 * DSP speaker volume (module 0x32) to 0 dB; the start block leaves
+	 * Windows' capture-time -36.19 dB there, and Windows keeps it in step
+	 * with its volume. It isn't in our speaker path, though (2026-11-04:
+	 * -20 dB and +6 dB there made no audible or measured difference), so
+	 * this only keeps the DSP's state tidy. Our volume is the DAC's.
 	 */
 	mutex_lock(&chip->replay_mutex);
 	creative_dsp_scp_send(chip, (3 << 17) | (0x20 << 8) | 0x32, &zero, 1);

@@ -22,6 +22,11 @@ playback.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
+> **Control panel:** [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) is a
+> Sound Blaster Command-style desktop app for this driver: SBX, the EQ and
+> its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
+> all in one window.
+
 ## Hardware / Environment
 
 - Creative Sound Blaster AE-9 — PCI `1102:0010`, subsystem `0x0071`
@@ -94,6 +99,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 
 ## Using it
 
+- Prefer a GUI? [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) gives
+  every control below a Sound Blaster Command-style window (Python 3 +
+  PySide6), and follows the knob and alsamixer live.
 - Output: the RCA jacks on the card (speaker mode, "-SP-") or the head
   unit's headphone jack ("-HP-"). Starts on speakers; switch with a 1.5-3.5 s
   knob hold or the "Head Unit Output" control. Each output remembers its own
