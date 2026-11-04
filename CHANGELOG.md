@@ -3,6 +3,25 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.5.0 (2026-11-03)
+
+Two new controls, both done the way the Windows driver does them.
+
+- **Mic level** ("Capture" in alsamixer): -89 to +9 dB in 1 dB steps, mute
+  at the bottom; default +9 dB, the level the mic had before. PipeWire uses
+  it as the mic's hardware volume, so the desktop microphone slider now
+  moves the card's own level. "XLR Gain" (0/+10/+20 dB preamp) stays a
+  separate control.
+- **DAC filter** ("DAC Filter"): Default, Fast or Slow roll-off for the
+  headphone/line-out DAC, as in the Creative app. Default leaves the
+  startup filter. Kept across sleep and wake.
+- Tested on kernel 7.2.14: recording at different mic levels, filter
+  switching during playback, sleep and wake.
+
+Upgrading from 0.4.0: replace the module, `sudo depmod -a`, reboot. Note
+that your desktop mic slider now sets the card's hardware level (100% =
++9 dB, as before).
+
 ## 0.4.0 (2026-11-03)
 
 Higher rates and 32-bit, set up exactly as the Windows driver does it.

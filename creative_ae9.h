@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.4.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.5.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -188,6 +188,9 @@ struct creative_chip {
 	size_t			cap_bdl_size;
 	unsigned int		cap_start_sent;
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
+	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
+	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
+	u8			dac48_07;	/* last value written to DAC 48/07 */
 
 	/* debugfs */
 	struct dentry		*dbg_dir;
@@ -344,6 +347,7 @@ int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 void creative_dsp_chipio_addr_invalidate(void);
 int creative_dsp_boot_handshake(struct creative_chip *chip);
 extern unsigned int ae9_ca0113_windows;
+void creative_ae9_mic_level_apply(struct creative_chip *chip);
 void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what);
 void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,

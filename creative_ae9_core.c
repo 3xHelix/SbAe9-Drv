@@ -2526,6 +2526,157 @@ static const struct snd_kcontrol_new mic_boost_control = {
 	.tlv.p = mic_boost_tlv,
 };
 
+/*
+ * "Capture Volume": the mic level, as Windows' Recording -> Levels slider
+ * sets it (capture 2026-11-03): codec 1 node 0x07's input amp (L, R) at
+ * step = dB + 90 (0x63 = +9 dB; 0x80 = mute), and DSP module 0x37 (mic
+ * volume) req 1 = 0 (unmute), req 2/3 = the same dB as a float, L and R.
+ * The 0x797/0x798 verb before each amp write carries the fraction of a dB
+ * in 1/64 steps (0 here, whole dB). 0 = mute, 1..99 = -89..+9 dB. The
+ * capture level and playback start blocks set +9 dB, so this is re-applied
+ * after them.
+ */
+static const DECLARE_TLV_DB_SCALE(mic_level_tlv, -9000, 100, 1);
+
+/* Whole numbers as IEEE-754 single bits (no FPU in the kernel). */
+static u32 ae9_int_f32(int v)
+{
+	u32 m = abs(v), e;
+
+	if (!m)
+		return 0;
+	e = fls(m) - 1;
+	return (v < 0 ? BIT(31) : 0) | ((e + 127) << 23) |
+	       ((m << (23 - e)) & 0x7fffff);
+}
+
+void creative_ae9_mic_level_apply(struct creative_chip *chip)
+{
+	int db = (int)chip->mic_level - 90;
+	u32 amp = chip->mic_level ? chip->mic_level : 0x80;
+	u32 resp, f = ae9_int_f32(chip->mic_level ? db : -90), zero = 0;
+
+	if (!chip->corb_buf || !chip->dsp_done)
+		return;
+	mutex_lock(&chip->replay_mutex);
+	creative_ae9_corb_send_verb_sync(chip, 0x10779700, &resp);
+	creative_ae9_corb_send_verb_sync(chip, 0x10736000 | amp, &resp);
+	creative_ae9_corb_send_verb_sync(chip, 0x10779800, &resp);
+	creative_ae9_corb_send_verb_sync(chip, 0x10735000 | amp, &resp);
+	creative_dsp_scp_send(chip, (1 << 17) | (0x20 << 8) | 0x37, &zero, 1);
+	creative_dsp_scp_send(chip, (2 << 17) | (0x20 << 8) | 0x37, &f, 1);
+	creative_dsp_scp_send(chip, (3 << 17) | (0x20 << 8) | 0x37, &f, 1);
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+}
+
+static int mic_level_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	ui->count = 1;
+	ui->value.integer.min = 0;
+	ui->value.integer.max = 99;
+	return 0;
+}
+
+static int mic_level_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->mic_level;
+	return 0;
+}
+
+static int mic_level_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, 99);
+
+	if (v == chip->mic_level)
+		return 0;
+	chip->mic_level = v;
+	creative_ae9_mic_level_apply(chip);
+	return 1;
+}
+
+static const struct snd_kcontrol_new mic_level_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Capture Volume",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_TLV_READ,
+	.info = mic_level_info,
+	.get = mic_level_get,
+	.put = mic_level_put,
+	.tlv.p = mic_level_tlv,
+};
+
+/*
+ * "DAC Filter": the ES9038's digital filter, as the Creative app sets it
+ * (capture 2026-11-03): Fast = DAC 48/07 bits 7:5 = 000 and DAC 49/0e
+ * bit 0 = 1; Slow = 001 and bit 0 = 0. "Default" leaves Windows' boot value
+ * (48/07 = 0x80). The choice is kept in every later 48/07 write
+ * (ca0113_list) and re-applied after a resume.
+ */
+static void creative_ae9_dac_filter_apply(struct creative_chip *chip)
+{
+	u8 cmds[2][3];
+
+	if (!chip->corb_buf || !chip->dsp_done || !chip->dac_filter)
+		return;
+	cmds[0][0] = 0x48;
+	cmds[0][1] = 0x07;
+	cmds[0][2] = chip->dac48_07;	/* ca0113_list puts the filter in */
+	cmds[1][0] = 0x49;
+	cmds[1][1] = 0x0e;
+	cmds[1][2] = chip->dac_filter == 1 ? 0x01 : 0x00;
+	creative_dsp_ca0113_replay_quiet(chip, (const u8 (*)[3])cmds, 2);
+}
+
+static int dac_filter_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	static const char * const names[] = { "Default", "Fast", "Slow" };
+
+	return snd_ctl_enum_info(ui, 1, 3, names);
+}
+
+static int dac_filter_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.enumerated.item[0] = chip->dac_filter;
+	return 0;
+}
+
+static int dac_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned int v = uv->value.enumerated.item[0];
+	u8 cmd[1][3] = { { 0x48, 0x07, 0 } };
+
+	if (v > 2 || v == chip->dac_filter)
+		return 0;
+	if (!v) {
+		/* back to Windows' boot filter (bits 7:5 = 100) */
+		chip->dac_filter = 0;
+		cmd[0][2] = (chip->dac48_07 & 0x1f) | 0x80;
+		if (chip->corb_buf && chip->dsp_done)
+			creative_dsp_ca0113_replay_quiet(chip,
+							 (const u8 (*)[3])cmd, 1);
+		return 1;
+	}
+	chip->dac_filter = v;
+	creative_ae9_dac_filter_apply(chip);
+	return 1;
+}
+
+static const struct snd_kcontrol_new dac_filter_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "DAC Filter",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = dac_filter_info,
+	.get = dac_filter_get,
+	.put = dac_filter_put,
+};
+
 /* "Head Unit Output": Speakers (card RCA) / Headphones (head unit). */
 static int hu_out_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
@@ -3293,6 +3444,9 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	if (enable_pcm) {
 		chip->mic_boost = 1;
 		snd_ctl_add(chip->card, snd_ctl_new1(&mic_boost_control, chip));
+		chip->mic_level = 99;	/* +9 dB, as Windows' capture blocks */
+		snd_ctl_add(chip->card, snd_ctl_new1(&mic_level_control, chip));
+		snd_ctl_add(chip->card, snd_ctl_new1(&dac_filter_control, chip));
 	}
 
 	/* IRQ before the card goes public: playback/capture need period
@@ -3610,6 +3764,9 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	if (!chip->hu_light)
 		creative_ae9_hu_light(chip, 0);
 	creative_ae9_mic_boost_apply(chip);
+	if (chip->mic_level != 99)
+		creative_ae9_mic_level_apply(chip);
+	creative_ae9_dac_filter_apply(chip);
 
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
 	dev_info(chip->dev, "resume: done after %u attempt(s), restoring output %s\n",

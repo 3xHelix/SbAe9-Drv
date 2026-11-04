@@ -383,6 +383,8 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate ||
 	    chip->pcm_start_fmt != format) {
 		creative_ae9_cold_pcm_replay(chip, true, false, runtime->rate, format);
+		if (chip->mic_level != 99)
+			creative_ae9_mic_level_apply(chip);
 		chip->pcm_start_sent = 1;
 		chip->pcm_start_rate = runtime->rate;
 		chip->pcm_start_fmt = format;
@@ -588,6 +590,8 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	 * must not resend it) */
 	if (!chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, true);
+		if (chip->mic_level != 99)
+			creative_ae9_mic_level_apply(chip);
 		chip->cap_start_sent = 1;
 		dev_info(chip->dev, "capture prepare: SD_FMT=0x%04x\n",
 			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));

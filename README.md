@@ -118,10 +118,17 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   PipeWire resamples those files when they're left out.
 - Recording: the head unit's XLR mic input (`arecord -D hw:AE9 -c 2 -r 48000
   -f S32_LE`, or the AE-9 input in PipeWire/Audacity). "XLR Gain" sets
-  the mic preamp to 0/+10/+20 dB (default +10, like Windows). It is separate
-  from the desktop microphone slider, which is software gain only; set it with
-  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'XLR Gain' 0|1|2`. Phantom power is the 48V button on
-  the head unit's front panel; the driver doesn't need to do anything.
+  the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
+  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'XLR Gain' 0|1|2`. "Capture"
+  is the mic level, -89 to +9 dB in 1 dB steps with mute at 0 (default +9 dB,
+  what Windows' recording setup uses), set the way Windows' Recording ->
+  Levels slider does it; PipeWire uses it as the mic's hardware volume, so
+  the desktop microphone slider moves it (100% = +9 dB). XLR Gain stays
+  separate. Phantom power is the 48V button on the head unit's front panel;
+  the driver doesn't need to do anything.
+- DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
+  ES9038's fast or slow roll-off, as the Creative app sets it; Default keeps
+  Windows' startup filter). Kept across sleep/resume.
 - Volume: turn the head-unit knob (0.5 dB per step, ~1 dB per click); press
   it to mute or unmute. The same setting is the ALSA "Master Playback
   Volume" / "Master Playback Switch" (`alsamixer -c AE9`; `hu_master=0`
