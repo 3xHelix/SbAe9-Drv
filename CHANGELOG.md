@@ -3,6 +3,59 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.5 (2026-11-04)
+
+Spent the evening throwing music on and rebooting for fun, and the card
+finally showed its hand. Two fixes that only matter on a bad day, which
+is exactly when you want them, plus a log you can actually read again.
+
+### Fixed
+
+- **The dark card.** Every so often a warm reboot comes up with the card
+  dead: lights off, no head unit, no sound. Happens in Windows too, so
+  it's the card being moody, not us. Pulled the logs: the card's main
+  chip just doesn't answer after the reboot. The old driver didn't take
+  the hint and kept talking to it for 2-3 minutes straight (that's the
+  "systemd-modules-load ... 2min 58s" crawl on boot), and THEN retried,
+  and the retry brought it right back. Now the driver notices in the
+  first second, skips the pointless part, and retries right away. A bad
+  reboot should cost you seconds now, not minutes and a PSU flip. If it
+  really won't come back, the log tells you plainly to power off at the
+  PSU.
+- **The overlay retry from 0.6.3 got its first real test**: a reboot at
+  17:32 hit the exact failure, the first transfer fell over, the second
+  one landed, boot carried on like nothing happened. Love to see it.
+- **"SBX Switch" is locked with Direct Mode on**, same as the SBX button
+  on the head unit. Mixers and the control panel snap back if you try.
+- Zero compiler warnings. Thirteen little leftovers from old experiments,
+  gone.
+
+### Changed
+
+- **The log is quiet now.** By default you get startup, the stuff you do
+  (Direct Mode, SBX, output switches, mutes) and anything that goes
+  wrong. All the per-stream chatter, router details and every single
+  volume step went behind a switch:
+  `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/debug`
+  brings it all back (2 adds the raw knob/button state), `echo 0` puts it
+  away. No reboot needed.
+
+### Learned (for the 5.1 crowd)
+
+Went back through the Windows capture where I stepped through every
+speaker layout: Windows always feeds the DSP 6 channels in DSP mode, even
+on 2.0, and the layout is one DSP setting. A lot of the 5.1 plumbing is
+already in place on the card's side. 5.1 is next on the list.
+
+Tested on kernel 7.2.15: a pile of reboots with music going, the overlay
+retry live, quiet logs with debug on and off, the SBX lock with the
+control panel.
+
+Upgrading from 0.6.4: rebuild, replace the module, `sudo depmod -a`,
+reboot.
+
+-- Joe
+
 ## 0.6.4 (2026-11-04)
 
 Quality-of-life round, weeeee. The SBX button got its light, and the

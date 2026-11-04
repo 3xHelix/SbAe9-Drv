@@ -400,7 +400,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 		chip->pcm_start_sent = 1;
 		chip->pcm_start_rate = runtime->rate;
 		chip->pcm_start_fmt = format;
-		dev_info(chip->dev, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
+		ae9_dbg(chip, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
 	}
 	return 0;
@@ -606,7 +606,7 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 		if (chip->mic_level != 99)
 			creative_ae9_mic_level_apply(chip);
 		chip->cap_start_sent = 1;
-		dev_info(chip->dev, "capture prepare: SD_FMT=0x%04x\n",
+		ae9_dbg(chip, "capture prepare: SD_FMT=0x%04x\n",
 			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));
 	}
 	return 0;

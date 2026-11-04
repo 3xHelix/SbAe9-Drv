@@ -787,7 +787,8 @@ static void scp_drain_announced(struct creative_chip *chip)
 	       (int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) > 0) {
 		int n = scp_read_announced(chip, &hdr, junk, ARRAY_SIZE(junk));
 
-		dev_info_ratelimited(chip->dev,
+		if (ae9_debug)
+			dev_info_ratelimited(chip->dev,
 			"scp: drained unexpected reply hdr=0x%08x (%d words: %08x %08x %08x %08x)\n",
 			hdr, n, n > 0 ? junk[0] : 0, n > 1 ? junk[1] : 0,
 			n > 2 ? junk[2] : 0, n > 3 ? junk[3] : 0);
@@ -3518,14 +3519,14 @@ static void chipio_set_control_param(struct creative_chip *chip,
 	}
 }
 
-void chipio_set_stream_channels(struct creative_chip *chip,
+static void chipio_set_stream_channels(struct creative_chip *chip,
 				int streamid, unsigned int channels)
 {
 	chipio_set_control_param(chip, CONTROL_PARAM_STREAM_ID, streamid);
 	chipio_set_control_param(chip, CONTROL_PARAM_STREAMS_CHANNELS, channels);
 }
 
-void chipio_set_stream_control(struct creative_chip *chip,
+static void chipio_set_stream_control(struct creative_chip *chip,
 			       int streamid, int enable)
 {
 	chipio_set_control_param(chip, CONTROL_PARAM_STREAM_ID, streamid);
@@ -3661,7 +3662,10 @@ void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what)
 {
 	ca0113_list(chip, cmds, n, CA0113_SETTLE_US);
-	dev_info(chip->dev, "ca0113_windows: %s, %zu commands\n", what, n);
+	if (chip->dsp_done)
+		ae9_dbg(chip, "ca0113_windows: %s, %zu commands\n", what, n);
+	else
+		dev_info(chip->dev, "ca0113_windows: %s, %zu commands\n", what, n);
 }
 
 /* Same without the log line and with the short settle time (volume). */
@@ -5906,9 +5910,6 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	timeout = jiffies + msecs_to_jiffies(8000); /* 8s: clean card needs more time */
 	do {
 		if (dspload_is_loaded(chip)) {
-			unsigned int dspio_sts;
-			int t;
-
 			dev_info(chip->dev, "DSP firmware downloaded and running\n");
 
 			{

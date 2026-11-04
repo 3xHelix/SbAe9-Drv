@@ -660,15 +660,8 @@ int creative_i2c_pcm_relay_engage(struct creative_chip *chip)
 	static const u8 f_wake[]    = { 0xf0, 0x21, 0x03,
 					0x02, 0x00, 0x00, 0xf7 };
 	/* hb_seq relay frames */
-	static const u8 f_sysctrl[] = { 0xf0, 0xc2, 0x00, 0xf7 };
 	static const u8 f_msg_q2[]  = { 0xf0, 0x83, 0x01, 0x02, 0xf7 };
-	static const u8 f_msg_q7[]  = { 0xf0, 0x83, 0x01, 0x07, 0xf7 };
-	static const u8 f_msg_sts[] = { 0xf0, 0x85, 0x01, 0x02, 0xf7 };
-	static const u8 f_relay1[]  = { 0xf0, 0xb1, 0x01, 0x01, 0xf7 };
-	static const u8 f_relay2[]  = { 0xf0, 0xb1, 0x01, 0x02, 0xf7 };
-	static const u8 f_relay3[]  = { 0xf0, 0xb1, 0x01, 0x03, 0xf7 };
 
-	u8 resp[16];
 	int n, i;
 	bool probe_ack = false;
 
@@ -810,7 +803,6 @@ int creative_i2c_pcm_relay_engage(struct creative_chip *chip)
 	 */
 	for (i = 0; i < 3; i++) {
 		int _j;
-		u32 _sts;
 		/* Send probe via raw writes */
 		for (_j = 0; _j < (int)ARRAY_SIZE(f_probe); _j++) {
 			creative_ext_writel(chip, 0xC00, f_probe[_j]);

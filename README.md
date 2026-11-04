@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.4):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.5):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -215,6 +215,11 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   with Chrome Canary after output switches or a reboot (no stream; VLC
   played fine); restarting the app fixes it. The earlier "silent first
   playback after a warm reboot" was most likely this.
+- Now and then a warm reboot leaves the card dark (lights off, no head
+  unit, no sound); Windows sees the same at times, so it's the card. The
+  driver notices within a second (`codec 1 (DSP) not answering after the
+  bus reset`) and brings the card up again, which has fixed it; if it
+  says `never answered`, power off at the PSU for ~20 s.
 - SBX: if Direct Mode off ever gives silence or echoey, crunched audio
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
@@ -254,6 +259,11 @@ code path for comparison:
   `sentinel_clear=0`, `lineout_prerun=0`, `loop_start=0` —
   firmware download, DSP start and the MASTERCONTROL boot handshake.
 - `overlay` — transfer the DSP overlay image during the handshake.
+- `debug` (default 0, writable at runtime) — log detail. 0: startup, your
+  actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
+  the routine per-stream and per-step lines (command blocks, router, volume
+  steps). 2: plus the raw head-unit button state. Turn it on to dig in:
+  `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/debug`.
 - `fw_verify` (default 0) — read the firmware back after download and count
   mismatches.
 - `ca0113_windows` — head-unit DAC commands with Windows' protocol/values.

@@ -528,6 +528,7 @@ static int creative_ae9_detect_codecs(struct creative_chip *chip)
 	/* Probe each detected codec via immediate commands (count afresh:
 	 * this runs again on every resume) */
 	chip->codec_count = 0;
+	chip->codec_ok_mask = 0;
 	for (cad = 0; cad < HDA_MAX_CODECS; cad++) {
 		if (!(chip->codec_mask & BIT(cad)))
 			continue;
@@ -543,6 +544,7 @@ static int creative_ae9_detect_codecs(struct creative_chip *chip)
 		}
 		dev_info(chip->dev,
 			 "Codec %d: vendor/device ID = 0x%08x\n", cad, resp);
+		chip->codec_ok_mask |= BIT(cad);
 
 		/* Get Subsystem ID (node 1, verb 0xF20, param 0x00) */
 		ret = creative_ae9_icw_send_verb(chip,
@@ -716,8 +718,13 @@ static void creative_ae9_verb_block_replay(struct creative_chip *chip,
 	creative_dsp_chipio_addr_invalidate();
 	if (!atomic) {
 		mutex_unlock(&chip->replay_mutex);
-		dev_info(chip->dev, "%s, %zu verbs (%u errors), %u SCP msgs (%u failed)\n",
-			 what, n, errs, msgs, msg_err);
+		/* every block at startup; afterwards only failures (debug=1: all) */
+		if (errs || msg_err || !chip->dsp_done)
+			dev_info(chip->dev, "%s, %zu verbs (%u errors), %u SCP msgs (%u failed)\n",
+				 what, n, errs, msgs, msg_err);
+		else
+			ae9_dbg(chip, "%s, %zu verbs (%u errors), %u SCP msgs (%u failed)\n",
+				what, n, errs, msgs, msg_err);
 	}
 }
 
@@ -862,7 +869,7 @@ static void creative_ae9_dsp_alive_log(struct creative_chip *chip, const char *w
 	mutex_unlock(&chip->replay_mutex);
 	if (n < 2)
 		dev_info(chip->dev, "DSP alive (%s): DBGCNTL read failed\n", when);
-	else
+	else if (!moved || !strcmp(when, "boot") || ae9_debug)
 		dev_info(chip->dev, "DSP alive (%s): DBGCNTL %s (%u of %u reads changed; first 0x%08x, last 0x%08x)\n",
 			 when, moved ? "moving" : "NOT moving", moved, n - 1,
 			 v[0], v[n - 1]);
@@ -1085,9 +1092,9 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	creative_dsp_chipio_write(chip, AE9_RT_APPLY, 1);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
-	dev_info(chip->dev, "SBX: router front L/R <- DSP ports 0x%02x/0x%02x, %d DSP input entr%s active\n",
+	ae9_dbg(chip, "SBX: router front L/R <- DSP ports 0x%02x/0x%02x, %d DSP input entr%s active\n",
 		 l, r, inputs, inputs == 1 ? "y" : "ies");
-	if (unsteady || retried)
+	if (retried || (unsteady && ae9_debug))
 		dev_info(chip->dev, "SBX: router: %u unsteady read%s, %u write%s retried, %u failed (the chip moved the ChipIO address)\n",
 			 unsteady, unsteady == 1 ? "" : "s",
 			 retried, retried == 1 ? "" : "s", failed);
@@ -1217,7 +1224,7 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 	creative_dsp_scp_send(chip, (2 << 17) | (0x20 << 8) | 0x32, &zero, 1);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
-	dev_info(chip->dev, "SBX: DSP speaker volume 0 dB (left, right), unmuted\n");
+	ae9_dbg(chip, "SBX: DSP speaker volume 0 dB (left, right), unmuted\n");
 	/* host-audio stream 0x05 on, stereo (DarkNikGr's working AE-9 setup:
 	 * "routed but never STARTED before"), then the front outputs from the
 	 * DSP (also done by dsp_mode_start, for later streams) */
@@ -2140,7 +2147,7 @@ static int creative_pcmtest_setup(struct creative_chip *chip)
 
 static void creative_pcmtest_go(struct creative_chip *chip)
 {
-	u32 ctl, resp;
+	u32 ctl;
 
 	/*
 	 * Cold-boot VM capture with CONFIRMED WORKING audio on head-unit HP.
@@ -2690,6 +2697,10 @@ static unsigned int hu_debug;
 module_param(hu_debug, uint, 0644);
 MODULE_PARM_DESC(hu_debug, "post_windows: log raw head-unit button state (1=on)");
 
+unsigned int ae9_debug;
+module_param_named(debug, ae9_debug, uint, 0644);
+MODULE_PARM_DESC(debug, "Log detail: 0 startup, actions and problems (default), 1 also routine per-stream/per-step lines, 2 also raw head-unit button state");
+
 /* knob/button poll interval between Windows' full 500 ms polls */
 static unsigned int hu_fast_ms = 40;
 module_param(hu_fast_ms, uint, 0444);
@@ -2723,7 +2734,12 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 		cmds[i][2] = att;
 	}
 	creative_dsp_ca0113_replay_quiet(chip, cmds, 6);
-	dev_info(chip->dev, "head unit: volume att 0x%02x (%s)\n", att,
+	/* mute changes always; each volume step only with debug=1 */
+	if (chip->hu_mute != chip->hu_mute_logged) {
+		chip->hu_mute_logged = chip->hu_mute;
+		dev_info(chip->dev, "head unit: %s\n", chip->hu_mute ? "muted" : "unmuted");
+	}
+	ae9_dbg(chip, "head unit: volume att 0x%02x (%s)\n", att,
 		 chip->hu_mute ? "muted" : "on");
 }
 
@@ -2745,7 +2761,7 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 	if (r[1] == 0x83 && n >= 6 && r[3] == 0x02) {
 		bool down = !(r[4] & 0x80);
 
-		if (hu_debug && (!chip->hu_status_valid ||
+		if ((hu_debug || ae9_debug >= 2) && (!chip->hu_status_valid ||
 				 r[4] != (chip->hu_status | (chip->hu_btn_down ? 0 : 0x80))))
 			dev_info(chip->dev, "hu_debug: 83 02 status 0x%02x\n", r[4]);
 		u8 st = r[4] & 0x7f;
@@ -2765,7 +2781,7 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 		 * 2026-11-04): act on the press */
 		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08)) {
 			chip->hu_sbx_press = true;
-			dev_info(chip->dev, "head unit: SBX button\n");
+			ae9_dbg(chip, "head unit: SBX button\n");
 		}
 		chip->hu_status = st;
 		chip->hu_status_valid = true;
@@ -2826,7 +2842,7 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 	 * the knob: f0 b1 04 01 01 <ms lo> <ms hi> f7 (seen 2026-11-04, not
 	 * needed). Item 03's b1 reply is logged, to learn what it is.
 	 */
-	if (hu_debug && r[1] == 0xb1 && n >= 8 && r[4])
+	if ((hu_debug || ae9_debug >= 2) && r[1] == 0xb1 && n >= 8 && r[4])
 		dev_info(chip->dev, "hu_debug: b1 item %u press %u ms\n",
 			 r[3], r[5] | (r[6] << 8));
 	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x03 && r[4])
@@ -2985,7 +3001,7 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 			creative_spi_frame_win(chip, mode, sizeof(mode), resp, sizeof(resp));
 		if (creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp)) > 0) {
 			chip->hu_sbx_led = sbx_led;
-			dev_info(chip->dev, "head unit: SBX light %s\n",
+			ae9_dbg(chip, "head unit: SBX light %s\n",
 				 sbx_led ? "on" : "off");
 		}
 	}
@@ -3609,6 +3625,17 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	ret = creative_ae9_detect_codecs(chip);
 	if (ret < 0)
 		return ret;
+	/*
+	 * Codec 1 (the CA0132 with the DSP) silent after the bus reset: every
+	 * later command would time out, ~2-3 min of them, holding up the
+	 * boot (2026-11-04, twice after a warm reboot, card lights off). A
+	 * second bring-up's bus reset brought it straight back both times
+	 * it got that far, so stop here and let the retry go again.
+	 */
+	if (post_windows && load_fw && !(chip->codec_ok_mask & BIT(1))) {
+		dev_warn(chip->dev, "codec 1 (DSP) not answering after the bus reset; trying the bring-up again\n");
+		return 0;
+	}
 
 	/* Wake codecs from D3: send SET_POWER_STATE D0 to AFG (node 0x01)
 	 * of each detected codec. ca0132's exit verbs put the codec in D3
@@ -3954,7 +3981,9 @@ static int creative_ae9_hw_bringup_retry(struct creative_chip *chip, const char 
 	for (attempt = 1; attempt <= tries; attempt++) {
 		if (attempt > 1) {
 			cancel_delayed_work_sync(&chip->acm_work);
-			creative_ae9_win_shutdown(chip, "bring-up retry");
+			/* nothing to shut down if codec 1 never answered */
+			if (chip->codec_ok_mask & BIT(1))
+				creative_ae9_win_shutdown(chip, "bring-up retry");
 			msleep(resume_delay_ms);
 			chip->dsp_done = 0;
 			chip->hs_done = 0;
@@ -3972,6 +4001,9 @@ static int creative_ae9_hw_bringup_retry(struct creative_chip *chip, const char 
 		dev_warn(chip->dev, "%s: bring-up attempt %u failed (dsp_done %u, handshake %s)\n",
 			 what, attempt, chip->dsp_done, chip->hs_ok ? "ok" : "failed");
 	}
+	if (post_windows && load_fw && !(chip->codec_ok_mask & BIT(1)))
+		dev_err(chip->dev, "%s: codec 1 (DSP) never answered in %u attempts: power off at the PSU for ~20 s\n",
+			what, tries);
 	return ret;
 }
 

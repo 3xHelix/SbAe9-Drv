@@ -161,9 +161,10 @@ static int fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
 	usleep_range(5000, 6000);
 	ret = creative_dsp_scp_send(chip, ((u32)req << 17) | (0x20 << 8) | mid,
 				    &val, 1);
-	if (ret < 0 || log)
-		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x%s\n", mid, req, val,
-			 ret < 0 ? " FAILED" : "");
+	if (ret < 0)
+		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x FAILED\n", mid, req, val);
+	else if (log)
+		ae9_dbg(chip, "fx: 0x%02x/0x%02x = 0x%08x\n", mid, req, val);
 	if (ret >= 0) {
 		fx->fails = 0;
 	} else if (++fx->fails >= 3) {
@@ -495,8 +496,14 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_SBX:
 		if (!!v == fx->sbx)
 			return 0;
+		/* locked with Direct Mode on, like the head unit's SBX button:
+		 * no change, and a notify so mixers snap back */
+		if (fx->direct) {
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &kc->id);
+			return 0;
+		}
 		fx->sbx = !!v;
-		if (!fx->direct && !chip->dsp_switch_pending)
+		if (!chip->dsp_switch_pending)
 			fx_apply_all(chip);
 		fx_update_active(chip);
 		return 1;
@@ -575,7 +582,7 @@ void creative_ae9_fx_sbx_toggle(struct creative_chip *chip)
 	unsigned int i;
 
 	if (fx->direct) {
-		dev_info(chip->dev, "SBX button ignored: Direct Mode is on\n");
+		ae9_dbg(chip, "SBX button ignored: Direct Mode is on\n");
 		return;
 	}
 	fx->sbx = !fx->sbx;

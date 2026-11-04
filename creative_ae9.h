@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.6.4"
+#define CREATIVE_AE9_DRV_VERSION	"0.6.5"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -148,6 +148,7 @@ struct creative_chip {
 
 	unsigned int		codec_mask;	/* bitmask from STATESTS */
 	unsigned int		codec_count;
+	unsigned int		codec_ok_mask;	/* codecs that answered at detection */
 
 	/* ICW protocol state */
 	u16			last_irs_ack;	/* ACK value for next IRS write */
@@ -286,6 +287,7 @@ struct creative_chip {
 	unsigned int		hu_btn_down;
 	unsigned long		hu_btn_since;
 	unsigned long		hu_btn_seen;	/* last press seen by the fast poll */
+	bool			hu_mute_logged;	/* mute state last logged */
 	bool			hu_bit7_stuck;	/* 83 02 bit 7 stuck at held: use b1 reports */
 	/* 83 01 02 status byte without bit 7 (knob button), for the plug
 	 * log. Logged only; output switching stays manual. */
@@ -376,6 +378,18 @@ int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 void creative_dsp_chipio_addr_invalidate(void);
 int creative_dsp_boot_handshake(struct creative_chip *chip);
 extern unsigned int ae9_ca0113_windows;
+
+/*
+ * debug=0 (default): startup, user actions and problems only. debug=1:
+ * also the routine per-stream/per-step detail (command blocks, router,
+ * volume steps). debug=2: plus the raw head-unit button state. Writable
+ * at runtime: /sys/module/snd_hda_codec_creative_ae9/parameters/debug
+ */
+extern unsigned int ae9_debug;
+#define ae9_dbg(chip, fmt, ...) do {					\
+		if (ae9_debug)						\
+			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\
+	} while (0)
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
 void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
