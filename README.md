@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.3):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.4):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -106,11 +106,11 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   every control below a Sound Blaster Command-style window (Python 3 +
   PySide6), and follows the knob and alsamixer live.
 - Output: the RCA jacks on the card (speaker mode, "-SP-") or the head
-  unit's headphone jack ("-HP-"). Starts on speakers; switch with a 1.5-3.5 s
+  unit's headphone jack ("-HP-"). Starts on speakers; switch with a 1.5-3 s
   knob hold or the "Head Unit Output" control. Each output remembers its own
   volume (both start at -36 dB).
-- Knob: turn = volume, press (< 1 s) = mute, hold 1.5-3.5 s = speakers /
-  headphones, hold > 3.5 s = knob light on/off.
+- Knob: turn = volume, press (< 1 s) = mute, hold 1.5-3 s = speakers /
+  headphones, hold 3 s or more = knob light on/off.
 - SBX button (head unit): turns SBX on/off, same as "SBX Switch", only
   with Direct Mode off (with Direct Mode on it does nothing). Its light is
   on while the effects are running: Direct Mode off and SBX on.

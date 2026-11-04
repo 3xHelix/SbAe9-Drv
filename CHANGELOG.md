@@ -3,6 +3,55 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.4 (2026-11-04)
+
+Quality-of-life round, weeeee. The SBX button got its light, and the
+knob immediately got jealous. Turns out the head unit has a little quirk,
+and we caught it in the act.
+
+### Fixed
+
+- **The knob froze on headphones with SBX on.** Turning still worked, but
+  mute, output switching and the knob light just... stopped, until you
+  poked something in the control panel. Turned on the new debug log and
+  there it was: on headphones with the SBX light on, the head unit leaves
+  its "knob is being held" flag stuck on after the first press. Forever.
+  The driver sat there waiting for you to let go of a knob you'd let go
+  of ages ago. It still sends a separate "this press lasted X ms" report
+  for every press, so now the driver notices the flag is lying and uses
+  those reports instead, until the flag comes back to its senses (it
+  does once you're on speakers or the light goes off). Even the first
+  press counts. No more freezing, no more surprise knob-light toggles.
+- **SBX light went dark after a speaker/headphone switch** while SBX was
+  still running. Windows' switch sequence flashes that same light and
+  leaves it off. Now the driver puts it right back.
+
+### Changed
+
+- **Knob light is now a 3 second hold** (was 3.5 s). Speakers/headphones
+  is 1.5 to 3 s, mute is still a quick press. Why: that "press lasted"
+  report from the head unit stops counting at 3 seconds, so 3 s is where
+  the knob light has to live for it to work in every mode. On headphones
+  with SBX on it toggles right at the 3 second mark, while you're still
+  holding. Feels kind of nice actually.
+
+### Added
+
+- `hu_debug=1` (can be flipped while running, under
+  `/sys/module/snd_hda_codec_creative_ae9/parameters/`): logs the head
+  unit's raw button state. It's how this one got caught.
+- The driver now sends the same "output mode" frame Windows sends right
+  before each SBX light change (`hu_sbx_mode`, on by default).
+
+Tested on kernel 7.2.15: mutes, output switches and the knob light on
+speakers and headphones, with SBX on and off, SBX button mashing in
+between. 99% on the money, and now that last 1% too.
+
+Upgrading from 0.6.3: rebuild, replace the module, `sudo depmod -a`,
+reboot. Muscle memory heads up: knob light is 3 s now.
+
+-- Joe
+
 ## 0.6.3 (2026-11-04)
 
 This one was hellish fun. New kernel drops (7.2.15), I reboot, and DSP

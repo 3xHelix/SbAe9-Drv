@@ -2675,6 +2675,21 @@ static const struct { u8 len; u8 d[10]; } hu_poll[] = {
 	{ 5, { 0xf0, 0xb1, 0x01, 0x03, 0xf7 } },
 };
 
+/*
+ * Before each SBX light change Windows sends the output-mode frame
+ * f0 03 03 02 <00 speakers / 40 headphones> 40 f7 (capture 6, ~0.4 s
+ * before each f0 22 02 01); we do the same. (It was a guess for the knob
+ * freeze, which turned out to be the stuck press bit; see hu_parse.)
+ */
+static unsigned int hu_sbx_mode = 1;
+module_param(hu_sbx_mode, uint, 0644);
+MODULE_PARM_DESC(hu_sbx_mode, "post_windows: send the output-mode frame before each SBX light change, as Windows (1=on, default)");
+
+/* Log raw head-unit button bits (83 01 02 byte changes, b1 press reports). */
+static unsigned int hu_debug;
+module_param(hu_debug, uint, 0644);
+MODULE_PARM_DESC(hu_debug, "post_windows: log raw head-unit button state (1=on)");
+
 /* knob/button poll interval between Windows' full 500 ms polls */
 static unsigned int hu_fast_ms = 40;
 module_param(hu_fast_ms, uint, 0444);
@@ -2729,6 +2744,10 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 		return r[3] ? -r[4] : r[4];
 	if (r[1] == 0x83 && n >= 6 && r[3] == 0x02) {
 		bool down = !(r[4] & 0x80);
+
+		if (hu_debug && (!chip->hu_status_valid ||
+				 r[4] != (chip->hu_status | (chip->hu_btn_down ? 0 : 0x80))))
+			dev_info(chip->dev, "hu_debug: 83 02 status 0x%02x\n", r[4]);
 		u8 st = r[4] & 0x7f;
 		u8 chg = chip->hu_status_valid ? st ^ chip->hu_status : 0x30;
 
@@ -2751,22 +2770,54 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 		chip->hu_status = st;
 		chip->hu_status_valid = true;
 
-		if (down && !chip->hu_btn_down) {
-			chip->hu_btn_since = jiffies;
-		} else if (!down && chip->hu_btn_down) {
-			*press_ms = jiffies_to_msecs(jiffies - chip->hu_btn_since);
-			chip->hu_btn_seen = jiffies;
+		if (chip->hu_bit7_stuck) {
+			/* presses come from the b1 reports (below) until bit 7
+			 * reads "not held" again; that isn't a release */
+			if (!down) {
+				chip->hu_bit7_stuck = false;
+				chip->hu_btn_down = false;
+				dev_info(chip->dev, "head unit: knob press bit back to normal\n");
+			}
+		} else {
+			if (down && !chip->hu_btn_down) {
+				chip->hu_btn_since = jiffies;
+			} else if (!down && chip->hu_btn_down) {
+				*press_ms = jiffies_to_msecs(jiffies - chip->hu_btn_since);
+				chip->hu_btn_seen = jiffies;
+			}
+			chip->hu_btn_down = down;
 		}
-		chip->hu_btn_down = down;
 	}
 	/* The b1 02 reply (full poll only) also reports presses, with the
 	 * duration capped at 3000 ms; a long hold is reported at 3 s while
 	 * still held. Use it only for a short press the fast poll missed:
 	 * not while held, not right after a press the fast poll timed. */
-	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x02 && r[4] == 0x01 &&
-	    !chip->hu_btn_down && (r[5] | (r[6] << 8)) < 1000 &&
-	    time_after(jiffies, chip->hu_btn_seen + msecs_to_jiffies(1500)))
-		*press_ms = r[5] | (r[6] << 8);
+	/*
+	 * On headphones with the SBX light on, bit 7 can stick at "held"
+	 * after a knob press (2026-11-04: 0x77 for 22 s while the b1 reports
+	 * kept coming, 104/109/183 ms presses; it came back at the next SBX
+	 * press, or on speakers). b1 reports a press when it ends, and the
+	 * full poll reads 83 02 before b1, so a real release is always seen
+	 * first: a b1 report while bit 7 still says held means it's stuck.
+	 * Then take presses from b1 until bit 7 reads "not held" again. b1
+	 * caps at 3000 ms and fires at 3 s while still held: a 3000 report
+	 * means "held 3 s", the knob-light hold, acted on right then.
+	 */
+	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x02 && r[4] == 0x01) {
+		unsigned int ms = r[5] | (r[6] << 8);
+
+		if (!chip->hu_bit7_stuck && chip->hu_btn_down && ms < 3000 &&
+		    jiffies_to_msecs(jiffies - chip->hu_btn_since) + 100 >= ms) {
+			chip->hu_bit7_stuck = true;
+			dev_info(chip->dev, "head unit: knob press bit stuck at held; using the press reports\n");
+		}
+		if (chip->hu_bit7_stuck) {
+			*press_ms = ms;
+		} else if (!chip->hu_btn_down && ms < 1000 &&
+			   time_after(jiffies, chip->hu_btn_seen + msecs_to_jiffies(1500))) {
+			*press_ms = ms;
+		}
+	}
 	/*
 	 * Item 01 is SBX: Windows lights its LED with f0 22 02 01 <on> f7
 	 * (capture 6, at each SBX toggle; item 02 is the knob's button and
@@ -2775,6 +2826,9 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 	 * the knob: f0 b1 04 01 01 <ms lo> <ms hi> f7 (seen 2026-11-04, not
 	 * needed). Item 03's b1 reply is logged, to learn what it is.
 	 */
+	if (hu_debug && r[1] == 0xb1 && n >= 8 && r[4])
+		dev_info(chip->dev, "hu_debug: b1 item %u press %u ms\n",
+			 r[3], r[5] | (r[6] << 8));
 	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x03 && r[4])
 		dev_info(chip->dev, "head unit: b1 item 3 reports a press (%u ms, reply %*ph)\n",
 			 r[5] | (r[6] << 8), min(n, 9), r);
@@ -2907,8 +2961,9 @@ static void creative_ae9_hu_light(struct creative_chip *chip, unsigned int on)
 
 /* Act on knob input and pending control changes: display first (feels
  * immediate), then the DAC volume commands (~20 ms each). Holds: under
- * 1 s mutes, 1.5-3.5 s switches speakers/headphones, longer toggles the
- * knob light. */
+ * 1 s mutes, 1.5-3 s switches speakers/headphones, 3 s or more toggles
+ * the knob light (3 s, not 3.5: the b1 report, our fallback when the
+ * press bit sticks, can't count past 3000 ms). */
 static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				   int press_ms)
 {
@@ -2923,7 +2978,11 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 	sbx_led = !chip->fx.direct && chip->fx.sbx;
 	if (sbx_led != chip->hu_sbx_led) {
 		u8 f[6] = { 0xf0, 0x22, 0x02, 0x01, sbx_led, 0xf7 };
+		u8 mode[7] = { 0xf0, 0x03, 0x03, 0x02,
+			       chip->hu_output ? 0x40 : 0x00, 0x40, 0xf7 };
 
+		if (hu_sbx_mode)
+			creative_spi_frame_win(chip, mode, sizeof(mode), resp, sizeof(resp));
 		if (creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp)) > 0) {
 			chip->hu_sbx_led = sbx_led;
 			dev_info(chip->dev, "head unit: SBX light %s\n",
@@ -2937,10 +2996,10 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		chip->hu_switch_to = -1;
 		creative_ae9_hu_switch(chip, to);
 	}
-	if (press_ms >= 1500 && press_ms < 3500) {
+	if (press_ms >= 1500 && press_ms < 3000) {
 		creative_ae9_hu_switch(chip, !chip->hu_output);
 		press_ms = -1;
-	} else if (press_ms >= 3500) {
+	} else if (press_ms >= 3000) {
 		creative_ae9_hu_light(chip, !chip->hu_light);
 		press_ms = -1;
 	} else if (press_ms >= 1000) {
