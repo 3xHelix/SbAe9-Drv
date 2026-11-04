@@ -1093,7 +1093,17 @@ static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
 	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET, 0x01);
 	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, 0x10);
 	port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
-	dev_info(chip->dev, "overlay: port read 0x%x (Windows: 3)\n", port);
+	/*
+	 * 0xff now and then (2026-11-04: on both boots whose DSP mode came up
+	 * with a strange router, never on the clean ones): the 8051 hadn't
+	 * answered yet. Give it a moment and ask again before guessing.
+	 */
+	for (i = 0; port > 0xf && i < 10; i++) {
+		msleep(5);
+		port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
+	}
+	dev_info(chip->dev, "overlay: port read 0x%x (Windows: 3)%s\n", port,
+		 i ? (port > 0xf ? ", still bad after retries" : ", after a retry") : "");
 	if (port > 0xf) {
 		/* read came back as 0xff000000 once; Windows always got 3 */
 		port = 3;
@@ -3275,38 +3285,61 @@ exit:
 	return status;
 }
 
+/*
+ * Where ChipIO reads an image word. The image addresses the DSP's aux RAM
+ * the way the DSP does, straight after main X / Y RAM (X_END..X_EXT,
+ * Y_END..Y_EXT), and the download's DSP DMA writes it there; ChipIO maps
+ * that aux RAM elsewhere (AXRAM_CHIP_OFFSET, AYRAM_CHIP_OFFSET). Reading
+ * the image address itself gave the old "27 + 24 mismatches", all in
+ * those two ranges (WINDOWS-CAPTURE-ANALYSIS §21).
+ */
+static unsigned int dsp_verify_addr(unsigned int addr, bool *aux)
+{
+	*aux = true;
+	if (addr >= X_END && addr < X_EXT)
+		return AXRAM_CHIP_OFFSET + (addr - X_END);
+	if (addr >= Y_END && addr < Y_EXT)
+		return AYRAM_CHIP_OFFSET + (addr - Y_END);
+	*aux = false;
+	return addr;
+}
+
 static void dsp_verify_image(struct creative_chip *chip,
 			     const struct ae9_dsp_image_seg *fls)
 {
 	unsigned int seg = 0;
 
 	for (; fls && !seg_is_last(fls); fls = seg_next(fls), seg++) {
-		unsigned int i, ok = 0, bad = 0, shown = 0;
+		unsigned int i, ok = 0, bad = 0, shown = 0, aux_ok = 0, aux_bad = 0;
 
 		if (seg_is_hci(fls))
 			continue;
 		for (i = 0; i < fls->count; i = (i + 97 < fls->count ||
 						 i == fls->count - 1) ?
 						i + 97 : fls->count - 1) {
-			unsigned int got = 0, addr = fls->chip_addr + 4 * i;
+			unsigned int got = 0, img = fls->chip_addr + 4 * i, addr;
+			bool aux;
 
+			addr = dsp_verify_addr(img, &aux);
 			creative_dsp_chipio_addr_invalidate();
 			creative_dsp_chipio_read(chip, addr, &got);
 			if (got == fls->data[i]) {
 				ok++;
+				aux_ok += aux;
 			} else {
 				bad++;
+				aux_bad += aux;
 				if (shown++ < 5)
 					dev_info(chip->dev,
-						 "fw_verify: seg%u word %u addr 0x%06x got 0x%08x want 0x%08x\n",
-						 seg, i, addr, got, fls->data[i]);
+						 "fw_verify: seg%u word %u addr 0x%06x%s got 0x%08x want 0x%08x\n",
+						 seg, i, img, aux ? " (aux)" : "", got, fls->data[i]);
 			}
 			if (i == fls->count - 1)
 				break;
 		}
 		dev_info(chip->dev,
-			 "fw_verify: seg%u chip 0x%06x %u words: %u match, %u mismatch\n",
-			 seg, fls->chip_addr, fls->count, ok, bad);
+			 "fw_verify: seg%u chip 0x%06x %u words: %u match, %u mismatch (aux RAM: %u match, %u mismatch)\n",
+			 seg, fls->chip_addr, fls->count, ok, bad, aux_ok, aux_bad);
 	}
 }
 

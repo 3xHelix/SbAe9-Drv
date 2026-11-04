@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.1):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.2):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -134,7 +134,8 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   "Direct Mode Switch" (default on) plays straight to the DAC at the
   stream's rate, DSP bypassed. Turn it off and the audio goes through the
   DSP at 96 kHz (stereo only for now); then "SBX Switch" turns the effects
-  on or off. With both, the "FX Surround / Dialog Plus / Smart Volume /
+  on or off, and "Speaker Config" (2.0 or 2.1, default 2.1 as Windows) tells
+  the DSP your speaker setup. With both, the "FX Surround / Dialog Plus / Smart Volume /
   Crystalizer / Bass" switches and volumes (0-100), "FX Smart Volume Mode",
   "EQ Switch", "EQ Preset" (Windows' 20 presets, Flat to Stadium), "EQ Pre-gain" and ten
   bands (31 Hz-16 kHz, -12..+12 dB) and "Scout Mode Switch" act; otherwise
@@ -204,8 +205,6 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
   SBX was being developed, not since the fixes in 0.6.0.
-- Firmware read-back (`fw_verify=1`) reports a few dozen mismatches in the DSP's
-  auxiliary RAM; audio works regardless (likely a read-back artifact, open).
 
 ## Source layout
 
@@ -259,9 +258,8 @@ code path for comparison:
   runtime) CA0113 settle time for volume changes;
   `tail_drop_rejected` (1) leave out the six startup SCP messages the DSP
   rejects.
-- SBX: `fx_spk_cfg` (2) speaker config with Direct Mode off (DSP
-  MASTERCONTROL 0x04: 1 = 2.0, 2 = 2.1 as Windows, 5 = 4.0, 6 = 4.1,
-  8 = 5.1); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
+- SBX: `fx_spk_cfg` (2) the "Speaker Config" setting at load (1 = 2.0,
+  2 = 2.1 as Windows); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
   stream plays direct before the switch to the DSP.
 
 Older parameters:

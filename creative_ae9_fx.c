@@ -14,7 +14,7 @@
 //     0x0a EQ pre-gain (dB)            0x0b-0x14 EQ bands 31 Hz-16 kHz (dB)
 //     0x15 bass redirect, 0x1f use speaker EQ, 0x3a output mute
 //   module 0x80 (MASTERCONTROL) request 0x04: speaker config, 8.0 in
-//     Direct Mode, fx_spk_cfg (2.0 = Windows' 2.1) with Direct Mode off
+//     Direct Mode, the "Speaker Config" control's value with Direct Mode off
 //   module 0x8f (speaker EQ) request 0x01: bypass attenuation
 //
 // On/off values are 0.0/1.0, levels 0.0-1.0 (the app's 0-100), EQ in dB.
@@ -106,14 +106,19 @@ static const s16 eq_scout[FX_EQ_VALUES] = { 0, 20, 30, 30, -20, -20, 0, 30, 40, 
 static const char * const sv_mode_names[] = { "Normal", "Loud", "Night" };
 
 /*
- * MASTERCONTROL 0x04 (speaker config) with Direct Mode off. Windows sent
- * 2.0 there in captures 5 and 6 (audio playing; Windows' speaker setting
- * maps 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0), and 8.0 in Direct
- * Mode. Writable at runtime for testing: toggle SBX to resend.
+ * MASTERCONTROL 0x04 (speaker config) with Direct Mode off, the "Speaker
+ * Config" control. Windows sent 2.0 there in captures 5 and 6 (its speaker
+ * setting on 2.1), and 8.0 in Direct Mode; ca0132's table is the same
+ * (2.0 -> 1.0, 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0). Only the
+ * stereo configs for now: 4.0 and up send part of the mix to rear and
+ * center channels, and only front L/R are routed to the jacks so far.
  */
+static const char * const spk_names[] = { "2.0", "2.1" };
+static const u8 spk_cfgs[] = { 1, 2 };	/* MASTERCONTROL 0x04 value */
+
 static unsigned int fx_spk_cfg = 2;
-module_param(fx_spk_cfg, uint, 0644);
-MODULE_PARM_DESC(fx_spk_cfg, "Speaker config with Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows), 5 = 4.0, 6 = 4.1, 8 = 5.1");
+module_param(fx_spk_cfg, uint, 0444);
+MODULE_PARM_DESC(fx_spk_cfg, "Speaker Config at load, Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows)");
 
 /* num/den as IEEE-754 single bits, without the FPU. |num/den| >= 2^-16. */
 static u32 fx_f32(s32 num, u32 den)
@@ -190,7 +195,8 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 	/* Windows' order (capture 3, 19:56:08): mute, speaker config, speaker
 	 * block, on/offs, then values only for what is on, EQ on last. */
 	fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
-	fx_send(chip, FX_MID_MASTER, 0x04, fx_f32(fx->direct ? 8 : fx_spk_cfg, 1), true);
+	fx_send(chip, FX_MID_MASTER, 0x04,
+		fx_f32(fx->direct ? 8 : spk_cfgs[fx->spk], 1), true);
 	fx_send(chip, FX_MID_OUT, 0x19, fx_f32(fx->level[FX_BASS], 100), false);
 	fx_send(chip, FX_MID_OUT, 0x17, fx_f32(80, 1), false);
 	fx_send(chip, FX_MID_OUT, 0x18, 0, false);
@@ -333,6 +339,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 
 	memset(fx, 0, sizeof(*fx));
 	fx->direct = true;
+	fx->spk = fx_spk_cfg == 1 ? 0 : 1;
 	for (i = 0; i < FX_COUNT; i++) {
 		fx->on[i] = fx_def_on[i];
 		fx->level[i] = fx_def_lvl[i];
@@ -343,7 +350,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 /* Controls: private_value = kind << 8 | index                         */
 /* ------------------------------------------------------------------ */
 
-enum { K_SBX, K_ON, K_LVL, K_SVMODE, K_EQON, K_EQ, K_PRESET, K_SCOUT, K_DIRECT };
+enum { K_SBX, K_ON, K_LVL, K_SVMODE, K_EQON, K_EQ, K_PRESET, K_SCOUT, K_DIRECT, K_SPK };
 #define PV(k, i)	((k) << 8 | (i))
 #define PV_K(pv)	((pv) >> 8)
 #define PV_I(pv)	((pv) & 0xff)
@@ -361,6 +368,8 @@ static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 	case K_PRESET:
 		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(eq_preset_names),
 					 eq_preset_names);
+	case K_SPK:
+		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(spk_names), spk_names);
 	}
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	ui->count = 1;
@@ -386,6 +395,7 @@ static int fx_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_SCOUT:	*v = fx->scout; break;
 	case K_SVMODE:	uv->value.enumerated.item[0] = fx->sv_mode; break;
 	case K_PRESET:	uv->value.enumerated.item[0] = fx->eq_preset; break;
+	case K_SPK:	uv->value.enumerated.item[0] = fx->spk; break;
 	}
 	return 0;
 }
@@ -430,7 +440,7 @@ static void fx_update_active(struct creative_chip *chip)
 		struct snd_kcontrol *kc = fx->kc[i];
 		unsigned int k = PV_K(kc->private_value), old = kc->vd[0].access;
 		bool active = k == K_DIRECT ? true :
-			      k == K_SBX ? !fx->direct : fx_eff(fx);
+			      k == K_SBX || k == K_SPK ? !fx->direct : fx_eff(fx);
 
 		if (active)
 			kc->vd[0].access &= ~SNDRV_CTL_ELEM_ACCESS_INACTIVE;
@@ -536,6 +546,13 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			fx_live_eq(chip, true, false);
 		fx_notify_others(chip, kc);
 		return 1;
+	case K_SPK:
+		if (e >= ARRAY_SIZE(spk_cfgs) || e == fx->spk)
+			return 0;
+		fx->spk = e;
+		if (!fx->direct && !chip->dsp_switch_pending)
+			fx_apply_all(chip);	/* speaker config + full range, as Windows */
+		return 1;
 	case K_SCOUT:
 		if (!!v == fx->scout)
 			return 0;
@@ -588,6 +605,8 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	err = fx_add(chip, "Direct Mode Switch", K_DIRECT, 0);
 	if (!err)
 		err = fx_add(chip, "SBX Switch", K_SBX, 0);
+	if (!err)
+		err = fx_add(chip, "Speaker Config", K_SPK, 0);
 	for (i = 0; !err && i < FX_COUNT; i++) {
 		snprintf(name, sizeof(name), "FX %s Switch", fx_names[i]);
 		err = fx_add(chip, name, K_ON, i);

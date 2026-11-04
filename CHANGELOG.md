@@ -3,6 +3,43 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.2 (2026-11-04)
+
+Quality-of-life round, plus one mystery solved and one ghost hunted.
+
+### Added
+
+- **Speaker Config** control (2.0 / 2.1), same idea as the speaker
+  setting in the Creative app. Works with Direct Mode off; defaults to
+  2.1, which is what Windows uses. Checked it in the log: the DSP gets
+  exactly the values Windows sends. 4.0, 4.1 and 5.1 show up when 5.1
+  does; until then they'd just throw half your mix at jacks we don't
+  drive yet.
+
+### Fixed
+
+- **The "27 + 24 firmware mismatches" are gone.** These sat in the
+  "known issues" list since the start, bugging me. Turns out the
+  firmware was fine the whole time: we were reading the DSP's spare RAM
+  back from the wrong address. Read it where it actually lives and it's
+  a perfect match. 0 mismatches. Case closed.
+- **Ghost boots.** Every so often a boot came up where DSP mode was
+  silent or did something weird (every output run through a stack of
+  sample-rate converters, like the card was having a moment). Both of
+  those boots had one thing in common: a setup read during startup came
+  back empty and the driver just guessed. Now it waits a beat and asks
+  again. If you ever see "after a retry" in the log, that's it doing its
+  job.
+
+Tested on kernel 7.2.14: Speaker Config both ways, the firmware
+read-back, Direct Mode off/on, SBX on speakers.
+
+Upgrading from 0.6.1: replace the module, `sudo depmod -a`, reboot. If
+DSP mode ever sounds wrong after an update, power off at the PSU once;
+a warm reboot keeps the card's old state.
+
+-- Joe
+
 ## 0.6.1 (2026-11-04)
 
 - **All 20 of Windows' EQ presets**, straight from the capture, in the

@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.6.1"
+#define CREATIVE_AE9_DRV_VERSION	"0.6.2"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -200,6 +200,7 @@ struct creative_chip {
 		bool		eq_on;
 		s16		eq[11];		/* 0.1 dB: pre-gain, 31 Hz .. 16 kHz */
 		u8		eq_preset;
+		u8		spk;		/* index into spk_cfgs (fx.c) */
 		bool		scout;
 		bool		dead;		/* DSP stopped answering */
 		unsigned int	fails;
