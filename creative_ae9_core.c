@@ -2857,7 +2857,8 @@ static void creative_ae9_ops_replay(struct creative_chip *chip,
  * Switch the output between the card's RCA jacks (speakers) and the head
  * unit's headphone jack, as Windows does (switch op lists), then restore
  * that output's own volume. Windows also brackets the change with
- * f0 22 02 01 01 / 00 on the head unit.
+ * f0 22 02 01 01 / 00 on the head unit, which is the SBX light (item 01):
+ * it flashes, then ends off. The heartbeat puts the real state back.
  */
 static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 {
@@ -2885,6 +2886,7 @@ static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 	msleep(600);
 	creative_spi_frame_win(chip, (const u8[]){ 0xf0, 0x22, 0x02, 0x01, 0x00, 0xf7 },
 			       6, resp, sizeof(resp));
+	chip->hu_sbx_led = -1;		/* left off: heartbeat resends it */
 	if (chip->hu_vol_ctl)
 		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->hu_vol_ctl->id);
 	if (chip->hu_out_ctl)
