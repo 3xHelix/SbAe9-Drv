@@ -88,9 +88,21 @@ make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 sudo cp snd-hda-codec-creative-ae9.ko /lib/modules/$(uname -r)/extra/ && sudo depmod -a
 ```
 
-Redo both after every code change and kernel update. (The DKMS script
-deletes a hand-copied module for the kernels it installs for, so the two
-don't clash.)
+Redo both after every code change and kernel update.
+
+**One install method per machine.** By hand, DKMS and a packaged build
+(akmod/kmod) each put their own copy of the module under `/lib/modules`;
+with two of them it's unclear which one loads, and updating one can leave
+the other's old copy in charge. To switch:
+
+- by hand to DKMS: just run `sudo scripts/dkms-install.sh` (it deletes the
+  hand-copied module first);
+- DKMS to by hand: `sudo scripts/dkms-install.sh --remove`, then copy;
+- to or from a package: remove the other method first (the DKMS script
+  refuses to run next to an installed `akmod-`/`kmod-` package).
+
+`scripts/dkms-install.sh --check` (no root needed) shows what's installed
+for the running kernel, every copy of the module, and which one loads.
 
 ### 3. Keep `snd_hda_intel` off the card
 

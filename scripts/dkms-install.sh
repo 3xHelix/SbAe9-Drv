@@ -7,15 +7,44 @@
 #                                            for the running kernel (and any
 #                                            kernels given as arguments)
 #   sudo scripts/dkms-install.sh --remove   take the driver out of DKMS
+#   scripts/dkms-install.sh --check         show how the driver is installed
+#                                            and every copy of it (no changes)
 #
-# Older registered versions are removed, and a hand-copied module in
-# /lib/modules/<kernel>/extra/ is deleted first so only one copy exists.
+# One install method per machine (by hand, DKMS, or a packaged akmod/kmod):
+# each puts its own copy under /lib/modules and with two it's unclear which
+# one loads. So older DKMS versions are removed, a hand-copied module in
+# /lib/modules/<kernel>/extra/ is deleted first, the script refuses to run
+# next to a packaged build, and it warns if any other copy is left.
 set -euo pipefail
 
 NAME=snd-hda-codec-creative-ae9
 SRC=$(cd "$(dirname "$0")/.." && pwd)
+
+# every copy of the module for a kernel, wherever it came from
+copies() { find "/lib/modules/$1" -name "$NAME.ko*" 2>/dev/null | sort; }
+# packaged builds (akmods / kmod RPMs), if any
+packaged() { command -v rpm >/dev/null && rpm -qa "akmod-$NAME*" "kmod-$NAME*" 2>/dev/null || true; }
+
+if [ "${1:-}" = "--check" ]; then
+	k=$(uname -r)
+	echo "kernel $k:"
+	echo "  DKMS:     $( (command -v dkms >/dev/null && dkms status -m "$NAME" 2>/dev/null) | grep . || echo none)"
+	echo "  packages: $(packaged | tr '\n' ' ' | grep . || echo none)"
+	echo "  copies:"
+	copies "$k" | sed 's/^/    /' | grep . || echo "    none (the driver isn't installed for this kernel)"
+	echo "  modprobe loads: $(modinfo -k "$k" -n "$NAME" 2>/dev/null || echo nothing)"
+	[ "$(copies "$k" | wc -l)" -le 1 ] || echo "  WARNING: more than one copy; keep one install method and remove the others" >&2
+	exit 0
+fi
+
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 command -v dkms >/dev/null || { echo "dkms isn't installed (sudo dnf install dkms)" >&2; exit 1; }
+if [ "${1:-}" != "--remove" ] && [ -n "$(packaged)" ]; then
+	echo "ERROR: a packaged build of the driver is installed:" >&2
+	packaged | sed 's/^/  /' >&2
+	echo "Use one install method: remove the package first (sudo dnf remove ...), or keep it and skip DKMS." >&2
+	exit 1
+fi
 
 registered() { dkms status -m "$NAME" 2>/dev/null | sed -n "s#^$NAME/\([^,: ]*\).*#\1#p" | sort -u; }
 
@@ -31,6 +60,8 @@ if [ "${1:-}" = "--remove" ]; then
 	for v in $(registered); do drop "$v"; done
 	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
 	echo "removed from DKMS; build and copy the module by hand again if you still want it"
+	left=$(copies "$(uname -r)")
+	[ -z "$left" ] || { echo "still installed for $(uname -r) (not by DKMS):"; echo "$left" | sed 's/^/  /'; }
 	exit 0
 fi
 
@@ -64,3 +95,10 @@ if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
 fi
 echo "done: $NAME $VER is in DKMS ($(modinfo -k "$(uname -r)" -n "$NAME"));"
 echo "new kernels get it built automatically. Reboot to load it."
+for k in "$(uname -r)" "$@"; do
+	if [ "$(copies "$k" | wc -l)" -gt 1 ]; then
+		echo "WARNING: more than one copy of the module for $k:" >&2
+		copies "$k" | sed 's/^/  /' >&2
+		echo "Only the DKMS one (above) should stay; delete the others and run: sudo depmod -a $k" >&2
+	fi
+done
