@@ -207,6 +207,18 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_min = 48000;
 		runtime->hw.rate_max = 48000;
 	}
+	/*
+	 * Direct Mode off = through the DSP: Windows offers up to 96 kHz.
+	 * Windows also plays 6 channels there (captures 5, 6: format 0x35),
+	 * but a 6-channel start sent before the switch to DSP mode (PipeWire
+	 * probes it at boot) leaves the DSP output a mess, and 5.1 isn't
+	 * wired up yet: stereo only for now.
+	 */
+	if (!chip->fx.direct) {
+		runtime->hw.rates &= SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+				     SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
+		runtime->hw.rate_max = min(runtime->hw.rate_max, 96000U);
+	}
 	runtime->hw.buffer_bytes_max = 128 * 1024;
 	runtime->hw.period_bytes_min = 4096;
 	runtime->hw.period_bytes_max = 64 * 1024;
@@ -410,6 +422,7 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 	case SNDRV_PCM_TRIGGER_RESUME:
 		/* stream only; the start block went out at prepare */
 		creative_ae9_stream_start(chip, base);
+		creative_ae9_dsp_switch_kick(chip);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:

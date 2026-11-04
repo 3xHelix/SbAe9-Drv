@@ -785,9 +785,12 @@ static void scp_drain_announced(struct creative_chip *chip)
 
 	while (guard-- &&
 	       (int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) > 0) {
-		scp_read_announced(chip, &hdr, junk, ARRAY_SIZE(junk));
+		int n = scp_read_announced(chip, &hdr, junk, ARRAY_SIZE(junk));
+
 		dev_info_ratelimited(chip->dev,
-			"scp: drained unexpected reply hdr=0x%08x\n", hdr);
+			"scp: drained unexpected reply hdr=0x%08x (%d words: %08x %08x %08x %08x)\n",
+			hdr, n, n > 0 ? junk[0] : 0, n > 1 ? junk[1] : 0,
+			n > 2 ? junk[2] : 0, n > 3 ? junk[3] : 0);
 	}
 }
 

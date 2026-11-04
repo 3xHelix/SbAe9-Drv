@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.5.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.6.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -191,6 +191,24 @@ struct creative_chip {
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
 	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
 	u8			dac48_07;	/* last value written to DAC 48/07 */
+	struct creative_ae9_fx {		/* SBX effects, creative_ae9_fx.c */
+		bool		direct;		/* Windows' Direct Mode (default on) */
+		bool		sbx;		/* the SBX button; acts with Direct Mode off */
+		bool		on[5];		/* Surround, Dialog+, Smart Vol, Crystalizer, Bass */
+		u8		level[5];	/* 0..100 */
+		u8		sv_mode;	/* Smart Volume: Normal, Loud, Night */
+		bool		eq_on;
+		s8		eq[11];		/* dB: pre-gain, 31 Hz .. 16 kHz */
+		u8		eq_preset;
+		bool		scout;
+		bool		dead;		/* DSP stopped answering */
+		unsigned int	fails;
+		bool		saved_sv_on, saved_eq_on;	/* before Scout Mode */
+		u8		saved_sv_level, saved_sv_mode;
+		s8		saved_eq[11];
+		struct snd_kcontrol *kc[32];
+		unsigned int	nkc;
+	} fx;
 
 	/* debugfs */
 	struct dentry		*dbg_dir;
@@ -218,6 +236,8 @@ struct creative_chip {
 	 * for ~20s so the DSP and head-unit MCU are ready.
 	 */
 	struct delayed_work	dsp_work;
+	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
+	bool			dsp_switch_pending;
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
 	int			pcm_started;  /* set after first PCM start — skips one-time ChipIO setup */
@@ -233,6 +253,8 @@ struct creative_chip {
 	unsigned int		pcm_start_sent;	/* pcm_windows start block sent since open */
 	unsigned int		pcm_start_rate;	/* stream rate that block was sent for */
 	u16			pcm_start_fmt;	/* and its stream format */
+	bool			dsp_primed;
+	bool			dsp_active;	/* DSP mode routing is up */	/* a full start block ran since bring-up */
 	unsigned int		pcm_bits;	/* 24 or 32, latched at open */
 	unsigned int		scp_unsol_done;
 	/* head unit (post_windows): volume as attenuation in 0.5 dB steps,
@@ -348,6 +370,13 @@ void creative_dsp_chipio_addr_invalidate(void);
 int creative_dsp_boot_handshake(struct creative_chip *chip);
 extern unsigned int ae9_ca0113_windows;
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
+void creative_ae9_fx_init(struct creative_chip *chip);
+int creative_ae9_fx_controls_add(struct creative_chip *chip);
+void creative_ae9_fx_restore(struct creative_chip *chip);
+void creative_ae9_fx_defer(struct creative_chip *chip);
+void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
+void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
+void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);
 void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what);
 void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,

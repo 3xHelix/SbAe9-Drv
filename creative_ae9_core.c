@@ -703,6 +703,15 @@ static void creative_ae9_verb_block_replay(struct creative_chip *chip,
 		}
 		if (creative_ae9_corb_send_verb_sync(chip, v, &resp) < 0)
 			errs++;
+		/*
+		 * Stream stop (ChipIO param 0x1c = 0): the 8051 tears the stream's
+		 * routes down after it answers. Windows waits 48 ms here (capture
+		 * 6, seq 9954 -> 9956) and 144 ms on the Direct Mode on stop
+		 * (11808); going straight on left random router layouts
+		 * (2026-11-04: no DSP input, half inputs, outputs to 0xff).
+		 */
+		if (v == 0x1157101c)
+			msleep(50);
 	}
 	creative_dsp_chipio_addr_invalidate();
 	if (!atomic) {
@@ -772,6 +781,338 @@ static size_t ae9_chipio_w(u32 *t, size_t n, u32 addr, u32 data)
 	return n;
 }
 
+/*
+ * Windows' Direct Mode switch (captures 2 and 3, WINDOWS-CAPTURE-ANALYSIS
+ * §38). Off (capture 5, 22:56:39, with music playing): node 0x02 unbound,
+ * DSP stream 0x14 off, stream 0x05 (host audio) to connection point 0x00
+ * (the DSP's input), stream 0x18 carrying the DSP's output (0x09) to 0xd0 at
+ * 96 kHz, 6 channels, and the I2S on the DSP's 96 kHz clocks (descriptors
+ * and the full PLL program, as at startup). A stream then plays once node
+ * 0x02 is bound again with only 0x18b008, its format and the bind (Windows'
+ * next stream, 22:56:47) - replaying the start block would undo the
+ * routing. On (= direct): stream 0x18 off; the next start block routes
+ * direct again (Windows was silent until stop/play too).
+ */
+/*
+ * The three sequences below are Windows' raw verbs (capture 6,
+ * vm_capture_coldboot_20261103_233115), status reads included: ChipIO
+ * takes a parameter only after a status read (0x115f0100 / 0x115f0300, and
+ * the 8051 reads 0x70d/0x70e/0xf07). Sent without them, as an earlier
+ * version did, the routing parameters are dropped and the audio keeps the
+ * direct path (2026-11-04: no DSP stream or route change had any effect).
+ */
+
+/*
+ * The audio router (ChipIO 0x190000..; ca0132.c chipio_remap_stream): one
+ * entry per 48 kHz channel, bits 17:16 state (1 active, 3 via the sample
+ * rate converter), 15:8 destination port, 7:0 source port. Ports: 0x00-0x1f
+ * HDA streams, 0x80-0xbf SRC, 0xc0-0xdf DSP DMA (assigned by the 8051),
+ * 0xe0-0xff DAC/ADC; 0x40/0x41 are the front (ES9038) outputs. Windows'
+ * Direct Mode start writes 0x190060/64 = HDA 0x00/0x01 -> 0x40/0x41, a
+ * manual overwrite that keeps feeding the front DAC straight from the bus
+ * whatever the DSP streams do. With Direct Mode off the 8051 has already
+ * built the DSP path (HDA -> SRC -> DSP DMA in, DSP DMA out -> 0xe0/0xe1 at
+ * 0x190048/4c, the processed front pair), so 0x40/0x41 have to take the
+ * DSP's processed output instead (found 2026-11-04: effects and EQ became
+ * audible the moment these two entries changed).
+ */
+#define AE9_RT_FRONT_L		0x190060
+#define AE9_RT_FRONT_R		0x190064
+#define AE9_RT_APPLY		0x19042c
+
+#define AE9_RT_ENTRIES		128	/* 0x190000..0x1901fc (entries seen up to 0x19011c) */
+
+/*
+ * The other DSP outputs with no recording running: c2..cb -> these ports
+ * (2026-11-04 dumps with SBX working). While a recording runs through the
+ * DSP the 8051 sends them to 0xff on purpose (Discord's mic, SBX clean),
+ * so 0xff is only logged; echoey audio seen with that layout came with
+ * the stream 0x05 leak.
+ */
+static const u8 ae9_rt_dsp_out[] = {
+	0x60, 0x61, 0x70, 0x71, 0x52, 0x53, 0x62, 0x63, 0x72, 0x73,
+};
+
+static int ae9_rt_free_slot(const u32 *e, int near)
+{
+	unsigned int i;
+
+	if (near > 0 && !e[near - 1])
+		return near - 1;
+	if (near >= 0 && near + 1 < AE9_RT_ENTRIES && !e[near + 1])
+		return near + 1;
+	for (i = 0x0c; i < AE9_RT_ENTRIES; i++)	/* past 0x190030 */
+		if (!e[i] && 0x190000 + 4 * i != AE9_RT_FRONT_L &&
+		    0x190000 + 4 * i != AE9_RT_FRONT_R)
+			return i;
+	return -1;
+}
+
+/*
+ * Front outputs from the DSP (Direct Mode off). The 8051 assigns the DSP
+ * DMA ports itself and they move between boots (2026-11-04: c0/c1 -> e0/e1
+ * at 0x190048 on one boot, c6/c7 -> e8/e9 there and c0..c3 -> 40..43 at
+ * 0x190090 on the next), so look them up: prefer the 8051's own entries
+ * that feed 0x40/0x41 from a DSP port, else its DSP-out -> 0xe0/0xe1 pair,
+ * else c0/c1.
+ *
+ * Then repair the two broken layouts seen when the 8051 builds the DSP
+ * path badly (with the usual c0/c1 front ports only):
+ * - DSP outputs c2..cb sent to 0xff or missing: echoey, crunched audio.
+ *   Point them back at the good boot's ports.
+ * - HDA 0x00 -> SRC 0x90 missing (after resume) while SRC 0x90 still feeds
+ *   the DSP: only half the input arrives, crunched audio. Add it back
+ *   (and HDA 0x01 -> SRC 0x80 likewise).
+ */
+static void creative_ae9_router_front_dsp(struct creative_chip *chip)
+{
+	int l = -1, r = -1, el = -1, er = -1, inputs = 0, outs = 0, ins = 0;
+	int out_at[ARRAY_SIZE(ae9_rt_dsp_out)];
+	int feed_at[2] = { -1, -1 }, src_to_dsp[2] = { 0, 0 };
+	static const u8 hda_src[2] = { 0x90, 0x80 };	/* HDA 0x00, 0x01 */
+	u32 e[AE9_RT_ENTRIES];
+	unsigned int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(out_at); i++)
+		out_at[i] = -1;
+	mutex_lock(&chip->replay_mutex);
+	creative_dsp_chipio_addr_invalidate();
+	for (i = 0; i < AE9_RT_ENTRIES; i++) {
+		u32 a = 0x190000 + 4 * i, v;
+		u8 src, dst;
+
+		if (creative_dsp_chipio_read(chip, a, &v) < 0)
+			break;
+		/* reads now and then come back 0 (2026-11-04: an entry read
+		 * as 0 in one dump and fine right after): confirm empties,
+		 * since the repairs below write into empty slots */
+		if (!v && creative_dsp_chipio_read(chip, a, &v) < 0)
+			break;
+		e[i] = v;
+		n++;
+		if (a == AE9_RT_FRONT_L || a == AE9_RT_FRONT_R)
+			continue;	/* ours */
+		src = v & 0xff;
+		dst = (v >> 8) & 0xff;
+		if (!((v >> 16) & 3))
+			continue;	/* inactive */
+		if ((src & 0xe0) == 0xc0) {
+			if (dst == 0x40 && l < 0)
+				l = src;
+			else if (dst == 0x41 && r < 0)
+				r = src;
+			else if (dst == 0xe0 && el < 0)
+				el = src;
+			else if (dst == 0xe1 && er < 0)
+				er = src;
+			/* -2: sent somewhere else on purpose, leave it */
+			if (src >= 0xc2 && src - 0xc2 < ARRAY_SIZE(ae9_rt_dsp_out) &&
+			    out_at[src - 0xc2] == -1)
+				out_at[src - 0xc2] = (dst == 0xff ||
+					dst == ae9_rt_dsp_out[src - 0xc2]) ? (int)i : -2;
+		}
+		if ((dst & 0xe0) == 0xc0 && src >= 0x80 && src < 0xc0) {
+			inputs++;
+			if (src == 0x90)
+				src_to_dsp[0] = 1;
+			else if (src == 0x80)
+				src_to_dsp[1] = 1;
+		}
+		if (src == 0x00 && dst == 0x90)
+			feed_at[0] = i;
+		else if (src == 0x01 && dst == 0x80)
+			feed_at[1] = i;
+	}
+	if (l < 0 || r < 0) {
+		l = el >= 0 ? el : 0xc0;
+		r = er >= 0 ? er : 0xc1;
+	}
+	if (n == AE9_RT_ENTRIES && l == 0xc0 && r == 0xc1) {
+		for (i = 0; i < ARRAY_SIZE(ae9_rt_dsp_out); i++) {
+			u32 want = 0x10000 | ae9_rt_dsp_out[i] << 8 | (0xc2 + i);
+			int at = out_at[i];
+
+			if (at >= 0 && e[at] != want)
+				outs++;		/* to 0xff: log only */
+		}
+		for (i = 0; i < 2; i++) {
+			u32 want = 0x10000 | hda_src[i] << 8 | i;
+			int at;
+
+			if (!src_to_dsp[i] || feed_at[i] >= 0)
+				continue;
+			at = ae9_rt_free_slot(e, feed_at[!i]);
+			if (at < 0)
+				break;
+			e[at] = want;
+			creative_dsp_chipio_write(chip, 0x190000 + 4 * at, want);
+			ins++;
+			inputs++;
+		}
+	}
+	creative_dsp_chipio_write(chip, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l);
+	creative_dsp_chipio_write(chip, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r);
+	creative_dsp_chipio_write(chip, AE9_RT_APPLY, 1);
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	dev_info(chip->dev, "SBX: router front L/R <- DSP ports 0x%02x/0x%02x, %d DSP input entr%s active\n",
+		 l, r, inputs, inputs == 1 ? "y" : "ies");
+	if (outs)
+		dev_info(chip->dev, "SBX: router: %d DSP output%s to 0xff (normal while recording)\n",
+			 outs, outs == 1 ? "" : "s");
+	if (ins)
+		dev_warn(chip->dev, "SBX: router repaired: %d input feed%s (bad layout from the 8051)\n",
+			 ins, ins == 1 ? "" : "s");
+	if (!inputs)
+		dev_warn(chip->dev, "SBX: the DSP's input path is not active in the router: no audio in DSP mode (try Direct Mode, or a PSU cold boot)\n");
+}
+
+/* Playback start with Direct Mode off (seq 11066): 0x18b008, format, bind. */
+void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format)
+{
+	u32 t[] = {
+		0x115f0300, 0x1150b008, 0x11510018, 0x115300f0, 0x11540000,
+		0x10220031,		/* node 0x02 converter format (patched) */
+		0x10270610,		/* node 0x02 bound to tag 1, ch 0 */
+	};
+
+	t[5] = 0x10220000 | format;
+	creative_ae9_verb_block_replay(chip, t, ARRAY_SIZE(t), false,
+				       "SBX: playback start in DSP mode");
+	creative_ae9_router_front_dsp(chip);
+}
+
+void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
+{
+	/* Direct Mode off (seq 9940-10118): node 0x02 unbound, 0x14 off,
+	 * 0x05 -> 0x00, 0x18: 0x09 -> 0xd0 at 96 kHz 6 ch on, ASI 8, PLL
+	 * trim, 96 kHz I2S descriptors ... */
+	static const u32 head[] = {
+		0x10270600, 0x11570dfc, 0x11570e07, 0x115f0700, 0x115f0100,
+		0x11571718, 0x11571814, 0x1157101c, 0x115710b8, 0x115f0100,
+		0x11571719, 0x11571843, 0x1157101a, 0x115f0100, 0x11571718,
+		0x11571818, 0x115f0100, 0x11571719, 0x11571809, 0x115f0100,
+		0x1157171a, 0x115718d0, 0x115f0100, 0x1157171d, 0x115718d0,
+		0x115f0100, 0x1157171e, 0x1157180b, 0x115f0100, 0x11571718,
+		0x11571818, 0x115710db, 0x11570d24, 0x11570e08, 0x115f0700,
+		0x115f0100, 0x11571718, 0x11571818, 0x1157103c, 0x115f0100,
+		0x11571717, 0x11571808, 0x11570d40, 0x11570cc7, 0x11570d42,
+		0x11570ccd, 0x11570d41, 0x11570cce,
+		0x11509000, 0x11510018, 0x1153f101, 0x11540001,
+		0x11509004, 0x11510018, 0x1153f101, 0x11540001,
+		0x11509008, 0x11510018, 0x1153f101, 0x11540001,
+		0x11509024, 0x11510018, 0x11534004, 0x11540001,
+		0x11509028, 0x11510018, 0x1153000f, 0x11540002,
+	};
+	/* ... (DAC re-lock here) ... full PLL program, ASI 0xf */
+	static const u32 tail[] = {
+		0x11570d44, 0x11570cc8, 0x11570d43, 0x11570ccc, 0x11570d45,
+		0x11570ccb, 0x11570d40, 0x11570cc7, 0x11570d42, 0x11570ccd,
+		0x11570d41, 0x11570cce, 0x11570d51, 0x11570cdb, 0x115f0100,
+		0x11571717, 0x1157180f,
+	};
+	static const u8 dac_relock[][3] = {
+		{ 0x48, 0x01, 0xc0 },	/* input configuration */
+		{ 0x48, 0x0a, 0x02 },	/* master mode */
+	};
+	/* Direct Mode on (seq 11794-11812): node 0x02 unbound, stream 0x18 off */
+	static const u32 off[] = {
+		0x10270600, 0x11570d24, 0x11570e08, 0x115f0700, 0x115f0100,
+		0x11571718, 0x11571818, 0x1157101c, 0x115f0100,
+	};
+	static const u32 in05[] = {
+		0x115f0100, 0x11571718, 0x11571805, 0x1157105b,	/* 0x05: 2 ch */
+		0x115f0100, 0x11571718, 0x11571805, 0x1157103c,	/* 0x05: on */
+		0x115f0100,
+	};
+	static const u32 in05_off[] = {
+		0x115f0100, 0x11571718, 0x11571805, 0x1157101c,	/* 0x05: off */
+		0x115f0100,
+	};
+	u32 zero = 0;	/* 0.0f: 0 dB, and "not muted" */
+
+	if (!chip->corb_buf || !chip->dsp_done)
+		return;
+	if (!dsp) {
+		creative_ae9_verb_block_replay(chip, off, ARRAY_SIZE(off), false,
+					       "SBX: direct mode (DSP stream 0x18 off)");
+		/*
+		 * Stop stream 0x05 too: we start it in DSP mode (Windows doesn't),
+		 * and left running it keeps the HDA -> SRC 0x90/0x80 -> DSP path
+		 * in use. The next Direct Mode off then got a second path on SRC
+		 * 0x98/0x88 that never started: silence or crunched audio, until
+		 * a PSU cold boot (2026-11-04 router dumps).
+		 */
+		creative_ae9_verb_block_replay(chip, in05_off, ARRAY_SIZE(in05_off),
+					       false, "SBX: DSP input stream 0x05 off");
+		chip->dsp_active = false;
+		return;
+	}
+	chip->dsp_active = true;
+	creative_ae9_verb_block_replay(chip, head, ARRAY_SIZE(head), false,
+				       "SBX: DSP mode (host audio -> DSP -> DAC at 96 kHz)");
+	/* the DAC follows the new I2S clock: Windows sends these right after
+	 * the descriptors (captures 5, 6), as every playback start does */
+	creative_dsp_ca0113_replay_quiet(chip, dac_relock, ARRAY_SIZE(dac_relock));
+	msleep(20);	/* Windows: 17 ms between descriptors and PLL (seq 10076) */
+	creative_ae9_verb_block_replay(chip, tail, ARRAY_SIZE(tail), false,
+				       "SBX: DSP mode, full PLL program");
+	/* a stream already playing: bind it again, as a new one would be */
+	if (chip->pcm_start_sent)
+		creative_ae9_dsp_mode_start(chip, chip->pcm_start_fmt);
+	/*
+	 * The audio now passes the DSP's speaker volume (module 0x32), which
+	 * the start block leaves at Windows' capture-time -36.19 dB (bypassed
+	 * in Direct Mode). Our volume is the DAC's (the knob), so unity here.
+	 * Windows keeps 0x32 in step with its own volume instead.
+	 */
+	mutex_lock(&chip->replay_mutex);
+	creative_dsp_scp_send(chip, (3 << 17) | (0x20 << 8) | 0x32, &zero, 1);
+	creative_dsp_scp_send(chip, (4 << 17) | (0x20 << 8) | 0x32, &zero, 1);
+	creative_dsp_scp_send(chip, (2 << 17) | (0x20 << 8) | 0x32, &zero, 1);
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	dev_info(chip->dev, "SBX: DSP speaker volume 0 dB (left, right), unmuted\n");
+	/* host-audio stream 0x05 on, stereo (DarkNikGr's working AE-9 setup:
+	 * "routed but never STARTED before"), then the front outputs from the
+	 * DSP (also done by dsp_mode_start, for later streams) */
+	creative_ae9_verb_block_replay(chip, in05, ARRAY_SIZE(in05), false,
+				       "SBX: DSP input stream 0x05 on");
+	creative_ae9_router_front_dsp(chip);
+}
+
+/*
+ * How long a fresh direct stream plays before the switch to DSP mode.
+ * 300 ms was too soon (2026-11-04: echoey, crunched audio that toggling
+ * Direct Mode didn't clear); switching by hand seconds later works.
+ */
+static unsigned int dsp_switch_ms = 3000;
+module_param(dsp_switch_ms, uint, 0644);
+MODULE_PARM_DESC(dsp_switch_ms,
+	"ms a fresh stream plays direct before the switch to DSP mode (default 3000)");
+
+static void creative_ae9_dsp_switch_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w),
+						  struct creative_chip,
+						  dsp_switch_work);
+
+	if (!chip->dsp_switch_pending || chip->fx.direct || !chip->pcm_start_sent)
+		return;
+	chip->dsp_switch_pending = false;
+	dev_info(chip->dev, "SBX: switching the running stream to DSP mode (after %u ms)\n",
+		 dsp_switch_ms);
+	creative_ae9_fx_restore(chip);	/* DSP mode + the SBX profile */
+}
+
+/* Playback trigger start (atomic): run a pending switch shortly after. */
+void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
+{
+	if (chip->dsp_switch_pending && !chip->fx.direct)
+		queue_delayed_work(chip->wq, &chip->dsp_switch_work,
+				   msecs_to_jiffies(dsp_switch_ms));
+}
+
 void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
 				  unsigned int rate, u16 format)
 {
@@ -786,6 +1127,14 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 			r = i;
 	if (start && rate && ae9_pcm_rates[r].rate != rate)
 		dev_warn(chip->dev, "pcm_rates: no setup for %u Hz, using 48 kHz\n", rate);
+	/* Direct Mode off: Windows' start is only the bind (see dsp_mode). The
+	 * DSP routing needs what a full start block sets up (silent otherwise,
+	 * e.g. Direct Mode off restored at boot): send one first. */
+	if (start && !chip->fx.direct && !atomic && chip->dsp_primed &&
+	    !chip->dsp_switch_pending) {
+		creative_ae9_dsp_mode_start(chip, format);
+		return;
+	}
 	if (start && !atomic && ae9_ca0113_windows) {
 		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm)][3];
 
@@ -897,6 +1246,18 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 					       "pcm_windows: playback start block (headphones)" :
 					       "pcm_windows: playback start block");
 		kfree(t);
+		chip->dsp_primed = true;
+		/*
+		 * First start in DSP mode after a bring-up (or a switch made
+		 * while nothing played): start as a direct stream, then switch
+		 * live once it runs (creative_ae9_dsp_switch_work). Switching
+		 * before any stream has run leaves the 8051's DSP input path
+		 * broken (2026-11-04: inactive or half-built router entries,
+		 * silence or crunched audio); the live switch from a running
+		 * direct stream works every time.
+		 */
+		if (!chip->fx.direct && !atomic)
+			chip->dsp_switch_pending = true;
 	} else {
 		creative_ae9_verb_block_replay(chip, ae9_cold_pcm_stop,
 					       ARRAY_SIZE(ae9_cold_pcm_stop), atomic,
@@ -1059,13 +1420,34 @@ static void creative_ae9_dsp_health(struct creative_chip *chip, u32 dbgcntl)
 			 dbgcntl, stalled ? "stall pattern" : "ok");
 }
 
+/*
+ * The startup tail comes from the old warm capture. Six of its SET messages
+ * are ones Windows' own startup never sends and the DSP rejects (error
+ * replies 0x0e4e9620 etc. at every boot): output effects 0x96 requests
+ * 0x16 (bass redirect crossover), 0x1e (sub gain), 0x27/0x28 (surround L/R
+ * level), 0x37/0x38 (surround L/R delay). tail_drop_rejected=1 (default)
+ * leaves them out, so the effects module sees what Windows' startup sends.
+ */
+static bool tail_drop_rejected = true;
+module_param(tail_drop_rejected, bool, 0444);
+MODULE_PARM_DESC(tail_drop_rejected, "Leave out the 6 startup SCP messages the DSP rejects (1=yes, default)");
+
+static bool ae9_tail_rejected(u32 hdr)
+{
+	unsigned int mid = hdr & 0xff, req = (hdr >> 17) & 0x7f;
+
+	return !((hdr >> 16) & 1) && mid == 0x96 &&
+	       (req == 0x16 || req == 0x1e || req == 0x27 || req == 0x28 ||
+		req == 0x37 || req == 0x38);
+}
+
 static void creative_ae9_post_fw(struct creative_chip *chip)
 {
 	struct tail_msg *retry;
 	unsigned int nretry = 0;
 	u32 words[1 + 32];
 	unsigned int n = 0, msgs = 0, msg_err = 0, verbs = 0, verb_err = 0;
-	unsigned int consec_err = 0, msg_skipped = 0;
+	unsigned int consec_err = 0, msg_skipped = 0, msg_dropped = 0;
 	unsigned int dbg = 0;
 	u16 lo = 0;
 	size_t i;
@@ -1112,7 +1494,10 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 					/* A DSP that stops taking commands makes
 					 * every send wait out its timeout; stop
 					 * sending SCP after 8 failures in a row. */
-					if (consec_err >= 8) {
+					if (tail_drop_rejected &&
+					    ae9_tail_rejected(words[0])) {
+						msg_dropped++;
+					} else if (consec_err >= 8) {
 						msg_skipped++;
 						retry_add(retry, &nretry, words, n);
 					} else if (creative_dsp_scp_send(chip, words[0],
@@ -1148,8 +1533,8 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 
 	creative_dsp_chipio_read(chip, 0x100e30, &dbg);
 	dev_info(chip->dev,
-		 "fw_split: tail replay done: %u SCP msgs (%u failed, %u skipped), %u verbs (%u failed); DBGCNTL 0x%08x\n",
-		 msgs, msg_err, msg_skipped, verbs, verb_err, dbg);
+		 "fw_split: tail replay done: %u SCP msgs (%u failed, %u skipped, %u dropped), %u verbs (%u failed); DBGCNTL 0x%08x\n",
+		 msgs, msg_err, msg_skipped, msg_dropped, verbs, verb_err, dbg);
 	creative_ae9_dsp_health(chip, dbg);
 	if (nretry) {
 		unsigned int k, ok = 0;
@@ -1661,6 +2046,41 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 	if (!g_dbg_chip)
 		return -ENODEV;
 
+	/*
+	 * Experiments without a rebuild:
+	 *   "verb 1157171d"        one raw codec verb (CORB, response logged)
+	 *   "scp 32 3 c1f00000"    one DSP SET: module, request, value (float bits)
+	 */
+	if (!strncmp(buf, "verb ", 5)) {
+		u32 v, resp = 0;
+		int ret;
+
+		if (kstrtou32(strim(buf + 5), 16, &v))
+			return -EINVAL;
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		ret = creative_ae9_corb_send_verb_sync(g_dbg_chip, v, &resp);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
+		dev_info(g_dbg_chip->dev, "dbg verb 0x%08x -> 0x%08x (%d)\n", v, resp, ret);
+		return len;
+	}
+	if (!strncmp(buf, "scp ", 4)) {
+		unsigned int mid, req;
+		u32 v;
+		int ret;
+
+		if (sscanf(buf + 4, "%x %x %x", &mid, &req, &v) != 3)
+			return -EINVAL;
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		ret = creative_dsp_scp_send(g_dbg_chip, ((req & 0x7f) << 17) |
+					    (0x20 << 8) | (mid & 0xff), &v, 1);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
+		dev_info(g_dbg_chip->dev, "dbg scp 0x%02x/0x%02x = 0x%08x (%d)\n",
+			 mid, req, v, ret);
+		return len;
+	}
+
 	/* PCM manual test commands (no ALSA / no auto-open) */
 	if (!strncmp(buf, "pcmtest", 7)) {
 		int ret = creative_pcmtest_setup(g_dbg_chip);
@@ -1841,7 +2261,13 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 
 		if (sscanf(buf, "%7s %x", op, &a) != 2)
 			return -EINVAL;
+		/* serialized with the driver's own ChipIO use: unlocked reads
+		 * raced it and returned 0 or another address's value */
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		creative_dsp_chipio_addr_invalidate();
 		ret = creative_dsp_chipio_read(g_dbg_chip, a, &v);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "chipio[0x%x]=0x%x ret=%d\n", a, v, ret);
 		return len;
@@ -3384,6 +3810,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	 * no relay click, no audio. Moving INIT here fixes the race.
 	 */
 	INIT_DELAYED_WORK(&chip->dsp_work, creative_ae9_dsp_work);
+	INIT_DELAYED_WORK(&chip->dsp_switch_work, creative_ae9_dsp_switch_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
@@ -3447,6 +3874,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 		chip->mic_level = 99;	/* +9 dB, as Windows' capture blocks */
 		snd_ctl_add(chip->card, snd_ctl_new1(&mic_level_control, chip));
 		snd_ctl_add(chip->card, snd_ctl_new1(&dac_filter_control, chip));
+		creative_ae9_fx_init(chip);
+		creative_ae9_fx_controls_add(chip);
 	}
 
 	/* IRQ before the card goes public: playback/capture need period
@@ -3584,10 +4013,29 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
  * reset. Replaces our older sequence, which left the DSP in a state the
  * next bring-up couldn't recover from without a power cut.
  */
+/*
+ * Before a power-down or a sleep: stop what we started in the 8051, as the
+ * streams' own stop paths would. Its routes survive a warm reboot (and the
+ * 8051 its record of them): a reboot with Direct Mode off and a recording
+ * through the DSP left a scrambled router on the next boot (2026-11-04).
+ */
+static void creative_ae9_streams_down(struct creative_chip *chip)
+{
+	if (!chip->corb_buf || !chip->dsp_done)
+		return;
+	if (chip->cap_start_sent) {
+		creative_ae9_cap_replay(chip, false);
+		chip->cap_start_sent = 0;
+	}
+	if (chip->dsp_active)
+		creative_ae9_dsp_mode(chip, false);	/* streams 0x18, 0x05 off */
+}
+
 static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *why)
 {
 	u32 ctl;
 
+	creative_ae9_streams_down(chip);
 	dev_info(chip->dev, "shutdown (%s): Windows power-down sequence\n", why);
 	/* stop capture (SD0) and playback (SD4) DMA */
 	ctl = readl(chip->hda_regs + 0x80 + AZX_REG_SD_CTL);
@@ -3608,6 +4056,7 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 	creative_ae9_corb_free(chip);
 	writel(0x100, chip->hda_regs + AZX_REG_GCTL);	/* controller in reset */
 	chip->dsp_done = 0;
+	chip->dsp_active = false;
 	dev_info(chip->dev, "shutdown (%s): done\n", why);
 }
 
@@ -3618,6 +4067,7 @@ static void creative_ae9_stop_works(struct creative_chip *chip)
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_work);
+	cancel_delayed_work_sync(&chip->dsp_switch_work);
 }
 
 /* Reboot / power-off: same as Windows shutting down. */
@@ -3687,6 +4137,9 @@ static int creative_ae9_suspend(struct device *dev)
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_work);
+	cancel_delayed_work_sync(&chip->dsp_switch_work);
+	creative_ae9_streams_down(chip);
+	chip->dsp_active = false;
 	chip->suspended = true;
 	writel(0, chip->hda_regs + AZX_REG_INTCTL);
 	creative_ae9_corb_free(chip);
@@ -3734,6 +4187,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 		chip->standup_done = 0;
 		chip->pcm_start_sent = 0;
 		chip->cap_start_sent = 0;
+		chip->dsp_primed = false;
 		atomic_set(&chip->scp_unsol, 0);
 		chip->scp_unsol_done = 0;
 		creative_dsp_chipio_addr_invalidate();
@@ -3767,6 +4221,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	if (chip->mic_level != 99)
 		creative_ae9_mic_level_apply(chip);
 	creative_ae9_dac_filter_apply(chip);
+	creative_ae9_fx_defer(chip);
 
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
 	dev_info(chip->dev, "resume: done after %u attempt(s), restoring output %s\n",

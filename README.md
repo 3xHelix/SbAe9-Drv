@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-01):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -17,7 +17,8 @@ playback.
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
 > 96, 192 and 384 kHz, 24- or 32-bit, is available as an option
 > (`pcm_rates=1`, `pcm_bits=32`); 44.1/88.2 kHz playback and recording above
-> 48 kHz are not done yet.
+> 48 kHz are not done yet. SBX effects and the EQ work through the card's
+> DSP, with Direct Mode off (stereo).
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -129,6 +130,20 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
   ES9038's fast or slow roll-off, as the Creative app sets it; Default keeps
   Windows' startup filter). Kept across sleep/resume.
+- SBX effects and EQ (new in 0.6.0): two stages, as in Windows.
+  "Direct Mode Switch" (default on) plays straight to the DAC at the
+  stream's rate, DSP bypassed. Turn it off and the audio goes through the
+  DSP at 96 kHz (stereo only for now); then "SBX Switch" turns the effects
+  on or off. With both, the "FX Surround / Dialog Plus / Smart Volume /
+  Crystalizer / Bass" switches and volumes (0-100), "FX Smart Volume Mode",
+  "EQ Switch", "EQ Preset" (Flat, Rock, Gaming), "EQ Pre-gain" and ten
+  bands (31 Hz-16 kHz, -12..+12 dB) and "Scout Mode Switch" act; otherwise
+  they are greyed out and keep their values. Set them in `alsamixer -c AE9`.
+  Works on speakers and headphones, across sleep and reboots. With Direct
+  Mode off, a new stream after boot, wake or a switch made while stopped
+  plays direct for 3 s (`dsp_switch_ms`), then moves to the DSP. Turning
+  Direct Mode on is silent until the stream restarts (pause/play), as in
+  Windows.
 - Volume: turn the head-unit knob (0.5 dB per step, ~1 dB per click); press
   it to mute or unmute. The same setting is the ALSA "Master Playback
   Volume" / "Master Playback Switch" (`alsamixer -c AE9`; `hu_master=0`
@@ -185,6 +200,10 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   with Chrome Canary after output switches or a reboot (no stream; VLC
   played fine); restarting the app fixes it. The earlier "silent first
   playback after a warm reboot" was most likely this.
+- SBX: if Direct Mode off ever gives silence or echoey, crunched audio
+  that toggling doesn't fix, the card's audio router is in a bad state;
+  only a PSU power-off clears it (a warm reboot doesn't). Seen often while
+  SBX was being developed, not since the fixes in 0.6.0.
 - Firmware read-back (`fw_verify=1`) reports a few dozen mismatches in the DSP's
   auxiliary RAM; audio works regardless (likely a read-back artifact, open).
 
@@ -197,6 +216,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
 | `creative_ae9_pcm.c` | ALSA PCM playback and capture (2 ch S32_LE 48 kHz) |
+| `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
 | `extract_firmware.py`, `extract_overlay.py` | Extract the DSP firmware and overlay from Creative's `CtxHda.sys` |
@@ -236,7 +256,13 @@ code path for comparison:
   `hu_dsp_keepalive` (0) heartbeat DSP keepalive (1 = old forced
   run state, which left playback silent after the output idled; 2 = log only);
   `hu_fast_ms` (40) knob poll interval; `hu_cmd_settle_us` (4000, writable at
-  runtime) CA0113 settle time for volume changes.
+  runtime) CA0113 settle time for volume changes;
+  `tail_drop_rejected` (1) leave out the six startup SCP messages the DSP
+  rejects.
+- SBX: `fx_spk_cfg` (2) speaker config with Direct Mode off (DSP
+  MASTERCONTROL 0x04: 1 = 2.0, 2 = 2.1 as Windows, 5 = 4.0, 6 = 4.1,
+  8 = 5.1); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
+  stream plays direct before the switch to the DSP.
 
 Older parameters:
 

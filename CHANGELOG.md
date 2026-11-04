@@ -3,6 +3,77 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.0 (2026-11-04)
+
+**SBX works on Linux.** Surround, Crystalizer, Dialog Plus, Smart Volume,
+Bass, the EQ: through the card's own DSP, toggled from alsamixer, and you
+can *hear* it.
+
+I'm not going to pretend this one was clean. It took one long night of
+"turn Direct Mode off... silence. Turn it back on... sound. Off again...
+crunchy garbage that sounds like a USB card dying under load." The logs
+said everything was fine. Every command: 0 errors. The card was lying to
+us, politely.
+
+So we stopped trusting the logs and started dumping the card's audio
+router, all 64 entries of it, after every single click. Something like
+thirty dumps later, it confessed:
+
+- We were turning on the DSP's input stream and **never turning it off**.
+  The card's little 8051 brain kept that path reserved forever, and the
+  next time we asked for DSP mode it built a second path on spare
+  hardware that never started. Silence. Toggle more, it gets worse.
+  Reboot? Still broken, because the card doesn't forget on a warm reboot.
+  Only pulling power fixed it. (I got very good at flipping the PSU
+  switch.)
+- Windows **waits** after it stops a stream: 48 ms here, 144 ms there.
+  We didn't. Sometimes the chip kept up, sometimes it didn't, which is why
+  the exact same steps worked on one boot and not the next.
+
+Both fixed. Then we broke it again on purpose: round trips, sleep and wake,
+headphones, booting straight into DSP mode, a warm reboot in the middle of
+a Discord call with the mic open. It held.
+
+### What you get
+
+- **Direct Mode** ("Direct Mode Switch", on by default): same as before,
+  straight to the DAC at the stream's rate, up to 384 kHz, DSP bypassed.
+  Nothing changes unless you turn it off.
+- Turn it **off** and the audio goes through the DSP at 96 kHz (stereo
+  for now). Then the **SBX** button ("SBX Switch") turns the effects on
+  and off.
+- With both: Surround, Dialog Plus, Smart Volume (and its mode),
+  Crystalizer, Bass (switch + level 0-100 each), EQ on/off with Flat,
+  Rock and Gaming presets, pre-gain and ten bands, and Scout Mode.
+  Otherwise those are greyed out and keep their values. Two-stage, like
+  Windows.
+- Switch Direct Mode with music playing, both ways. After boot, wake, or a
+  switch made while nothing plays, the first stream plays direct for 3 s
+  and then moves to the DSP (`dsp_switch_ms`). Turning Direct Mode back on
+  goes quiet until you pause/play, same as Windows does.
+- Speakers and headphones, sleep and wake, reboots. Before a reboot,
+  power-off or sleep the driver now stops the DSP streams and any
+  recording it started, so the card comes back clean.
+- The six startup messages the DSP always rejected aren't sent any more
+  (`tail_drop_rejected`), so those error lines are gone from the log.
+
+### Known limits
+
+- DSP mode is stereo only; 5.1 isn't wired up yet.
+- Direct Mode on is silent until the stream restarts (pause/play).
+- Three EQ presets so far; Scout Mode and 96 kHz streams in DSP mode
+  haven't had a proper listen yet.
+- If DSP mode ever goes silent or crunchy and toggling doesn't fix it,
+  power off at the PSU. Haven't seen it since these fixes, but now you
+  know.
+
+Tested on kernel 7.2.14, Fedora 44 KDE, one card: everything above, plus
+Direct Mode as in 0.5.0 (48/96/192 kHz, recording, sleep).
+
+Upgrading from 0.5.0: replace the module, `sudo depmod -a`, reboot.
+
+If you've got an AE-9 and Linux, try it and tell me what breaks. -- Joe
+
 ## 0.5.0 (2026-11-03)
 
 Two new controls, both done the way the Windows driver does them.
