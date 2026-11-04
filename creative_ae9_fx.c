@@ -62,17 +62,46 @@ static const char * const eq_names[FX_EQ_VALUES] = {
 	"EQ 500Hz", "EQ 1kHz", "EQ 2kHz", "EQ 4kHz", "EQ 8kHz", "EQ 16kHz",
 };
 
-/* EQ presets as the Creative app sends them for the AE-9 (capture 3);
- * pre-gain first. Other presets: set the bands. */
-static const char * const eq_preset_names[] = { "Flat", "Rock", "Gaming" };
-static const s8 eq_presets[][FX_EQ_VALUES] = {
-	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-	{ 0, 0, 0, 2, 1, 0, 3, 1, -1, 3, 3 },
-	{ 0, 0, 0, 3, -2, 0, 3, 0, 0, 3, 2 },
+/*
+ * EQ presets as the Creative app sends them for the AE-9, in its list
+ * order (capture 5, 22:59-23:03, every preset in turn; Rock and Gaming
+ * match capture 3). 0.1 dB, pre-gain first. Pop and Stadium have finer
+ * values (Pop 8 kHz 1.19624, Stadium 62 Hz 5.68521), rounded to 0.1 dB.
+ * Night sends the same EQ as Concert, and the game presets (Project CARS,
+ * Racing, Rocket League, RPG) a flat one: whatever else they do in Windows
+ * isn't sent to the card. Other presets: set the bands.
+ */
+static const char * const eq_preset_names[] = {
+	"Flat", "Rock", "Concert", "Night", "Acoustic", "Classical", "Country",
+	"Dance", "Hip Hop", "Jazz", "Pop", "R&B", "Vocal", "Gaming", "Cinema",
+	"Project CARS", "Racing", "Rocket League", "RPG", "Stadium",
+};
+static const s16 eq_presets[][FX_EQ_VALUES] = {
+	/* pre  31   62  125  250  500   1k   2k   4k   8k  16k */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Flat */
+	{   0,   0,   0,  20,  10,   0,  30,  10, -10,  30,  30 },	/* Rock */
+	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Concert */
+	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Night */
+	{   0,   0,   0,  20,   0,   0,  25,  20,  20,  20,  30 },	/* Acoustic */
+	{   0,   0,   0,  15,  20,  10,  30,  10,   0,  30,  30 },	/* Classical */
+	{   0,   0,   0,   0,   0,  20,  25,  25,  20,  30,  30 },	/* Country */
+	{   0,   0,   0,  10,  15,   5,  15,  20,  10,  25,  25 },	/* Dance */
+	{   0,   0,   0,  20,  25,  15,  25,   0, -25, -10, -15 },	/* Hip Hop */
+	{   0,   0,   0,   0,  25,  25,  30,  10,  10,  30,  30 },	/* Jazz */
+	{ -10,  17,  26,  21,  27,   7,  34,  12,  56,  60,  52 },	/* Pop */
+	{   0,   0,   0,   0, -15,  25,  15,  20,   0,  20,  10 },	/* R&B */
+	{   0,   0,   0, -15,  -5,  30,  30,  30,   0,   0,  10 },	/* Vocal */
+	{   0,   0,   0,  30, -20,   0,  30,   0,   0,  30,  20 },	/* Gaming */
+	{   0,   0,   0,   0,   0,  20,  30,   0,   0,  10,  10 },	/* Cinema */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Project CARS */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Racing */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Rocket League */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* RPG */
+	{   0,  39,  57,  43,  30,  36,  35,  33,  40,  60,  68 },	/* Stadium */
 };
 
 /* Scout Mode (capture 3): Smart Volume on at 0.9, mode 0, and this EQ. */
-static const s8 eq_scout[FX_EQ_VALUES] = { 0, 2, 3, 3, -2, -2, 0, 3, 4, 3, 2 };
+static const s16 eq_scout[FX_EQ_VALUES] = { 0, 20, 30, 30, -20, -20, 0, 30, 40, 30, 20 };
 
 static const char * const sv_mode_names[] = { "Normal", "Loud", "Night" };
 
@@ -187,9 +216,9 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 	}
 	on = fx_eff(fx) && fx->eq_on;
 	for (i = 1; on && i < FX_EQ_VALUES; i++)
-		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 1), false);
+		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 10), false);
 	if (on)
-		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 1), false);
+		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 10), false);
 	fx_send(chip, FX_MID_OUT, 0x09, fx_f32(on, 1), false);
 	fx_send(chip, FX_MID_OUT, 0x3a, 0, false);
 }
@@ -257,9 +286,9 @@ static void fx_live_eq(struct creative_chip *chip, bool values, bool onoff)
 
 	fx_live_begin(chip);
 	for (i = 1; values && fx->eq_on && i < FX_EQ_VALUES; i++)
-		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 1), true);
+		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 10), true);
 	if (values && fx->eq_on)
-		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 1), true);
+		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 10), true);
 	if (onoff)
 		fx_send(chip, FX_MID_OUT, 0x09, fx_f32(fx->eq_on, 1), true);
 	fx_live_end(chip);
@@ -353,7 +382,7 @@ static int fx_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_ON:	*v = fx->on[i]; break;
 	case K_LVL:	*v = fx->level[i]; break;
 	case K_EQON:	*v = fx->eq_on; break;
-	case K_EQ:	*v = fx->eq[i] + 12; break;
+	case K_EQ:	*v = DIV_ROUND_CLOSEST(fx->eq[i], 10) + 12; break;	/* whole dB */
 	case K_SCOUT:	*v = fx->scout; break;
 	case K_SVMODE:	uv->value.enumerated.item[0] = fx->sv_mode; break;
 	case K_PRESET:	uv->value.enumerated.item[0] = fx->eq_preset; break;
@@ -492,9 +521,9 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		return 1;
 	case K_EQ:
 		v = clamp_t(long, v, 0, 24) - 12;
-		if (v == fx->eq[i])
-			return 0;
-		fx->eq[i] = v;
+		if (v == DIV_ROUND_CLOSEST(fx->eq[i], 10))
+			return 0;	/* also keeps a preset's 0.1 dB value */
+		fx->eq[i] = v * 10;
 		if (fx_live(chip) && fx->eq_on)
 			fx_live_one(chip, 0x0a + i, fx_f32(v, 1));
 		return 1;

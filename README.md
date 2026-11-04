@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.1):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -136,7 +136,7 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   DSP at 96 kHz (stereo only for now); then "SBX Switch" turns the effects
   on or off. With both, the "FX Surround / Dialog Plus / Smart Volume /
   Crystalizer / Bass" switches and volumes (0-100), "FX Smart Volume Mode",
-  "EQ Switch", "EQ Preset" (Flat, Rock, Gaming), "EQ Pre-gain" and ten
+  "EQ Switch", "EQ Preset" (Windows' 20 presets, Flat to Stadium), "EQ Pre-gain" and ten
   bands (31 Hz-16 kHz, -12..+12 dB) and "Scout Mode Switch" act; otherwise
   they are greyed out and keep their values. Set them in `alsamixer -c AE9`.
   Works on speakers and headphones, across sleep and reboots. With Direct

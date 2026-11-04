@@ -3,6 +3,21 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.1 (2026-11-04)
+
+- **All 20 of Windows' EQ presets**, straight from the capture, in the
+  Creative app's order: Flat, Rock, Concert, Night, Acoustic, Classical,
+  Country, Dance, Hip Hop, Jazz, Pop, R&B, Vocal, Gaming, Cinema, Project
+  CARS, Racing, Rocket League, RPG, Stadium. Fractional values come
+  through (0.1 dB); the band sliders still show whole dB. Heads up: on
+  this card Night is the same as Concert, and the four game presets are
+  flat. That's what Windows sends too.
+- Tested by ear on kernel 7.2.14: Stadium, Concert, Hip Hop and Flat,
+  clearly different. Bang on.
+
+Upgrading from 0.6.0: replace the module, `sudo depmod -a`, reboot. A
+saved "EQ Preset" setting keeps its name (Rock stays Rock).
+
 ## 0.6.0 (2026-11-04)
 
 **SBX works on Linux.** Surround, Crystalizer, Dialog Plus, Smart Volume,
