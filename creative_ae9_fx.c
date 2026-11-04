@@ -565,6 +565,32 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	return 0;
 }
 
+/*
+ * The head unit's SBX button: the same as flipping "SBX Switch", and only
+ * with Direct Mode off. With Direct Mode on it does nothing.
+ */
+void creative_ae9_fx_sbx_toggle(struct creative_chip *chip)
+{
+	struct creative_ae9_fx *fx = &chip->fx;
+	unsigned int i;
+
+	if (fx->direct) {
+		dev_info(chip->dev, "SBX button ignored: Direct Mode is on\n");
+		return;
+	}
+	fx->sbx = !fx->sbx;
+	if (!chip->dsp_switch_pending)
+		fx_apply_all(chip);
+	else
+		dev_info(chip->dev, "SBX %s (button; applied when the DSP switch runs)\n",
+			 fx->sbx ? "on" : "off");
+	fx_update_active(chip);
+	for (i = 0; i < fx->nkc; i++)
+		if (PV_K(fx->kc[i]->private_value) == K_SBX)
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &fx->kc[i]->id);
+}
+
 static int fx_add(struct creative_chip *chip, const char *name,
 		  unsigned int kind, unsigned int idx)
 {

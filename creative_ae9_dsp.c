@@ -1096,15 +1096,18 @@ static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
 	/*
 	 * 0xff now and then (2026-11-04: on both boots whose DSP mode came up
 	 * with a strange router, never on the clean ones): the 8051 hadn't
-	 * answered yet. Give it a moment and ask again before guessing.
+	 * answered yet. 0 too (2026-11-04, 7.2.15: port 0 taken, the overlay
+	 * never landed, DMA took 30-44 polls instead of 1). Every good boot
+	 * and Windows read 3. Give it a moment and ask again before guessing.
 	 */
-	for (i = 0; port > 0xf && i < 10; i++) {
+	for (i = 0; (port == 0 || port > 0xf) && i < 10; i++) {
 		msleep(5);
 		port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
 	}
 	dev_info(chip->dev, "overlay: port read 0x%x (Windows: 3)%s\n", port,
-		 i ? (port > 0xf ? ", still bad after retries" : ", after a retry") : "");
-	if (port > 0xf) {
+		 i ? ((port == 0 || port > 0xf) ? ", still bad after retries" :
+		      ", after a retry") : "");
+	if (port == 0 || port > 0xf) {
 		/* read came back as 0xff000000 once; Windows always got 3 */
 		port = 3;
 		dev_info(chip->dev, "overlay: implausible port, using 3\n");
@@ -1185,6 +1188,32 @@ out:
 }
 
 /*
+ * Did the overlay land? Word 5 of its jump table at 0x3f3a0 reads
+ * 0x04000086 once it has (see creative_ae9_dsp_health). ChipIO reads can
+ * come back wrong now and then, so two reads must agree; a few tries.
+ */
+#define OVL_CHECK_ADDR	0x3f3b4
+#define OVL_CHECK_WANT	0x04000086
+
+static bool dsp_overlay_landed(struct creative_chip *chip, u32 *got)
+{
+	u32 a, b = 0;
+	unsigned int i;
+
+	creative_dsp_chipio_addr_invalidate();
+	for (i = 0; i < 4; i++) {
+		if (creative_dsp_chipio_read(chip, OVL_CHECK_ADDR, &a) < 0 ||
+		    creative_dsp_chipio_read(chip, OVL_CHECK_ADDR, &b) < 0)
+			continue;
+		if (a == b)
+			break;
+	}
+	creative_dsp_chipio_addr_invalidate();
+	*got = b;
+	return b == OVL_CHECK_WANT;
+}
+
+/*
  * MASTERCONTROL boot handshake, run by Windows straight after starting the
  * freshly downloaded firmware (capture seq 4576-5163, see
  * WINDOWS-CAPTURE-ANALYSIS.md). The overlay transfer Windows does between
@@ -1207,9 +1236,29 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			 * as Windows does. */
 			ret = -ENOENT;
 			chan = ~0U;
-			if (overlay)
+			bool landed = false;
+
+			if (overlay) {
+				u32 chk = 0;
+
 				ret = dsp_overlay_xfer(chip, &chan);
-			chip->overlay_sent = (ret == 0);
+				landed = dsp_overlay_landed(chip, &chk);
+				if (!landed) {
+					/* free the channel, then go again */
+					dev_warn(chip->dev,
+						 "overlay: didn't land (ret=%d, check word 0x%08x), sending it again\n",
+						 ret, chk);
+					if (chan != ~0U)
+						scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);
+					chan = ~0U;
+					ret = dsp_overlay_xfer(chip, &chan);
+					landed = dsp_overlay_landed(chip, &chk);
+					dev_info(chip->dev, "overlay: second try ret=%d, %s (check word 0x%08x)\n",
+						 ret, landed ? "landed" : "STILL NOT landed", chk);
+				}
+			}
+			/* an SCP error with the data in place still counts */
+			chip->overlay_sent = ret == 0 || landed;
 			if (ret && chan == ~0U) {
 				ret = scp_get_u32(chip, MASTERCONTROL, 0x0a, &chan);
 				dev_info(chip->dev,

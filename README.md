@@ -7,12 +7,14 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.2):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.3):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
 > mutes, a medium hold switches between the RCA outputs and the head unit's
-> headphone jack, and a long hold toggles the knob light.
+> headphone jack, and a long hold toggles the knob light. The SBX button
+> turns SBX on and off (with Direct Mode off) and its light shows when the
+> effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
 > 96, 192 and 384 kHz, 24- or 32-bit, is available as an option
@@ -25,14 +27,15 @@ playback.
 > **Control panel:** [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) is a
 > Sound Blaster Command-style desktop app for this driver: SBX, the EQ and
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
-> all in one window.
+> all in one window. It's a solid stand-in for the Windows software that
+> ships with the card.
 
 ## Hardware / Environment
 
 - Creative Sound Blaster AE-9 — PCI `1102:0010`, subsystem `0x0071`
   (CA0132 Sound Core3D, behind an IDT Tsi381 PCIe-to-PCI bridge), with the
   ACM head unit connected.
-- Developed/tested on Fedora 44 KDE, kernels `7.2.13` and `7.2.14`
+- Developed/tested on Fedora 44 KDE, kernels `7.2.13`, `7.2.14` and `7.2.15`
   (`-200.fc44.x86_64`).
 - No `iommu=pt` needed: tested on an AMD system with the IOMMU in its
   default translated mode, with no IOMMU page faults from the card. (Drivers
@@ -108,6 +111,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   volume (both start at -36 dB).
 - Knob: turn = volume, press (< 1 s) = mute, hold 1.5-3.5 s = speakers /
   headphones, hold > 3.5 s = knob light on/off.
+- SBX button (head unit): turns SBX on/off, same as "SBX Switch", only
+  with Direct Mode off (with Direct Mode on it does nothing). Its light is
+  on while the effects are running: Direct Mode off and SBX on.
 - In PipeWire / KDE use the "Stereo Output + Stereo Input" profile: the
   desktop volume slider and mute drive the card (hardware volume), and the
   knob moves the slider and OSD. "Pro Audio" also plays, but uses software
@@ -212,7 +218,8 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 - SBX: if Direct Mode off ever gives silence or echoey, crunched audio
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
-  SBX was being developed, not since the fixes in 0.6.0.
+  SBX was being developed, and once since (0.6.2, a warm reboot onto a new
+  kernel; the power-off fixed it).
 
 ## Source layout
 

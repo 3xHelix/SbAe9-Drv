@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.6.2"
+#define CREATIVE_AE9_DRV_VERSION	"0.6.3"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -239,6 +239,7 @@ struct creative_chip {
 	struct delayed_work	dsp_work;
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
 	bool			dsp_switch_pending;
+	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
 	int			pcm_started;  /* set after first PCM start — skips one-time ChipIO setup */
@@ -277,6 +278,10 @@ struct creative_chip {
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
 	int			hu_switch_to;	/* pending output switch, -1 none */
 	unsigned int		hu_light;	/* knob light on */
+	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
+	bool			hu_sbx_press;	/* SBX button press to act on */
+	bool			hu_st07_valid;
+	u8			hu_st07;	/* 83 01 07 reply byte, logged on change */
 	struct snd_kcontrol	*hu_out_ctl;
 	unsigned int		hu_btn_down;
 	unsigned long		hu_btn_since;
@@ -375,6 +380,7 @@ void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
+void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
 void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);

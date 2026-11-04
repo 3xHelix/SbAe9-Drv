@@ -833,6 +833,150 @@ static const u8 ae9_rt_dsp_out[] = {
 	0x60, 0x61, 0x70, 0x71, 0x52, 0x53, 0x62, 0x63, 0x72, 0x73,
 };
 
+/*
+ * Is the DSP executing? DBGCNTL (0x100e30) has a top half that changes on
+ * every read while the DSP runs (2026-11-04, healthy DSP mode: 0x4e72,
+ * 0x01f2, 0x004d, 0x20b5 over four reads 0.25 s apart; that's also why
+ * each boot logs a different DBGCNTL). The guess is that it stops moving
+ * on a stuck chip (silent DSP mode cured only by a PSU power-off). Logged
+ * only until a stuck boot confirms it.
+ */
+#define AE9_DSP_ALIVE_READS	4
+
+static void creative_ae9_dsp_alive_log(struct creative_chip *chip, const char *when)
+{
+	u32 v[AE9_DSP_ALIVE_READS];
+	unsigned int i, n = 0, moved = 0;
+
+	mutex_lock(&chip->replay_mutex);
+	for (i = 0; i < AE9_DSP_ALIVE_READS; i++) {
+		if (i)
+			msleep(20);
+		if (creative_dsp_chipio_read(chip, 0x100e30, &v[n]) < 0)
+			continue;
+		if (n && v[n] != v[n - 1])
+			moved++;
+		n++;
+	}
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	if (n < 2)
+		dev_info(chip->dev, "DSP alive (%s): DBGCNTL read failed\n", when);
+	else
+		dev_info(chip->dev, "DSP alive (%s): DBGCNTL %s (%u of %u reads changed; first 0x%08x, last 0x%08x)\n",
+			 when, moved ? "moving" : "NOT moving", moved, n - 1,
+			 v[0], v[n - 1]);
+}
+
+/*
+ * DSP outputs c2..cb sent to 0xff, logged once per bring-up for the record.
+ * It is not a fault sign on its own (2026-11-04): a recording through the
+ * DSP does it, the stuck chip that played silence until a PSU power-off
+ * had it, and a healthy warm boot playing clean audio had it too (all of
+ * c0..cb -> 0xff, c2..cb -> SRC chains, input via SRC 95/85). Earlier, a
+ * boot with SRC chains like that was silent. So the router layout doesn't
+ * tell a stuck chip from a good one; the silence comes from somewhere the
+ * router doesn't show.
+ *
+ * Only entries 0x190000..0x1900fc are looked at, and a failed read just
+ * shortens the scan (the 128-entry walk in router_front_dsp gives up on
+ * any failed read, which is why its old 0xff count hardly ever fired).
+ * Counted only once stream 0x05 runs: before that, a healthy 8051 still
+ * has c2..cb -> 0xff for a moment (gone 170 ms later).
+ */
+#define AE9_RT_SCAN		64
+
+/* c2..cb entries that are active and sent to 0xff; *seen = c2..cb found */
+static unsigned int ae9_rt_dsp_out_ff(const u32 *e, unsigned int n,
+				      unsigned int *seen)
+{
+	unsigned int i, ff = 0;
+
+	*seen = 0;
+	for (i = 0; i < n && i < AE9_RT_SCAN; i++) {
+		u8 src = e[i] & 0xff, dst = (e[i] >> 8) & 0xff;
+
+		if (!((e[i] >> 16) & 3) || src < 0xc2 ||
+		    src >= 0xc2 + ARRAY_SIZE(ae9_rt_dsp_out))
+			continue;
+		if (dst == 0xff)
+			ff++;
+		else if (dst != ae9_rt_dsp_out[src - 0xc2])
+			continue;	/* c2..cb -> e2..ed: the other half */
+		(*seen)++;
+	}
+	return ff;
+}
+
+/* Log c2..cb -> 0xff once per bring-up (info only, see above). */
+static void ae9_rt_ff_report(struct creative_chip *chip, unsigned int ff,
+			     unsigned int seen)
+{
+	if (!ff || chip->rt_ff_logged)
+		return;
+	chip->rt_ff_logged = true;
+	dev_info(chip->dev, "SBX: router: %u of %u DSP outputs to 0xff%s\n",
+		 ff, seen, chip->cap_start_sent ? " (recording)" : "");
+}
+
+/*
+ * ChipIO reads and writes while audio plays aren't reliable (2026-11-04):
+ * 300 reads of a fixed router entry were all right with audio stopped,
+ * but 6 came back wrong while playing (0, 0x1, or the NEXT entry's value),
+ * with no verb timeouts and every status OK. The router snapshot showed
+ * values from 0x38 further on too. So something on the chip moves the
+ * ChipIO address between our address and data verbs while streaming,
+ * most likely the 8051 itself, and no driver lock can stop that.
+ *
+ * Router reads: read until two in a row agree. Router writes: read back
+ * and write once more if it didn't stick. A write that went astray may
+ * have landed on another address, which we can't see; the retry count is
+ * logged so we learn how often that happens.
+ */
+#define AE9_STABLE_TRIES	5
+
+static int ae9_chipio_read_stable(struct creative_chip *chip, u32 a, u32 *v,
+				  unsigned int *unsteady)
+{
+	u32 prev, cur;
+	unsigned int i;
+
+	if (creative_dsp_chipio_read(chip, a, &prev) < 0)
+		return -EIO;
+	for (i = 1; i < AE9_STABLE_TRIES; i++) {
+		if (creative_dsp_chipio_read(chip, a, &cur) < 0)
+			return -EIO;
+		if (cur == prev) {
+			*v = cur;
+			return 0;
+		}
+		(*unsteady)++;
+		prev = cur;
+	}
+	*v = cur;
+	return 0;
+}
+
+static void ae9_rt_write_checked(struct creative_chip *chip, u32 a, u32 want,
+				 unsigned int *unsteady, unsigned int *retried,
+				 unsigned int *failed)
+{
+	u32 got = ~0U;
+	unsigned int k;
+
+	for (k = 0; k < 2; k++) {
+		creative_dsp_chipio_write(chip, a, want);
+		if (ae9_chipio_read_stable(chip, a, &got, unsteady) == 0 &&
+		    got == want)
+			return;
+		if (!k)
+			(*retried)++;
+	}
+	(*failed)++;
+	dev_warn(chip->dev, "SBX: router write 0x%06x = 0x%05x didn't stick (reads 0x%x)\n",
+		 a, want, got);
+}
+
 static int ae9_rt_free_slot(const u32 *e, int near)
 {
 	unsigned int i;
@@ -856,37 +1000,32 @@ static int ae9_rt_free_slot(const u32 *e, int near)
  * that feed 0x40/0x41 from a DSP port, else its DSP-out -> 0xe0/0xe1 pair,
  * else c0/c1.
  *
- * Then repair the two broken layouts seen when the 8051 builds the DSP
- * path badly (with the usual c0/c1 front ports only):
- * - DSP outputs c2..cb sent to 0xff or missing: echoey, crunched audio.
- *   Point them back at the good boot's ports.
+ * Then repair the broken layout seen when the 8051 builds the DSP path
+ * badly (with the usual c0/c1 front ports only), and report DSP outputs
+ * c2..cb sent to 0xff (logged only; not a fault sign on its own,
+ * see ae9_rt_ff_report):
  * - HDA 0x00 -> SRC 0x90 missing (after resume) while SRC 0x90 still feeds
  *   the DSP: only half the input arrives, crunched audio. Add it back
  *   (and HDA 0x01 -> SRC 0x80 likewise).
  */
-static void creative_ae9_router_front_dsp(struct creative_chip *chip)
+static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge)
 {
-	int l = -1, r = -1, el = -1, er = -1, inputs = 0, outs = 0, ins = 0;
-	int out_at[ARRAY_SIZE(ae9_rt_dsp_out)];
+	int l = -1, r = -1, el = -1, er = -1, inputs = 0, ins = 0;
 	int feed_at[2] = { -1, -1 }, src_to_dsp[2] = { 0, 0 };
 	static const u8 hda_src[2] = { 0x90, 0x80 };	/* HDA 0x00, 0x01 */
 	u32 e[AE9_RT_ENTRIES];
-	unsigned int i, n = 0;
+	unsigned int i, n = 0, ff, seen;
+	unsigned int unsteady = 0, retried = 0, failed = 0;
 
-	for (i = 0; i < ARRAY_SIZE(out_at); i++)
-		out_at[i] = -1;
 	mutex_lock(&chip->replay_mutex);
 	creative_dsp_chipio_addr_invalidate();
 	for (i = 0; i < AE9_RT_ENTRIES; i++) {
 		u32 a = 0x190000 + 4 * i, v;
 		u8 src, dst;
 
-		if (creative_dsp_chipio_read(chip, a, &v) < 0)
-			break;
-		/* reads now and then come back 0 (2026-11-04: an entry read
-		 * as 0 in one dump and fine right after): confirm empties,
-		 * since the repairs below write into empty slots */
-		if (!v && creative_dsp_chipio_read(chip, a, &v) < 0)
+		/* two reads in a row must agree (see ae9_chipio_read_stable);
+		 * the repairs below write into slots that read as empty */
+		if (ae9_chipio_read_stable(chip, a, &v, &unsteady) < 0)
 			break;
 		e[i] = v;
 		n++;
@@ -905,11 +1044,6 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip)
 				el = src;
 			else if (dst == 0xe1 && er < 0)
 				er = src;
-			/* -2: sent somewhere else on purpose, leave it */
-			if (src >= 0xc2 && src - 0xc2 < ARRAY_SIZE(ae9_rt_dsp_out) &&
-			    out_at[src - 0xc2] == -1)
-				out_at[src - 0xc2] = (dst == 0xff ||
-					dst == ae9_rt_dsp_out[src - 0xc2]) ? (int)i : -2;
 		}
 		if ((dst & 0xe0) == 0xc0 && src >= 0x80 && src < 0xc0) {
 			inputs++;
@@ -928,13 +1062,6 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip)
 		r = er >= 0 ? er : 0xc1;
 	}
 	if (n == AE9_RT_ENTRIES && l == 0xc0 && r == 0xc1) {
-		for (i = 0; i < ARRAY_SIZE(ae9_rt_dsp_out); i++) {
-			u32 want = 0x10000 | ae9_rt_dsp_out[i] << 8 | (0xc2 + i);
-			int at = out_at[i];
-
-			if (at >= 0 && e[at] != want)
-				outs++;		/* to 0xff: log only */
-		}
 		for (i = 0; i < 2; i++) {
 			u32 want = 0x10000 | hda_src[i] << 8 | i;
 			int at;
@@ -945,21 +1072,28 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip)
 			if (at < 0)
 				break;
 			e[at] = want;
-			creative_dsp_chipio_write(chip, 0x190000 + 4 * at, want);
+			ae9_rt_write_checked(chip, 0x190000 + 4 * at, want,
+					     &unsteady, &retried, &failed);
 			ins++;
 			inputs++;
 		}
 	}
-	creative_dsp_chipio_write(chip, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l);
-	creative_dsp_chipio_write(chip, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r);
+	ae9_rt_write_checked(chip, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
+			     &unsteady, &retried, &failed);
+	ae9_rt_write_checked(chip, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r,
+			     &unsteady, &retried, &failed);
 	creative_dsp_chipio_write(chip, AE9_RT_APPLY, 1);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
 	dev_info(chip->dev, "SBX: router front L/R <- DSP ports 0x%02x/0x%02x, %d DSP input entr%s active\n",
 		 l, r, inputs, inputs == 1 ? "y" : "ies");
-	if (outs)
-		dev_info(chip->dev, "SBX: router: %d DSP output%s to 0xff (normal while recording)\n",
-			 outs, outs == 1 ? "" : "s");
+	if (unsteady || retried)
+		dev_info(chip->dev, "SBX: router: %u unsteady read%s, %u write%s retried, %u failed (the chip moved the ChipIO address)\n",
+			 unsteady, unsteady == 1 ? "" : "s",
+			 retried, retried == 1 ? "" : "s", failed);
+	ff = ae9_rt_dsp_out_ff(e, n, &seen);
+	if (judge)
+		ae9_rt_ff_report(chip, ff, seen);
 	if (ins)
 		dev_warn(chip->dev, "SBX: router repaired: %d input feed%s (bad layout from the 8051)\n",
 			 ins, ins == 1 ? "" : "s");
@@ -967,8 +1101,13 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip)
 		dev_warn(chip->dev, "SBX: the DSP's input path is not active in the router: no audio in DSP mode (try Direct Mode, or a PSU cold boot)\n");
 }
 
-/* Playback start with Direct Mode off (seq 11066): 0x18b008, format, bind. */
-void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format)
+/*
+ * Playback start with Direct Mode off (seq 11066): 0x18b008, format, bind.
+ * count_ff: stream 0x05 is already on, so the router's 0xff count means
+ * something (dsp_mode turns dsp_active on before it starts 0x05).
+ */
+static void ae9_dsp_mode_start(struct creative_chip *chip, u16 format,
+			       bool count_ff)
 {
 	u32 t[] = {
 		0x115f0300, 0x1150b008, 0x11510018, 0x115300f0, 0x11540000,
@@ -979,7 +1118,12 @@ void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format)
 	t[5] = 0x10220000 | format;
 	creative_ae9_verb_block_replay(chip, t, ARRAY_SIZE(t), false,
 				       "SBX: playback start in DSP mode");
-	creative_ae9_router_front_dsp(chip);
+	creative_ae9_router_front_dsp(chip, count_ff);
+}
+
+void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format)
+{
+	ae9_dsp_mode_start(chip, format, chip->dsp_active);
 }
 
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
@@ -1059,7 +1203,7 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 				       "SBX: DSP mode, full PLL program");
 	/* a stream already playing: bind it again, as a new one would be */
 	if (chip->pcm_start_sent)
-		creative_ae9_dsp_mode_start(chip, chip->pcm_start_fmt);
+		ae9_dsp_mode_start(chip, chip->pcm_start_fmt, false);
 	/*
 	 * DSP speaker volume (module 0x32) to 0 dB; the start block leaves
 	 * Windows' capture-time -36.19 dB there, and Windows keeps it in step
@@ -1079,7 +1223,8 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 	 * DSP (also done by dsp_mode_start, for later streams) */
 	creative_ae9_verb_block_replay(chip, in05, ARRAY_SIZE(in05), false,
 				       "SBX: DSP input stream 0x05 on");
-	creative_ae9_router_front_dsp(chip);
+	creative_ae9_router_front_dsp(chip, true);
+	creative_ae9_dsp_alive_log(chip, "DSP mode on");
 }
 
 /*
@@ -1537,6 +1682,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 		 "fw_split: tail replay done: %u SCP msgs (%u failed, %u skipped, %u dropped), %u verbs (%u failed); DBGCNTL 0x%08x\n",
 		 msgs, msg_err, msg_skipped, msg_dropped, verbs, verb_err, dbg);
 	creative_ae9_dsp_health(chip, dbg);
+	creative_ae9_dsp_alive_log(chip, "boot");
 	if (nretry) {
 		unsigned int k, ok = 0;
 
@@ -1555,6 +1701,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 		creative_dsp_ca0113_replay(chip, ae9_cold_ca0113_boot,
 					   ARRAY_SIZE(ae9_cold_ca0113_boot),
 					   "boot commands");
+	chip->rt_ff_logged = false;
 }
 
 static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
@@ -2569,6 +2716,8 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
  * steps per click. Button: bit 7 of the 83 01 02 reply's status byte reads
  * 0 while held (b5 -> 35). Plugs, same byte, 0 = plugged in (checked on the
  * card 2026-11-03): bit 5 = 3.5 mm headphone jack, bit 4 = 3.5 mm mic jack.
+ * Bit 3 = SBX button, 1 while held; bit 1 = SBX light, 1 while lit (our
+ * f0 22 02 01 <on> echoed back) (2026-11-04).
  * The 6.3 mm headphone jack, the XLR/TRS combo jack (a TRS plug set bit 4
  * once in 4 tries) and XLR plugs are effectively not reported. Plug changes
  * are only logged; the driver never switches output on them. Returns the
@@ -2590,9 +2739,15 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 			dev_info(chip->dev, "head unit: mic/line plug %s\n",
 				 (st & 0x10) ? "out" : "in");
 		/* bit 6 (headphone amp) follows every output switch: not logged */
-		if (chg & ~0x70)
+		if (chg & ~0x7a)
 			dev_info(chip->dev, "head unit: status 0x%02x (other bits changed: 0x%02x)\n",
-				 r[4], chg & ~0x70);
+				 r[4], chg & ~0x7a);
+		/* bit 3 = SBX button, 1 while held (b5 -> bd, found live
+		 * 2026-11-04): act on the press */
+		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08)) {
+			chip->hu_sbx_press = true;
+			dev_info(chip->dev, "head unit: SBX button\n");
+		}
 		chip->hu_status = st;
 		chip->hu_status_valid = true;
 
@@ -2612,6 +2767,25 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 	    !chip->hu_btn_down && (r[5] | (r[6] << 8)) < 1000 &&
 	    time_after(jiffies, chip->hu_btn_seen + msecs_to_jiffies(1500)))
 		*press_ms = r[5] | (r[6] << 8);
+	/*
+	 * Item 01 is SBX: Windows lights its LED with f0 22 02 01 <on> f7
+	 * (capture 6, at each SBX toggle; item 02 is the knob's button and
+	 * light). The button itself is bit 3 of the 83 01 02 status byte
+	 * (above); the b1 reply for item 01 also reports each press, as for
+	 * the knob: f0 b1 04 01 01 <ms lo> <ms hi> f7 (seen 2026-11-04, not
+	 * needed). Item 03's b1 reply is logged, to learn what it is.
+	 */
+	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x03 && r[4])
+		dev_info(chip->dev, "head unit: b1 item 3 reports a press (%u ms, reply %*ph)\n",
+			 r[5] | (r[6] << 8), min(n, 9), r);
+	/* 83 01 07 reply (f0 83 02 07 <byte> f7, 0x0a in every capture) */
+	if (r[1] == 0x83 && n >= 6 && r[3] == 0x07) {
+		if (chip->hu_st07_valid && r[4] != chip->hu_st07)
+			dev_info(chip->dev, "head unit: 83 07 status 0x%02x -> 0x%02x\n",
+				 chip->hu_st07, r[4]);
+		chip->hu_st07 = r[4];
+		chip->hu_st07_valid = true;
+	}
 	return 0;
 }
 
@@ -2737,6 +2911,23 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				   int press_ms)
 {
 	u8 resp[24];
+	int sbx_led;
+
+	if (chip->hu_sbx_press) {
+		chip->hu_sbx_press = false;
+		creative_ae9_fx_sbx_toggle(chip);
+	}
+	/* SBX LED: lit while the effects can run (Direct Mode off, SBX on) */
+	sbx_led = !chip->fx.direct && chip->fx.sbx;
+	if (sbx_led != chip->hu_sbx_led) {
+		u8 f[6] = { 0xf0, 0x22, 0x02, 0x01, sbx_led, 0xf7 };
+
+		if (creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp)) > 0) {
+			chip->hu_sbx_led = sbx_led;
+			dev_info(chip->dev, "head unit: SBX light %s\n",
+				 sbx_led ? "on" : "off");
+		}
+	}
 
 	if (chip->hu_switch_to >= 0) {
 		int to = chip->hu_switch_to;
@@ -3150,6 +3341,7 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_name_until = HU_SP_TICKS;
 	chip->hu_switch_to = -1;
 	chip->hu_light = 1;
+	chip->hu_sbx_led = -1;
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
 		chip->hu_out_ctl = NULL;
@@ -4218,6 +4410,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 		chip->hu_switch_to = 1;
 	if (!chip->hu_light)
 		creative_ae9_hu_light(chip, 0);
+	chip->hu_sbx_led = -1;		/* heartbeat sends it again */
 	creative_ae9_mic_boost_apply(chip);
 	if (chip->mic_level != 99)
 		creative_ae9_mic_level_apply(chip);

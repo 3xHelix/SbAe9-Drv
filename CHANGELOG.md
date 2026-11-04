@@ -3,6 +3,67 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.3 (2026-11-04)
+
+This one was hellish fun. New kernel drops (7.2.15), I reboot, and DSP
+mode is dead silent. Cue an afternoon of dumps, scripts and "wait, that
+can't be right." It wasn't the kernel. It was the card being the card.
+But we came out the other side with a pile of fixes and the SBX button
+on the head unit finally doing its job. Awesome quality of life.
+
+### Added
+
+- **The SBX button on the ACM works.** Press it and SBX flips on or off,
+  same as the "SBX Switch" control, and your mixer or control panel
+  follows along. Only with Direct Mode off; with Direct Mode on it does
+  nothing, on purpose. Found it live: the button sits on bit 3 of the
+  head unit's status byte.
+- **The SBX light works too.** Pulled it out of the Windows capture
+  (Windows flips it right as SBX toggles). It's lit while the effects
+  are actually running: Direct Mode off and SBX on. The head unit even
+  reports the light back to us. Polite little thing.
+- "DSP alive" lines in the log at boot and when DSP mode turns on, so
+  the next time the card gets stuck it tells on itself.
+- Two helper scripts for chasing card weirdness:
+  `scripts/ae9-dsp-snapshot.sh` and `scripts/ae9-read-stress.sh`.
+
+### Fixed
+
+- **The DSP firmware overlay was missing on two of three boots.** One
+  setup read came back as 0 (not just the 0xff we already caught), so the
+  overlay got sent to the wrong place and never landed; another boot hit
+  an I/O error halfway. The driver now treats 0 as a bad answer too,
+  checks that the overlay actually arrived, and sends it again if it
+  didn't. Recording depends on it.
+- **The card lies a little while audio plays.** Read the same router entry
+  300 times with music stopped: 300 right. With music playing: 6 wrong.
+  The card moves its own address pointer under us mid-read, and no lock
+  on our side can stop that. Router reads now have to agree twice in a
+  row, and router writes get read back and resent if they didn't stick.
+  (So far every write has stuck. Good card.)
+- The router's "outputs to 0xff" line no longer jumps the gun before the
+  DSP path is built, and it stopped pretending to know what it means. It
+  doesn't mean a stuck card; we checked, twice.
+
+### A word on SbAe9-SBC
+
+If you haven't tried [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC)
+yet, do. It's the desktop control panel for this driver (SBX, EQ and
+presets, Scout Mode, Direct Mode, outputs, recording, mixer), and I've
+been using it for a while now. It's a solid step in for the Windows
+software that ships with the card, and it follows the knob and now the
+SBX button live.
+
+Tested on kernel 7.2.15: SBX button and light, Direct Mode off/on, a
+handful of reboots (overlay landing every time), the read checks.
+
+Upgrading from 0.6.2: rebuild for your kernel, replace the module,
+`sudo depmod -a`, reboot. New kernel? Rebuild first, every time. And if
+DSP mode ever comes up silent after a reboot, power off at the PSU for
+20 seconds. A warm reboot keeps the card's bad mood.
+
+-- Joe
+
 ## 0.6.2 (2026-11-04)
 
 Quality-of-life round, plus one mystery solved and one ghost hunted.
