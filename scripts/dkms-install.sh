@@ -19,11 +19,17 @@ command -v dkms >/dev/null || { echo "dkms isn't installed (sudo dnf install dkm
 
 registered() { dkms status -m "$NAME" 2>/dev/null | sed -n "s#^$NAME/\([^,: ]*\).*#\1#p" | sort -u; }
 
+# Take a version out of DKMS and /usr/src. dkms remove can return non-zero
+# even after removing it (2026-11-04: the module was gone but the script
+# stopped there, leaving no driver), so don't let that stop the install.
+drop() {
+	dkms remove -m "$NAME" -v "$1" --all || echo "note: dkms remove $1 returned $?, carrying on" >&2
+	rm -rf "/usr/src/$NAME-$1" "/var/lib/dkms/$NAME/$1"
+}
+
 if [ "${1:-}" = "--remove" ]; then
-	for v in $(registered); do
-		dkms remove -m "$NAME" -v "$v" --all
-		rm -rf "/usr/src/$NAME-$v"
-	done
+	for v in $(registered); do drop "$v"; done
+	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
 	echo "removed from DKMS; build and copy the module by hand again if you still want it"
 	exit 0
 fi
@@ -33,10 +39,8 @@ VER=$(sed -n 's/^#define CREATIVE_AE9_DRV_VERSION[[:space:]]*"\(.*\)"/\1/p' "$SR
 
 # Drop every registered version (including this one, so a re-run picks up
 # changed source), then copy the source to /usr/src.
-for v in $(registered); do
-	dkms remove -m "$NAME" -v "$v" --all
-	rm -rf "/usr/src/$NAME-$v"
-done
+for v in $(registered); do drop "$v"; done
+for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done	# leftovers
 DEST=/usr/src/$NAME-$VER
 mkdir -p "$DEST"
 cp "$SRC"/Makefile "$SRC"/creative_ae9*.c "$SRC"/creative_ae9*.h "$SRC"/ca0132_regs.h "$DEST"/
@@ -53,4 +57,10 @@ for k in "$(uname -r)" "$@"; do
 	dkms install -m "$NAME" -v "$VER" -k "$k" --force
 done
 dkms status -m "$NAME"
-echo "done: $NAME $VER is in DKMS; new kernels get it built automatically. Reboot to load it."
+# make sure the running kernel really has it now
+if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
+	echo "ERROR: $NAME isn't installed for $(uname -r); don't reboot until this is fixed" >&2
+	exit 1
+fi
+echo "done: $NAME $VER is in DKMS ($(modinfo -k "$(uname -r)" -n "$NAME"));"
+echo "new kernels get it built automatically. Reboot to load it."
