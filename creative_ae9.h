@@ -140,6 +140,10 @@ struct creative_chip {
 	void __iomem		*hda_regs;	/* BAR0 */
 	bool			card_gone;	/* dropped off the bus: registers and
 						 * config space read all-ones */
+	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
+	bool			rings_deferred;	/* start CORB/RIRB after the firmware
+						 * stream (fw_rings_off=1) */
+	size_t			dma_pad;	/* spare bytes after every DMA buffer */
 	void __iomem		*ext_regs;	/* BAR2 */
 
 	spinlock_t		lock;
@@ -332,6 +336,17 @@ static inline bool creative_ae9_gone(struct creative_chip *chip, const char *whe
 	dev_err(chip->dev, "card dropped off the bus (%s): registers and config space read all-ones; stopping\n",
 		where);
 	return true;
+}
+
+/*
+ * The ASMedia ASM1083 (rev 03) bridge reads ahead past the end of the
+ * buffer the card is reading; through the IOMMU that read lands on an
+ * unmapped page and faults (bugzilla 219552). Every DMA buffer gets
+ * chip->dma_pad spare bytes after its end so the read-ahead stays mapped.
+ */
+static inline size_t ae9_dma_size(struct creative_chip *chip, size_t n)
+{
+	return n + chip->dma_pad;
 }
 
 /* ------------------------------------------------------------------ */

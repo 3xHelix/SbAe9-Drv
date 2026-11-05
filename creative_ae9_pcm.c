@@ -73,7 +73,7 @@ static void ae9_posbuf_off(struct creative_chip *chip)
 	creative_hda_writel(chip, AZX_REG_DPLBASE, 0);
 	creative_hda_writel(chip, AZX_REG_DPUBASE, 0);
 	creative_hda_readl(chip, AZX_REG_DPLBASE);
-	dma_free_coherent(chip->dev, PAGE_SIZE, chip->posbuf, chip->posbuf_dma);
+	dma_free_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE), chip->posbuf, chip->posbuf_dma);
 	chip->posbuf = NULL;
 }
 
@@ -84,7 +84,7 @@ static void ae9_posbuf_on(struct creative_chip *chip)
 		return;
 	}
 	if (!chip->posbuf) {
-		chip->posbuf = dma_alloc_coherent(chip->dev, PAGE_SIZE,
+		chip->posbuf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE),
 						  &chip->posbuf_dma, GFP_KERNEL);
 		if (!chip->posbuf) {
 			dev_warn(chip->dev, "posbuf: no memory, staying on LPIB\n");
@@ -516,7 +516,7 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (ret < 0)
 		return ret;
 
-	alloc_size = CREATIVE_PCM_BDL_SIZE + 128;
+	alloc_size = ae9_dma_size(chip, CREATIVE_PCM_BDL_SIZE + 128);
 	chip->playback_bdl_raw = dma_alloc_coherent(chip->dev, alloc_size,
 						    &chip->playback_bdl_dma,
 						    GFP_KERNEL);
@@ -789,7 +789,7 @@ static int creative_ae9_cap_hw_params(struct snd_pcm_substream *substream,
 	ret = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
 	if (ret < 0)
 		return ret;
-	chip->cap_bdl_size = CREATIVE_CAP_BDL_MAX * 16 + 128;
+	chip->cap_bdl_size = ae9_dma_size(chip, CREATIVE_CAP_BDL_MAX * 16 + 128);
 	chip->cap_bdl_raw = dma_alloc_coherent(chip->dev, chip->cap_bdl_size,
 					       &dma, GFP_KERNEL);
 	if (!chip->cap_bdl_raw) {
@@ -953,7 +953,8 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 
 	snd_pcm_lib_preallocate_pages_for_all(pcm,
 		SNDRV_DMA_TYPE_DEV, chip->dev,
-		CREATIVE_PCM_BUF_MAX, CREATIVE_PCM_BUF_MAX);
+		ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX),
+		ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX));
 
 	chip->pcm = pcm;
 	pcm->private_free = creative_ae9_pcm_free;

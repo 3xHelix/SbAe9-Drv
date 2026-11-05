@@ -34,7 +34,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	/* Allocate DMA-coherent buffer for CORB (256 * 4 = 1 KB) */
 	if (!chip->corb_buf) {
 		chip->corb_buf = dmam_alloc_coherent(chip->dev,
-				CREATIVE_CORB_SIZE, &chip->corb_dma, GFP_KERNEL);
+				ae9_dma_size(chip, CREATIVE_CORB_SIZE), &chip->corb_dma, GFP_KERNEL);
 		if (!chip->corb_buf) {
 			dev_err(chip->dev, "Failed to allocate CORB DMA buffer\n");
 			return -ENOMEM;
@@ -47,7 +47,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 */
 	if (!chip->rirb_buf) {
 		chip->rirb_buf = dmam_alloc_coherent(chip->dev,
-				CREATIVE_RIRB_SIZE, &chip->rirb_dma, GFP_KERNEL);
+				ae9_dma_size(chip, CREATIVE_RIRB_SIZE), &chip->rirb_dma, GFP_KERNEL);
 		if (!chip->rirb_buf) {
 			dev_err(chip->dev, "Failed to allocate RIRB DMA buffer\n");
 			return -ENOMEM;
@@ -368,7 +368,13 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		timeout = CREATIVE_IC_CMD_TIMEOUT_MS * 100;
 		wp = wp_start;
 		do {
-			u16 cur_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+			u16 raw_wp = readw(chip->hda_regs + AZX_REG_RIRBWP);
+			u16 cur_wp = raw_wp & 0xff;
+
+			/* all-ones: the card may have dropped off the bus;
+			 * each read of a dead card can stall for a long time */
+			if (raw_wp == 0xffff && creative_ae9_gone(chip, "RIRB poll"))
+				break;
 			while (cur_wp != wp) {
 				u16 next = (wp + 1) & 0xff;
 				u32 fl = le32_to_cpu(READ_ONCE(rirb[next].flags));

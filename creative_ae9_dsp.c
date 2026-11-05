@@ -692,13 +692,20 @@ static int dspio_read_multiple(struct creative_chip *chip, unsigned int *buffer,
  */
 static void scp_drain_announced(struct creative_chip *chip);
 
+/* The DSP announces SCP replies through the RIRB: without running rings
+ * (corb_rings=0, or fw_rings_off=1 before the rings start) poll instead. */
+static bool scp_ev(struct creative_chip *chip)
+{
+	return scp_event && chip->corb_buf;
+}
+
 static void dspio_clear_response_queue(struct creative_chip *chip)
 {
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	unsigned int dummy = 0;
 	int status = -1;
 
-	if (scp_event) {
+	if (scp_ev(chip)) {
 		scp_drain_announced(chip);
 		return;
 	}
@@ -838,7 +845,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 		return -EINVAL;
 
 	/* Drain stale responses so the command queue isn't stuck FULL. */
-	if (scp_event)
+	if (scp_ev(chip))
 		scp_drain_announced(chip);
 	else
 		dspio_clear_response_queue(chip);
@@ -867,7 +874,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 	if (dir != SCP_GET)
 		return 0;
 
-	if (scp_event) {
+	if (scp_ev(chip)) {
 		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 		unsigned int got;
 
@@ -880,6 +887,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 					mod_id, req);
 				return -EIO;
 			}
+			if (creative_ae9_gone(chip, "SCP reply wait"))
+				return -ENODEV;
 			dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
 			usleep_range(200, 400);
 		}
@@ -912,6 +921,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 		bool matched = false;
 
 		do {
+			if (creative_ae9_gone(chip, "SCP reply poll"))
+				break;
 			if (dspio_read(chip, &hdr) == 0) {
 				reads++;
 				last = hdr;
@@ -1068,8 +1079,8 @@ static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
 		release_firmware(fw);
 		return -EINVAL;
 	}
-	buf = dma_alloc_coherent(chip->dev, OVL_BUF_BYTES, &buf_dma, GFP_KERNEL);
-	bdl = dma_alloc_coherent(chip->dev, 16 * OVL_BDL_ENTRIES, &bdl_dma, GFP_KERNEL);
+	buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), &buf_dma, GFP_KERNEL);
+	bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), &bdl_dma, GFP_KERNEL);
 	if (!buf || !bdl) {
 		ret = -ENOMEM;
 		goto out;
@@ -1180,9 +1191,9 @@ unbind:
 	*chan_out = chan;
 out:
 	if (buf)
-		dma_free_coherent(chip->dev, OVL_BUF_BYTES, buf, buf_dma);
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
 	if (bdl)
-		dma_free_coherent(chip->dev, 16 * OVL_BDL_ENTRIES, bdl, bdl_dma);
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
 	release_firmware(fw);
 	(void)resp;
 	return ret;
@@ -2933,14 +2944,14 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	__le32 *bdl;
 	u32 ctl;
 
-	dma->buf = dma_alloc_coherent(chip->dev, DSPLOAD_BUF_SIZE,
+	dma->buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE),
 				      &dma->buf_dma, GFP_KERNEL);
 	if (!dma->buf)
 		return -ENOMEM;
-	dma->bdl = dma_alloc_coherent(chip->dev, DSPLOAD_BDL_BYTES, &dma->bdl_dma,
+	dma->bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BDL_BYTES), &dma->bdl_dma,
 				      GFP_KERNEL);
 	if (!dma->bdl) {
-		dma_free_coherent(chip->dev, DSPLOAD_BUF_SIZE, dma->buf,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
 		dma->buf = NULL;
 		return -ENOMEM;
@@ -3017,10 +3028,10 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 		udelay(50);
 	}
 	if (dma->buf)
-		dma_free_coherent(chip->dev, DSPLOAD_BUF_SIZE, dma->buf,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
 	if (dma->bdl)
-		dma_free_coherent(chip->dev, DSPLOAD_BDL_BYTES, dma->bdl,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BDL_BYTES), dma->bdl,
 				  dma->bdl_dma);
 	dma->buf = dma->bdl = NULL;
 }
@@ -3179,6 +3190,8 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 			 chip_addx, run_size_words, lpib0, lpib1,
 			 readl(chip->hda_regs + DSPLOAD_STREAM_BASE +
 			       AZX_REG_SD_CTL));
+		if (creative_ae9_gone(chip, "firmware chunk start"))
+			return -ENODEV;
 
 		if (remainder_words != 0) {
 			unsigned int i;
@@ -3208,6 +3221,8 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		timeout = jiffies + msecs_to_jiffies(2000);
 		flicker = 0;
 		do {
+			if (creative_ae9_gone(chip, "firmware chunk"))
+				return -ENODEV;
 			if (!dsp_is_dma_active(chip, dma_chan)) {
 				if (!dsp_dma_active_again(chip, dma_chan))
 					break;
@@ -3411,6 +3426,16 @@ static int dspload_image(struct creative_chip *chip,
 			return status;
 	}
 	status = dspxfr_image(chip, fls, sample_rate, channels);
+	if (chip->rings_deferred && !chip->card_gone) {
+		/* fw_rings_off=1: the firmware stream has stopped; start the
+		 * command rings now, before the boot handshake */
+		int cret = creative_ae9_corb_init(chip);
+
+		chip->rings_deferred = false;
+		dev_info(chip->dev, "corb_init after the firmware stream: %d\n", cret);
+		if (creative_ae9_gone(chip, "CORB/RIRB start after the firmware"))
+			return -ENODEV;
+	}
 	if (status < 0)
 		return status;
 	dspload_post_setup(chip);
