@@ -16,6 +16,19 @@
 /* CORB / RIRB initialization					  */
 /* ae9_mmio_capture.txt:180-330					  */
 /* ------------------------------------------------------------------ */
+/*
+ * ring_irq=0: run the rings with no interrupts (no response, overrun or
+ * memory-error interrupt; INTCTL left off): responses are polled anyway.
+ * Diagnostic for ASMedia-bridged cards (bugzilla 219552): tells whether
+ * the card's interrupt messages through the bridge, rather than the ring
+ * DMA, are what takes it down while a stream runs.
+ */
+static unsigned int ring_irq = 1;
+module_param(ring_irq, uint, 0444);
+MODULE_PARM_DESC(ring_irq, "Command-ring interrupts (1=on, default; 0=off, diagnostic)");
+
+#define CORBCTL_RUN	(ring_irq ? 0x03 : 0x02)	/* run (+ memory-error irq) */
+
 int creative_ae9_corb_init(struct creative_chip *chip)
 {
 	u32 corb_addr_low, corb_addr_high;
@@ -107,8 +120,8 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	/* Step 3: CORBCTL = 0x03 and RIRBCTL = 0x07 BEFORE base addresses.
 	 * Fresh capture confirms this order (lines 187-188).
 	 */
-	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0x03);
-	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x07);
+	creative_hda_writeb(chip, AZX_REG_CORBCTL, CORBCTL_RUN);
+	creative_hda_writeb(chip, AZX_REG_RIRBCTL, ring_irq ? 0x07 : 0x02);
 	wmb();
 
 	/* Step 3: write CORB and RIRB base addresses */
@@ -126,8 +139,12 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 * does. Stream interrupt enables (bits 0-29) are set per stream in
 	 * creative_ae9_stream_start.
 	 */
-	creative_hda_writel(chip, AZX_REG_INTCTL, 0x40000000);
-	creative_hda_writel(chip, AZX_REG_INTCTL, 0xc0000000);
+	if (ring_irq) {
+		creative_hda_writel(chip, AZX_REG_INTCTL, 0x40000000);
+		creative_hda_writel(chip, AZX_REG_INTCTL, 0xc0000000);
+	} else {
+		creative_hda_writel(chip, AZX_REG_INTCTL, 0);
+	}
 
 	/* Step 5: RINTCNT (0x5a) = 0xc0: response interrupt every 192
 	 * responses (CtxHda.sys tables and the live MMIO dump both use 0xc0).
@@ -140,11 +157,15 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 *   0x05 = + overrun interrupt (RIRBOIC)
 	 *   0x07 = + RIRB DMA run (DMAEN)
 	 */
-	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x01);
-	udelay(10);
-	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x05);
-	udelay(10);
-	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x07);
+	if (ring_irq) {
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x01);
+		udelay(10);
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x05);
+		udelay(10);
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x07);
+	} else {
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x02);
+	}
 	wmb();
 
 	/* Step 7: CORBCTL = 0x01 (memory-error interrupt only, CORB DMA not
@@ -152,8 +173,13 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 * capture readback); the first corb_send_verb sets 0x03, which starts
 	 * the CORB DMA (CORBRUN).
 	 */
-	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0x01);
+	creative_hda_writeb(chip, AZX_REG_CORBCTL, ring_irq ? 0x01 : 0x00);
 	wmb();
+
+	/* rings running: unsolicited responses have somewhere to go (the
+	 * bring-up already has them on; this covers rings started late) */
+	creative_hda_writel(chip, AZX_REG_GCTL,
+			    creative_hda_readl(chip, AZX_REG_GCTL) | AZX_GCTL_UNSOL);
 
 	/* Do NOT reset CORBRP or RIRBWP.
 	 * Windows capture shows RIRBWP is already non-zero (from prior ICW
@@ -180,13 +206,13 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	udelay(10);
 
 	ctl = creative_hda_readb(chip, AZX_REG_CORBCTL);
-	dev_info(chip->dev, "CORBCTL=0x%02x (expected 0x01)\n", ctl);
+	dev_info(chip->dev, "CORBCTL=0x%02x (expected 0x%02x)\n", ctl, ring_irq ? 0x01 : 0x00);
 	ctl = creative_hda_readb(chip, AZX_REG_RINTCNT);
 	dev_info(chip->dev, "RINTCNT=0x%02x (expected 0xc0)\n", ctl);
-	dev_info(chip->dev, "RIRBCTL=0x%02x (expected 0x07)\n",
-		 creative_hda_readb(chip, AZX_REG_RIRBCTL));
-	dev_info(chip->dev, "INTCTL=0x%08x (expected 0xc0000000)\n",
-		 creative_hda_readl(chip, AZX_REG_INTCTL));
+	dev_info(chip->dev, "RIRBCTL=0x%02x (expected 0x%02x)\n",
+		 creative_hda_readb(chip, AZX_REG_RIRBCTL), ring_irq ? 0x07 : 0x02);
+	dev_info(chip->dev, "INTCTL=0x%08x (expected 0x%08x)\n",
+		 creative_hda_readl(chip, AZX_REG_INTCTL), ring_irq ? 0xc0000000 : 0);
 
 	dev_info(chip->dev, "CORB at DMA 0x%llx, RIRB at DMA 0x%llx\n",
 		 (unsigned long long)chip->corb_dma,
@@ -206,6 +232,12 @@ void creative_ae9_corb_free(struct creative_chip *chip)
 	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0);
 	/* Disable RIRB DMA */
 	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0);
+	/* no RIRB for unsolicited responses (the DSP's SCP reply
+	 * announcements) to land in: switch them off until the rings
+	 * start again, so they can't jam the immediate interface */
+	if (!chip->card_gone)
+		creative_hda_writel(chip, AZX_REG_GCTL,
+				    creative_hda_readl(chip, AZX_REG_GCTL) & ~AZX_GCTL_UNSOL);
 
 	/* park the (device-managed) buffers for the next corb_init; with
 	 * corb_buf NULL every verb path falls back to immediate commands */
@@ -269,7 +301,7 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 	 * CORBWP advance, as the Windows capture does. Only the first one
 	 * changes anything (it starts the CORB DMA); later ones are no-ops.
 	 */
-	writeb(0x03, chip->hda_regs + AZX_REG_CORBCTL);
+	writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);
 	wmb();
 
 	/* Acknowledge any pending RIRB status (W1C, matches capture) */
@@ -425,7 +457,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 			udelay(10);
 		writew(0x0000, chip->hda_regs + AZX_REG_CORBWP);	/* WP = 0 */
 		chip->corb_wp = 0;
-		writeb(0x03, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
+		writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
 
 		/* skip responses that may still arrive for the dropped verb */
 		chip->rirb_rp = cur_rirb_wp;

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 # DSP-side snapshot for telling a stuck AE-9 from a healthy one.
 # The router layout can't (2026-11-04), so this samples DSP control and DMA
 # registers a few times and shows which ones move: a DSP that's processing

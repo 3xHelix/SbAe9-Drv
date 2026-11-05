@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Install the AE-9 driver as a DKMS module, so every new kernel gets it
 # rebuilt automatically (Fedora's kernel-install hook runs dkms autoinstall;
 # the matching kernel-devel package must be installed, as dnf does).

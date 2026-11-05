@@ -3829,6 +3829,12 @@ static unsigned int fw_rings_off;
 module_param(fw_rings_off, uint, 0444);
 MODULE_PARM_DESC(fw_rings_off, "Start the command rings only after the firmware download (1=yes; 0=no, default; diagnostic)");
 
+/* the rings start at the usual point of the bring-up (the default) */
+static bool ae9_rings_early(void)
+{
+	return corb_rings && !fw_rings_off;
+}
+
 static void creative_ae9_bridge_log(struct creative_chip *chip, const char *step)
 {
 	struct pci_dev *br = chip->pci->bus->self;
@@ -3947,9 +3953,10 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	if (ret < 0)
 		return ret;
 
-	/* Enable unsolicited responses */
-	creative_hda_writel(chip, AZX_REG_GCTL,
-			    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
+	/* Enable unsolicited responses (only once the rings run, when
+	 * they start late: without a RIRB they jam the immediate interface) */
+	creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
+			    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
 	if (codec_probe_delay_ms)
 		msleep(codec_probe_delay_ms);
 
@@ -4084,8 +4091,8 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			creative_ae9_bridge_log(chip, "after second controller reset");
 			if (creative_ae9_gone(chip, "after the second controller reset"))
 				return -ENODEV;
-			creative_hda_writel(chip, AZX_REG_GCTL,
-					    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
+			creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
+					    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
 			chip->rings_deferred = corb_rings && fw_rings_off;
 			if (corb_rings && !fw_rings_off) {
 				cret = creative_ae9_corb_init(chip);

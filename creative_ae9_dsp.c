@@ -74,6 +74,67 @@ module_param(scp_event, uint, 0444);
 MODULE_PARM_DESC(scp_event, "Read SCP replies only after the DSP announces them, as Windows does (1=on, default)");
 
 /*
+ * stream_rings_off=1: stop the command rings while a boot stream runs
+ * (firmware download, overlay transfer) and send commands through the
+ * immediate interface meanwhile; restart the rings after each. On an
+ * ASMedia-bridged card the rings running alongside any stream took the
+ * card off the bus (bugzilla 219552 round 2), each alone was fine.
+ */
+static unsigned int stream_rings_off;
+module_param(stream_rings_off, uint, 0444);
+MODULE_PARM_DESC(stream_rings_off, "Stop the command rings during the boot streams (firmware, overlay) (1=yes; 0=no, default; diagnostic)");
+
+/*
+ * fw_posbuf=1: turn on the DMA position buffer during the firmware
+ * download, so the card writes to memory while the stream reads. With
+ * the rings off this tells whether any card write during a stream (the
+ * RIRB is the card's other writer) takes an ASMedia bridge down.
+ */
+static unsigned int fw_posbuf;
+module_param(fw_posbuf, uint, 0444);
+MODULE_PARM_DESC(fw_posbuf, "DMA position buffer on during the firmware download (1=yes; 0=no, default; diagnostic)");
+
+/* stream_rings_off: park the rings before a stream; true when parked */
+static bool ae9_rings_park(struct creative_chip *chip, const char *what)
+{
+	unsigned int t;
+
+	if (!stream_rings_off || !chip->corb_buf || chip->card_gone)
+		return false;
+	creative_ae9_corb_free(chip);
+	/* wait for both ring engines to report stopped (RUN bits clear) */
+	for (t = 0; t < 100; t++) {
+		if (!(creative_hda_readb(chip, AZX_REG_CORBCTL) & 0x02) &&
+		    !(creative_hda_readb(chip, AZX_REG_RIRBCTL) & 0x02))
+			break;
+		udelay(10);
+	}
+	/* re-arm the immediate interface the way the bring-up does before
+	 * the rings first start: once the rings have run, it stays busy
+	 * (IRS=0x5) until this is done again (tested on the IDT card) */
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x5);
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x0);
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x4);
+	chip->last_irs_ack = 0x6;
+	dev_info(chip->dev, "%s: command rings stopped for the stream (%u us; IRS now 0x%04x)\n",
+		 what, t * 10, creative_hda_readw(chip, AZX_REG_IRS));
+	return true;
+}
+
+static int ae9_rings_unpark(struct creative_chip *chip, const char *what)
+{
+	int ret;
+
+	if (chip->card_gone)
+		return -ENODEV;
+	ret = creative_ae9_corb_init(chip);
+	dev_info(chip->dev, "%s: command rings back after the stream: %d\n", what, ret);
+	if (creative_ae9_gone(chip, what))
+		return -ENODEV;
+	return ret;
+}
+
+/*
  * prep_windows=1 (use with fw_split): skip creative_dsp_prepare()'s codec
  * verbs and dspload_image()'s extra DSPIO_DSP_INIT. The fw_split
  * pre-download replay already sends all of them in Windows' order
@@ -832,6 +893,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 			      unsigned int len, void *reply,
 			      unsigned int *reply_len)
 {
+	if (chip->card_gone)
+		return -ENODEV;
 	struct scp_msg scp_send, scp_reply;
 	unsigned int data_size = len / sizeof(unsigned int);
 	unsigned int scp_send_size, i;
@@ -1058,7 +1121,26 @@ static void ovl_stream_stop(struct creative_chip *chip)
 	wmb();
 }
 
+static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out);
+
 static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
+{
+	bool parked;
+	int ret, u;
+
+	if (chip->card_gone)
+		return -ENODEV;
+	parked = ae9_rings_park(chip, "overlay");
+	ret = dsp_overlay_xfer_once(chip, chan_out);
+	if (parked) {
+		u = ae9_rings_unpark(chip, "overlay");
+		if (u == -ENODEV)
+			return u;
+	}
+	return ret;
+}
+
+static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 {
 	const struct firmware *fw;
 	const struct ae9_dsp_image_seg *seg;
@@ -1242,6 +1324,8 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 	u32 v, chan;
 
 	for (i = 0; i < ARRAY_SIZE(states); i++) {
+		if (chip->card_gone)
+			return -ENODEV;
 		if (i == 1) {
 			/* Between states 3 and 4: DMA channel alloc, overlay
 			 * transfer (overlay=1), channel free, then 0x0b = 1,
@@ -2911,6 +2995,8 @@ struct ae9_dma_engine {
 	size_t buf_size;
 	unsigned short hda_format;
 	unsigned char stream_tag;
+	void *posbuf;		/* fw_posbuf=1 */
+	dma_addr_t posbuf_dma;
 };
 
 /* Reset the download stream (read position back to 0) and reprogram it,
@@ -3005,6 +3091,16 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	writel(upper_32_bits(dma->bdl_dma),
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_BDLPU);
 	wmb();
+	if (fw_posbuf && !chip->posbuf) {
+		dma->posbuf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE),
+						 &dma->posbuf_dma, GFP_KERNEL);
+		if (dma->posbuf) {
+			writel(upper_32_bits(dma->posbuf_dma), chip->hda_regs + AZX_REG_DPUBASE);
+			writel(lower_32_bits(dma->posbuf_dma) | 1, chip->hda_regs + AZX_REG_DPLBASE);
+			dev_info(chip->dev, "fw_posbuf: DMA position buffer on at 0x%llx\n",
+				 (u64)dma->posbuf_dma);
+		}
+	}
 	return 0;
 }
 
@@ -3026,6 +3122,26 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 		writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 		wmb();
 		udelay(50);
+	}
+	if (dma->posbuf) {
+		writel(0, chip->hda_regs + AZX_REG_DPLBASE);
+		writel(0, chip->hda_regs + AZX_REG_DPUBASE);
+		readl(chip->hda_regs + AZX_REG_DPLBASE);
+		{
+			/* which slot this controller uses for the download
+			 * stream isn't known: log the busiest one */
+			__le32 *pb = dma->posbuf;
+			unsigned int i, best = 0;
+
+			for (i = 0; i < 16; i += 2)
+				if (le32_to_cpu(pb[i]) > le32_to_cpu(pb[best]))
+					best = i;
+			dev_info(chip->dev, "fw_posbuf: slot %u position 0x%x after the download\n",
+				 best / 2, le32_to_cpu(pb[best]));
+		}
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE), dma->posbuf,
+				  dma->posbuf_dma);
+		dma->posbuf = NULL;
 	}
 	if (dma->buf)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
@@ -3413,6 +3529,7 @@ static int dspload_image(struct creative_chip *chip,
 {
 	unsigned int sample_rate = 48000;
 	unsigned short channels = DMA_TRANSFER_FRAME_SIZE_NWORDS;
+	bool parked;
 	int status;
 
 	while (channels > 16) {
@@ -3425,7 +3542,14 @@ static int dspload_image(struct creative_chip *chip,
 		if (status < 0)
 			return status;
 	}
+	parked = ae9_rings_park(chip, "firmware");
 	status = dspxfr_image(chip, fls, sample_rate, channels);
+	if (parked) {
+		int u = ae9_rings_unpark(chip, "firmware");
+
+		if (u == -ENODEV)
+			return u;
+	}
 	if (chip->rings_deferred && !chip->card_gone) {
 		/* fw_rings_off=1: the firmware stream has stopped; start the
 		 * command rings now, before the boot handshake */
