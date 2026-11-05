@@ -7,6 +7,8 @@
 #   /etc/udev/rules.d/00-ae9-override.rules
 #   /etc/modprobe.d/ae9-override.conf, /etc/modprobe.d/ae9-options.conf
 #   /etc/dracut.conf.d/ae9-omit.conf
+#   /etc/udev/rules.d/89-ae9-pipewire.rules and the PipeWire profile set
+#   /usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 # plus older file names from earlier versions of this project, and the
 # "*.off-vfio" copies scripts/toggle-ae9-mode.sh parks. Then runs depmod,
 # rebuilds the initramfs and checks nothing of ours is left.
@@ -36,6 +38,9 @@ FILES=(
     /etc/modprobe.d/ae9-options.conf
     /etc/dracut.conf.d/ae9-omit.conf
     /etc/modules-load.d/creative-ae9.conf
+    /etc/udev/rules.d/89-ae9-pipewire.rules
+    /usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+    /etc/modprobe.d/ae9-surround.conf
     # older names from earlier versions of this project
     /etc/udev/rules.d/10-creative-ae9.rules
     /etc/modprobe.d/creative_ae9.conf

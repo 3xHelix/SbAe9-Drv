@@ -1,0 +1,4 @@
+# Give the AE-9 its own PipeWire profile set (stereo + 5.1) instead of the
+# stereo fallback. Install to /etc/udev/rules.d/ next to the profile set
+# (config/creative-ae9.conf). Same match as PipeWire's own card rules.
+SUBSYSTEM=="sound", ACTION=="change", KERNEL=="card*", ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0010", ATTRS{subsystem_device}=="0x0071", ENV{ACP_PROFILE_SET}="creative-ae9.conf"

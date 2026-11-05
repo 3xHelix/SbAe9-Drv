@@ -169,6 +169,60 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 static unsigned int pcm_rates;
 module_param(pcm_rates, uint, 0644);
 MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only (default), 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz (experimental)");
+/*
+ * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
+ * -> front RCA, Center/Sub jack, Rear jack; checked by ear 2026-11-04) and
+ * the 4.0/4.1/5.1 speaker configs. PipeWire offers it as a profile with
+ * config/creative-ae9.conf. Takes effect at the next stream open.
+ */
+unsigned int ae9_surround = 1;
+module_param_named(surround, ae9_surround, uint, 0644);
+MODULE_PARM_DESC(surround, "Offer 6-channel (5.1) playback and the 4.0/4.1/5.1 speaker configs (1=on, default; 0 = stereo only)");
+
+static const unsigned int ae9_ch_list[] = { 2, 6 };
+static const struct snd_pcm_hw_constraint_list ae9_ch_constraint = {
+	.count = ARRAY_SIZE(ae9_ch_list),
+	.list = ae9_ch_list,
+};
+
+/* Windows' 5.1 order (WAVEFORMATEXTENSIBLE): FL FR FC LFE BL BR */
+static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
+	{ .channels = 2, .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR } },
+	{ .channels = 6, .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR,
+				  SNDRV_CHMAP_FC, SNDRV_CHMAP_LFE,
+				  SNDRV_CHMAP_RL, SNDRV_CHMAP_RR } },
+	{ }
+};
+
+/* 6 channels only up to 96 kHz, and above 96 kHz only 2 */
+static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
+			       struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
+	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval t;
+
+	if (ch->min <= 2)
+		return 0;
+	snd_interval_any(&t);
+	t.max = 96000;
+	return snd_interval_refine(rate, &t);
+}
+
+static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
+			       struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
+	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval t;
+
+	if (rate->min <= 96000)
+		return 0;
+	snd_interval_any(&t);
+	t.max = 2;
+	return snd_interval_refine(ch, &t);
+}
+
 static unsigned int pcm_bits = 24;
 module_param(pcm_bits, uint, 0644);
 MODULE_PARM_DESC(pcm_bits, "Playback sample bits sent to the card: 24 (default) or 32");
@@ -207,17 +261,28 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_min = 48000;
 		runtime->hw.rate_max = 48000;
 	}
-	/*
-	 * Direct Mode off = through the DSP: Windows offers up to 96 kHz.
-	 * Windows also plays 6 channels there (captures 5, 6: format 0x35),
-	 * but a 6-channel start sent before the switch to DSP mode (PipeWire
-	 * probes it at boot) leaves the DSP output a mess, and 5.1 isn't
-	 * wired up yet: stereo only for now.
-	 */
+	/* Direct Mode off = through the DSP: Windows offers up to 96 kHz. */
 	if (!chip->fx.direct) {
 		runtime->hw.rates &= SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 				     SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
 		runtime->hw.rate_max = min(runtime->hw.rate_max, 96000U);
+	}
+	/*
+	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
+	 * (captures 5, 6: format 0x35) and in Direct Mode with 5.1 speakers
+	 * (capture 6, 23:39:16). Up to 96 kHz: at 192/384 kHz the direct path
+	 * already doubles the channel count.
+	 */
+	if (ae9_surround) {
+		runtime->hw.channels_max = 6;
+		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
+					   &ae9_ch_constraint);
+		snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
+				    ae9_rule_rate_by_ch, NULL,
+				    SNDRV_PCM_HW_PARAM_CHANNELS, -1);
+		snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
+				    ae9_rule_ch_by_rate, NULL,
+				    SNDRV_PCM_HW_PARAM_RATE, -1);
 	}
 	runtime->hw.buffer_bytes_max = 128 * 1024;
 	runtime->hw.period_bytes_min = 4096;
@@ -402,6 +467,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 		chip->pcm_start_fmt = format;
 		ae9_dbg(chip, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
+		creative_ae9_fx_spk_follow(chip, runtime->channels);
 	}
 	return 0;
 }
@@ -700,6 +766,10 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 
 	chip->pcm = pcm;
 	pcm->private_free = creative_ae9_pcm_free;
+	ret = snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_PLAYBACK, ae9_chmaps,
+				     6, 0, NULL);
+	if (ret < 0)
+		dev_warn(chip->dev, "channel map control not added (%d)\n", ret);
 
 	dev_info(chip->dev, "PCM device initialized (playback + capture)\n");
 	return 0;

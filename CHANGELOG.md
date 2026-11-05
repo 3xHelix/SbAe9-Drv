@@ -3,6 +3,78 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.7 (2026-11-04)
+
+**5.1 works.** Front, rear, center and sub, every one coming out of the
+right jack. In Direct Mode and through the DSP. On a card that was a
+stereo-only science project this morning. I moved one pair of speakers
+from jack to jack about forty times today and I'd do it again.
+
+### Added
+
+- **5.1 surround.** Pick "Analog Surround 5.1 Output" for the AE-9 in your
+  sound settings and you get FL/FR on the RCA jacks, center + LFE on the
+  Center/Sub jack, rear L/R on the Rear jack. Works with Direct Mode on
+  (straight to the DACs, like Windows) and off (through the DSP, effects
+  and all). Played a real 5.1 FLAC in VLC: all six where they belong.
+- **PipeWire profiles for the card** (`config/creative-ae9.conf` +
+  `config/89-ae9-pipewire.rules`, setup step 4). Before this PipeWire only
+  ever gave the AE-9 its "fallback" stereo profile, so 5.1 couldn't even
+  show up. Stereo is still the default.
+- **Speaker Config 4.0 / 4.1 / 5.1**, and it follows you: switch the
+  desktop to 5.1 and a 2.0/2.1 setting jumps to 5.1 by itself; go back to
+  stereo and it drops to 2.1. 4.0/4.1 stay put. Set 2.0 on a 5.1 stream and
+  the DSP folds everything down to your two speakers, same as Windows.
+- [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) now switches the
+  desktop profile from its Speaker Config (and has a speaker test that
+  says "Front Left", "Rear Right"... on the right speaker). Sync goes both
+  ways and neither one fights the other. Tested every layout.
+- **A stuck-DSP warning.** If the DSP isn't running when DSP mode turns on,
+  the log says so plainly: DSP mode will be silent, Direct Mode works,
+  power off at the PSU. That's the sign I was hunting all week.
+- `scripts/ae9-surround-test.sh [--direct]`: speaks each channel's name
+  so you can check your jacks.
+
+### Fixed
+
+- **The things the chip leaves lying around in 5.1.** Old stereo feeds
+  that dragged the front into the rear (quiet, tinny, wrong voices), and
+  an extra set of outputs that put the front on the sub. Both get switched
+  off now. Switching between a stereo and a 5.1 stream rebuilds the DSP
+  path properly instead of giving you static.
+- **DKMS updates can't leave you with no driver** anymore: if
+  `dkms remove` grumbles, the install carries on, and the script refuses
+  to say "done" unless the module is really there.
+- **One install method per machine:** the DKMS script won't run next to a
+  packaged build and warns about leftover copies; `--check` shows what's
+  installed and which copy loads.
+
+### Correction to 0.6.5
+
+The dark card after a warm reboot does **not** come back with the
+driver's retry, I was wrong. Caught one live and threw everything at it:
+bus resets, reloads 16 minutes later, the whole old slow bring-up. Dead
+every time. A PSU power-off fixed it in one go. The fast fail stays (8
+seconds and "power off at the PSU" beats a 3-minute boot stall), and
+`codec1_failfast=0` is there if you ever want to experiment.
+
+### Heads up
+
+- After a long session of flipping Direct Mode and switching streams,
+  the DSP can get stuck (silent or front-only DSP mode). Warm reboots
+  don't clear it, a PSU power-off does. Normal use doesn't get there.
+- 6 channels go up to 96 kHz; above that it's stereo.
+
+Tested on kernel 7.2.15: the spoken channel test in both modes, a 5.1
+FLAC, all five speaker configs on a 5.1 stream, Direct Mode on/off with
+5.1 playing, stereo/5.1 profile switching from KDE and from SbAe9-SBC.
+
+Upgrading from 0.6.6: rebuild, replace the module (`sudo depmod -a`),
+install the two PipeWire files (setup step 4), reboot. First boot: a PSU
+power-off is the safest start.
+
+-- Joe
+
 ## 0.6.6 (2026-11-04)
 
 Remember this morning? New kernel lands, I reboot, and before I can hear

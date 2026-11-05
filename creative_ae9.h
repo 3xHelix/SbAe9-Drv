@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.6.6"
+#define CREATIVE_AE9_DRV_VERSION	"0.6.7"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -256,6 +256,7 @@ struct creative_chip {
 	unsigned int		pcm_start_sent;	/* pcm_windows start block sent since open */
 	unsigned int		pcm_start_rate;	/* stream rate that block was sent for */
 	u16			pcm_start_fmt;	/* and its stream format */
+	unsigned int		in05_ch;	/* DSP input stream 0x05 channels, 0 = off */
 	bool			dsp_primed;
 	bool			dsp_active;	/* DSP mode routing is up */	/* a full start block ran since bring-up */
 	unsigned int		pcm_bits;	/* 24 or 32, latched at open */
@@ -386,6 +387,7 @@ extern unsigned int ae9_ca0113_windows;
  * at runtime: /sys/module/snd_hda_codec_creative_ae9/parameters/debug
  */
 extern unsigned int ae9_debug;
+extern unsigned int ae9_surround;	/* 5.1 (default on) */
 #define ae9_dbg(chip, fmt, ...) do {					\
 		if (ae9_debug)						\
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\
@@ -396,6 +398,7 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
+void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
 void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);

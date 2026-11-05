@@ -109,12 +109,24 @@ static const char * const sv_mode_names[] = { "Normal", "Loud", "Night" };
  * MASTERCONTROL 0x04 (speaker config) with Direct Mode off, the "Speaker
  * Config" control. Windows sent 2.0 there in captures 5 and 6 (its speaker
  * setting on 2.1), and 8.0 in Direct Mode; ca0132's table is the same
- * (2.0 -> 1.0, 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0). Only the
- * stereo configs for now: 4.0 and up send part of the mix to rear and
- * center channels, and only front L/R are routed to the jacks so far.
+ * (2.0 -> 1.0, 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0; capture
+ * 6 sends exactly these). 4.0 and up need 6-channel streams to reach the
+ * rear and center/sub jacks, so they're offered only with surround=1.
  */
-static const char * const spk_names[] = { "2.0", "2.1" };
-static const u8 spk_cfgs[] = { 1, 2 };	/* MASTERCONTROL 0x04 value */
+static const char * const spk_names[] = { "2.0", "2.1", "4.0", "4.1", "5.1" };
+static const u8 spk_cfgs[] = { 1, 2, 5, 6, 8 };	/* MASTERCONTROL 0x04 value */
+/* 4.0 and up only with surround=1 (5.1 in DSP mode, experimental) */
+#define SPK_STEREO	2
+static unsigned int spk_count(void)
+{
+	return ae9_surround ? ARRAY_SIZE(spk_names) : SPK_STEREO;
+}
+
+/* the config in use: a saved 4.0+ falls back to 2.1 without surround */
+static unsigned int spk_idx(const struct creative_ae9_fx *fx)
+{
+	return fx->spk < spk_count() ? fx->spk : 1;
+}
 
 static unsigned int fx_spk_cfg = 2;
 module_param(fx_spk_cfg, uint, 0444);
@@ -197,7 +209,7 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 	 * block, on/offs, then values only for what is on, EQ on last. */
 	fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
 	fx_send(chip, FX_MID_MASTER, 0x04,
-		fx_f32(fx->direct ? 8 : spk_cfgs[fx->spk], 1), true);
+		fx_f32(fx->direct ? 8 : spk_cfgs[spk_idx(fx)], 1), true);
 	fx_send(chip, FX_MID_OUT, 0x19, fx_f32(fx->level[FX_BASS], 100), false);
 	fx_send(chip, FX_MID_OUT, 0x17, fx_f32(80, 1), false);
 	fx_send(chip, FX_MID_OUT, 0x18, 0, false);
@@ -370,7 +382,7 @@ static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(eq_preset_names),
 					 eq_preset_names);
 	case K_SPK:
-		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(spk_names), spk_names);
+		return snd_ctl_enum_info(ui, 1, spk_count(), spk_names);
 	}
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	ui->count = 1;
@@ -396,7 +408,7 @@ static int fx_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_SCOUT:	*v = fx->scout; break;
 	case K_SVMODE:	uv->value.enumerated.item[0] = fx->sv_mode; break;
 	case K_PRESET:	uv->value.enumerated.item[0] = fx->eq_preset; break;
-	case K_SPK:	uv->value.enumerated.item[0] = fx->spk; break;
+	case K_SPK:	uv->value.enumerated.item[0] = spk_idx(fx); break;
 	}
 	return 0;
 }
@@ -554,7 +566,7 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		fx_notify_others(chip, kc);
 		return 1;
 	case K_SPK:
-		if (e >= ARRAY_SIZE(spk_cfgs) || e == fx->spk)
+		if (e >= spk_count() || e == fx->spk)
 			return 0;
 		fx->spk = e;
 		if (!fx->direct && !chip->dsp_switch_pending)
@@ -570,6 +582,36 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * Speaker Config follows the stream (surround=1): picking the 5.1 profile
+ * in the desktop reopens the card at 6 channels, so a stereo layout (2.0,
+ * 2.1) becomes 5.1; back on a 2-channel stream, 5.1 becomes 2.1. 4.0 and
+ * 4.1 are the user's choice and stay. Mixers and SbAe9-SBC get notified.
+ */
+void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels)
+{
+	struct creative_ae9_fx *fx = &chip->fx;
+	unsigned int want = fx->spk, i;
+
+	if (!ae9_surround)
+		return;
+	if (channels == 6 && spk_idx(fx) <= 1)
+		want = 4;		/* 5.1 */
+	else if (channels == 2 && spk_idx(fx) == 4)
+		want = 1;		/* 2.1 */
+	if (want == fx->spk)
+		return;
+	fx->spk = want;
+	dev_info(chip->dev, "Speaker Config %s (follows the %u-channel stream)\n",
+		 spk_names[want], channels);
+	if (!fx->direct && !chip->dsp_switch_pending)
+		fx_apply_all(chip);
+	for (i = 0; i < fx->nkc; i++)
+		if (PV_K(fx->kc[i]->private_value) == K_SPK)
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &fx->kc[i]->id);
 }
 
 /*

@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.6):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.7):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -20,7 +20,8 @@ playback.
 > 96, 192 and 384 kHz, 24- or 32-bit, is available as an option
 > (`pcm_rates=1`, `pcm_bits=32`); 44.1/88.2 kHz playback and recording above
 > 48 kHz are not done yet. SBX effects and the EQ work through the card's
-> DSP, with Direct Mode off (stereo).
+> DSP, with Direct Mode off. 5.1 works on the card's front, rear and
+> center/sub jacks, in Direct Mode and through the DSP.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -123,8 +124,19 @@ yours with `lspci -d 1102:0010` and edit it. The module must load from the
 root filesystem (after `/lib/firmware` is available), which is what the
 dracut omit is for.
 
+### 4. PipeWire profiles (stereo and 5.1)
+
+Without this PipeWire only gives the card its stereo fallback profiles.
+The profile set adds "Analog Stereo Duplex" (the default) and "Analog
+Surround 5.1 Output":
+
+```sh
+sudo cp config/creative-ae9.conf /usr/share/alsa-card-profile/mixer/profile-sets/
+sudo cp config/89-ae9-pipewire.rules /etc/udev/rules.d/
+```
+
 `scripts/restore-stock-audio.sh` removes the driver and restores stock
-`snd_hda_intel`.
+`snd_hda_intel` (and removes these too).
 
 Reboot after setup. A full power-off (PSU off) is the safest first start.
 
@@ -172,6 +184,19 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
   ES9038's fast or slow roll-off, as the Creative app sets it; Default keeps
   Windows' startup filter). Kept across sleep/resume.
+- 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
+  the desktop's sound settings (needs step 4). Front L/R come out of the
+  card's RCA jacks, center and LFE out of the Center/Sub jack, rear L/R
+  out of the Rear jack. Works in Direct Mode (straight to the DACs) and
+  with Direct Mode off (through the DSP). With Direct Mode off, "Speaker
+  Config" tells the DSP your layout: 2.0/2.1 fold the six channels down
+  to the front (and sub), 4.0/4.1 drop the center, 5.1 uses all six. It
+  follows the stream by itself: a 5.1 stream turns 2.0/2.1 into 5.1, a
+  stereo stream turns 5.1 back into 2.1 (4.0/4.1 stay as you set them).
+  [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) switches the desktop
+  profile from its Speaker Config and has a speaker test.
+  `scripts/ae9-surround-test.sh` speaks each channel's name (stops PipeWire
+  while it runs). 6 channels go up to 96 kHz.
 - SBX effects and EQ (new in 0.6.0): two stages, as in Windows.
   "Direct Mode Switch" (default on) plays straight to the DAC at the
   stream's rate, DSP bypassed. Turn it off and the audio goes through the
@@ -246,8 +271,9 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 - Now and then a warm reboot leaves the card dark (lights off, no head
   unit, no sound); Windows sees the same at times, so it's the card. The
   driver notices within a second (`codec 1 (DSP) not answering after the
-  bus reset`) and brings the card up again, which has fixed it; if it
-  says `never answered`, power off at the PSU for ~20 s.
+  bus reset`), tries a few times, and if it says `never answered`, power
+  off at the PSU for ~20 s; only that clears it (a warm reboot sometimes
+  does, a reload doesn't).
 - SBX: if Direct Mode off ever gives silence or echoey, crunched audio
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
@@ -287,11 +313,18 @@ code path for comparison:
   `sentinel_clear=0`, `lineout_prerun=0`, `loop_start=0` —
   firmware download, DSP start and the MASTERCONTROL boot handshake.
 - `overlay` — transfer the DSP overlay image during the handshake.
+- `surround` (default 1, writable at runtime) — 6-channel (5.1) playback and
+  the 4.0/4.1/5.1 speaker configs; 0 = stereo only. `surround_ports`
+  (0x50,0x51,0x60,0x61) the router targets for the DSP's center, LFE, rear
+  L/R outputs.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
   actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
   the routine per-stream and per-step lines (command blocks, router, volume
   steps). 2: plus the raw head-unit button state. Turn it on to dig in:
   `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/debug`.
+- `codec1_failfast` (default 1, writable at runtime) — stop a bring-up right
+  after codec detection when codec 1 is silent (the dark-card case). 0 runs
+  the whole bring-up anyway: 2-3 min of timeouts, for experiments only.
 - `fw_verify` (default 0) — read the firmware back after download and count
   mismatches.
 - `ca0113_windows` — head-unit DAC commands with Windows' protocol/values.
