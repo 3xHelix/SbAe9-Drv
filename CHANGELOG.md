@@ -3,6 +3,72 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.7.0 (2026-11-05)
+
+Spent a day chasing crackles at tiny quantums and came out the other side
+with a card that runs 384 kHz at well under a millisecond, 5.1 at 96 kHz,
+and starts every song clean. Turns out most of it was the driver getting
+in its own way.
+
+### Fixed
+
+- **Stutter at 384 kHz with PipeWire on auto.** The playback buffer was
+  stuck at 64 KB, which at 384 kHz is one PipeWire quantum. One cycle
+  filled the whole thing: stutter at the start, odd clicks after. It's
+  256 KB now, so 384 kHz on auto just plays. You no longer need a big
+  quantum to keep 192/384 kHz clean.
+- **5.1 at 96 kHz, the "here be dragons" one.** The driver was giving a
+  96 kHz 5.1 stream the stereo setup: fronts mapped, the rest of the
+  channels landing wherever the card's router pointed last. Tinny, then
+  stuttering more and more. All six speakers now come out right at 96 kHz,
+  clean for minutes on end, and it's **on by default** (Direct Mode; DSP
+  mode stays 48 kHz). `surround_96k=0` puts 5.1 back to 48 kHz only.
+- **The little hiccup half a second into every song.** Every start
+  reprogrammed the DAC (Windows does it too), and the DAC re-locks: a
+  quick glitch. Now it only gets those commands when the rate or output
+  actually changed. You'll still hear it once after a rate change; every
+  other start is clean. `dac_start_skip=0` goes back to Windows' way.
+- **Apps asking for a big quantum** (pw-play wants 4096 at 96 kHz) could
+  get one as big as the whole buffer and throw errors. The buffer now
+  holds 8 periods by default (`pcm_periods`, 2-32): more room, same
+  interrupt rate, same latency.
+
+### Added
+
+- **Low latency, if you want it.** The card's DMA reads about half a
+  millisecond ahead of where the driver says it is. At tiny quantums
+  PipeWire writes into audio the card already grabbed, and you get a
+  tinny, metallic static with no error anywhere. A bit of PipeWire
+  headroom fixes it: the README has a "Low latency" section with the
+  numbers per rate, and `config/60-ae9-headroom.conf` (256, covers every
+  rate) if you want it. Nothing changes PipeWire's defaults. Here it runs
+  384 kHz clean down to quantum 64, about 0.8 ms.
+- New module options: `pcm_periods` (8), `pcm_nowakeup` (0, lets PipeWire
+  turn period interrupts off), `pcm_posbuf` (0; 1 logs the DMA read-ahead
+  every 2 s while playing), `dac_start_skip` (1).
+- **`hutext` debug command:** `echo "hutext ABCD" >
+  /sys/kernel/debug/creative_ae9/cmd` puts your own text on the head
+  unit's display (4 characters; a `.` lights the dot of the one before).
+  Bare `hutext` gives the volume back.
+
+### Heads up
+
+- **Reloading the driver is for quick checks.** Even a clean reload can
+  leave recording silent (all zeros). Reboot for good measure.
+- 44.1/88.2 kHz still go through PipeWire's resampler.
+
+Tested on kernel 7.2.15, freshly power-cycled: stereo at 48/96/192/384 kHz
+on auto and small quantums (native-rate tones, no resampling), 5.1 at 48
+and 96 kHz including a rate change mid-song, suspend/resume, speakers <->
+headphones from the knob and the app, Direct Mode off/on with SBX, and a
+day of Spotify, Discord and YouTube.
+
+Upgrading from 0.6.8: rebuild, replace the module (`sudo depmod -a`),
+reboot (PSU off is the safest start). Drop `surround_96k=1` from your
+options file if you added it; it's the default now.
+
+-- Joe
+
 ## 0.6.8 (2026-11-04)
 
 Turned this thing up to 384 kHz and lived to tell the tale. Also learned

@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.6.8"
+#define CREATIVE_AE9_DRV_VERSION	"0.7.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -180,6 +180,12 @@ struct creative_chip {
 	unsigned int		playback_period_size;
 	unsigned int		playback_stream_tag;
 	unsigned int		playback_stream_base; /* SDO offset in BAR0 */
+	/* DMA position buffer (pcm_posbuf): where the DMA has read to */
+	void			*posbuf;
+	dma_addr_t		posbuf_dma;
+	u32			pb_min, pb_max, pb_n, pb_last, pb_moves;
+	u64			pb_sum;
+	unsigned long		pb_next;
 	struct snd_pcm_substream *playback_substream; /* for period_elapsed */
 	/* capture (input stream 0, XLR via codec 1 node 0x07) */
 	struct snd_pcm_substream *capture_substream;
@@ -256,6 +262,9 @@ struct creative_chip {
 	unsigned int		pcm_start_sent;	/* pcm_windows start block sent since open */
 	unsigned int		pcm_start_rate;	/* stream rate that block was sent for */
 	u16			pcm_start_fmt;	/* and its stream format */
+	u32			dac_start_key;	/* rate row + output the DAC start commands
+						 * were last sent for; 0 = unknown (any DAC
+						 * command or a resume clears it) */
 	unsigned int		in05_ch;	/* DSP input stream 0x05 channels, 0 = off */
 	bool			dsp_primed;
 	bool			dsp_active;	/* DSP mode routing is up */	/* a full start block ran since bring-up */
@@ -278,6 +287,7 @@ struct creative_chip {
 	unsigned int		hu_output;	/* 0 speakers (RCA), 1 headphones */
 	unsigned int		hu_att_out[2];	/* remembered volume per output */
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
+	char			hu_text[9];	/* debugfs "hutext": held display text */
 	int			hu_switch_to;	/* pending output switch, -1 none */
 	unsigned int		hu_light;	/* knob light on */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */

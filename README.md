@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.8):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-05, v0.7.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -21,7 +21,8 @@ playback.
 > the box in Direct Mode; 44.1/88.2 kHz playback and recording above
 > 48 kHz are not done yet. SBX effects and the EQ work through the card's
 > DSP, with Direct Mode off. 5.1 works on the card's front, rear and
-> center/sub jacks, in Direct Mode and through the DSP.
+> center/sub jacks, at 48 or 96 kHz in Direct Mode and 48 kHz through the
+> DSP.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -166,10 +167,8 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - Choosing a rate: PipeWire runs at 48 kHz unless told otherwise.
   `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`
   follows 48 kHz-family files, `clock.force-rate 192000` forces one (0 =
-  back to automatic). At 192/384 kHz also set a bigger quantum, or it
-  crackles: `pw-metadata -n settings 0 clock.force-quantum 2048` (1024 is
-  enough at 192 kHz; 0 = automatic). SbAe9-SBC does all of this from its
-  rate picker. Don't add 44100/88200: that family isn't working yet
+  back to automatic). SbAe9-SBC does this from its rate picker. For
+  small quantums, see "Low latency" below. Don't add 44100/88200: that family isn't working yet
   (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
   PipeWire resamples those files when they're left out. `pcm_rates=0`
   limits the card to 48 kHz.
@@ -189,8 +188,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
   card's RCA jacks, center and LFE out of the Center/Sub jack, rear L/R
-  out of the Rear jack. Works in Direct Mode (straight to the DACs) and
-  with Direct Mode off (through the DSP). With Direct Mode off, "Speaker
+  out of the Rear jack. Works in Direct Mode (straight to the DACs, 48 or
+  96 kHz; 192/384 kHz stay stereo) and with Direct Mode off (through the
+  DSP, 48 kHz). With Direct Mode off, "Speaker
   Config" tells the DSP your layout: 2.0/2.1 fold the six channels down
   to the front (and sub), 4.0/4.1 drop the center, 5.1 uses all six. It
   follows the stream by itself: a 5.1 stream turns 2.0/2.1 into 5.1, a
@@ -225,10 +225,43 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   slider and the knob all stay in sync. Range -127 dB to 0 dB; the desktop
   slider at 100% is 0 dB, the card's full output level.
 
+### Low latency
+
+PipeWire's defaults work as they are; nothing here is needed for normal
+use. If you lower the quantum yourself, know this about the card: its DMA
+fetches audio about 0.5-0.7 ms ahead of the playback position the driver
+reports, the same on any machine. Below that (roughly 200 frames at
+384 kHz, 100 at 192 kHz) PipeWire writes into audio the card has already
+fetched, and you get a tinny, metallic static with no error logged.
+PipeWire's `api.alsa.headroom` keeps extra frames queued past the card's
+read point and cures it. Values tested clean down to quantum 32-64
+(2026-11-05):
+
+| Rate | Headroom | Measured read-ahead |
+|---|---|---|
+| 48 kHz | 64 | up to 33 frames |
+| 96 kHz | 96 | up to 49 frames |
+| 192 kHz | 144 | up to 97 frames |
+| 384 kHz | 256 | up to 195 frames |
+
+PipeWire takes one headroom per output, so pick the one for the rate you
+use most. `config/60-ae9-headroom.conf` sets 256, which covers every rate
+(edit the number for a lower one):
+
+```sh
+cp config/60-ae9-headroom.conf ~/.config/wireplumber/wireplumber.conf.d/
+systemctl --user restart wireplumber
+```
+
+`pcm_posbuf=1` logs the read-ahead every 2 s while playing, to check it on
+your card.
+
 ### Testing after a rebuild
 
-`bus_reset=1` makes a module reload behave like a cold start, so a reboot
-isn't needed:
+`bus_reset=1` makes a module reload behave close to a cold start, which is
+good for a quick check of a new build. It can disrupt streams, though
+(recording especially, see Known issues), so reboot for good measure
+before trusting the results:
 
 ```sh
 systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire pipewire-pulse wireplumber
@@ -258,8 +291,14 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   warm reboot doesn't clear it. Power off at the PSU for ~30 s to recover.
   Reboot instead of reloading where you can. The log line `DSP health:`
   after each startup warns when this has happened.
+- Even a clean reload (no failures, `DSP health: ok`) can leave recording
+  silent: the stream runs but every sample is zero. A reboot fixes it.
 - A very small PipeWire quantum (64) can drop out under heavy CPU load
   (`pw-top` ERR column); 128 or more is fine.
+- The first stream after a sample-rate or output change can hiccup briefly
+  about half a second in: the DAC re-locking to its new settings (Windows
+  sends them at every start; we only when something changed,
+  `dac_start_skip`).
 - After one warm reboot the first playback was silent until a new stream
   started (the card itself was working). Not reproduced yet.
 - Suspend can be blocked by other programs stuck on network file I/O (seen
@@ -306,6 +345,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `extract_firmware.py`, `extract_overlay.py` | Extract the DSP firmware and overlay from Creative's `CtxHda.sys` |
 | `config/` | Boot binding (udev rule, modprobe hook, dracut omit) and optional module options |
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
+| `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 
 ## Module parameters
 
@@ -328,9 +368,9 @@ code path for comparison:
   the 4.0/4.1/5.1 speaker configs; 0 = stereo only. `surround_ports`
   (0x50,0x51,0x60,0x61) the router targets for the DSP's center, LFE, rear
   L/R outputs.
-  `surround_96k` (0, writable at runtime) — **here be dragons**: allows 5.1
-  at 96 kHz, which stutters more and more as it plays. For testing only,
-  until a Windows capture of 5.1 at 96 kHz shows how it should be set up.
+  `surround_96k` (1, writable at runtime) — 5.1 at 96 kHz in Direct Mode
+  (fixed 2026-11-05: all six speakers right, clean over minutes); 0 limits
+  5.1 to 48 kHz. Pick the 5.1 profile and `clock.force-rate 96000`.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
   actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
   the routine per-stream and per-step lines (command blocks, router, volume
@@ -361,6 +401,14 @@ code path for comparison:
 - SBX: `fx_spk_cfg` (2) the "Speaker Config" setting at load (1 = 2.0,
   2 = 2.1 as Windows); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
   stream plays direct before the switch to the DSP.
+- Playback buffer (all writable at runtime, applied at the next stream):
+  `pcm_periods` (8) most periods per buffer, 2-32 (2 is Windows' 48 kHz
+  layout; with 2 an app asking for a big quantum could fill the whole
+  buffer); `pcm_nowakeup` (0) 1 lets PipeWire turn period interrupts off;
+  `pcm_posbuf` (0) 1 logs how far the DMA reads ahead of the reported
+  position (see "Low latency"); `dac_start_skip` (1) sends the DAC's start
+  commands only when the rate or output changed (each send makes it
+  re-lock, a brief hiccup); 0 sends them at every start, as Windows.
 
 Older parameters:
 

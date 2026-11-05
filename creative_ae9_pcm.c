@@ -23,8 +23,117 @@
 #define CREATIVE_PCM_STREAM_BASE	0x100	/* stream descriptor index 4 */
 #define CREATIVE_PCM_CODEC_ADDR	1	/* main codec */
 #define CREATIVE_PCM_DAC_NID	0x02	/* front DSP DAC */
-#define CREATIVE_PCM_BDL_ENTRIES	2	/* double-buffer */
-#define CREATIVE_PCM_BDL_SIZE		(CREATIVE_PCM_BDL_ENTRIES * 16)
+#define CREATIVE_PCM_BDL_MAX		32	/* one entry per period */
+#define CREATIVE_PCM_BDL_SIZE		(CREATIVE_PCM_BDL_MAX * 16)
+
+/* playback buffer limit (preallocated per substream; capture keeps its own
+ * 64 KB limit in its hw constraints) */
+#define CREATIVE_PCM_BUF_MAX	(256 * 1024)
+
+/*
+ * Playback buffer layout: most periods per buffer (2-32, as snd_hda_intel
+ * allows). PipeWire sizes the buffer as periods x its default period, not
+ * from the app's quantum, so with 2 an app asking for a big quantum
+ * (pw-play: 4096 at 96 kHz) could get one the size of the whole buffer and
+ * errors. 8 (default since 2026-11-05) lets it pick a buffer several
+ * quanta long; PipeWire keeps ~21 ms periods, so interrupts (46/s) and
+ * latency stay the same. Windows uses 2 entries at 48 kHz stereo, up to
+ * 24 for bigger streams. Writable: takes effect at the next stream open. pcm_nowakeup=1 lets PipeWire turn
+ * period interrupts off (SNDRV_PCM_INFO_NO_PERIOD_WAKEUP, as
+ * snd_hda_intel does); it runs on its own timer anyway.
+ */
+static unsigned int pcm_periods = 8;
+module_param(pcm_periods, uint, 0644);
+MODULE_PARM_DESC(pcm_periods, "Most playback periods per buffer, 2-32 (default 8; 2 = Windows' 48 kHz layout)");
+static bool pcm_nowakeup;
+module_param(pcm_nowakeup, bool, 0644);
+MODULE_PARM_DESC(pcm_nowakeup, "Let apps disable playback period interrupts (0 = no, default)");
+
+/*
+ * DMA position buffer (HD-Audio spec 3.3.32, DPLBASE): the controller
+ * writes each stream's DMA read position to memory. LPIB, our pointer, is
+ * the position going out on the link; the DMA has already fetched ahead
+ * of it, and at tiny PipeWire quantums PipeWire wrote into audio the card
+ * had already fetched (static, no xrun). The cure is PipeWire headroom
+ * (README, scripts/ae9-headroom.sh). 1 = log the DMA-LPIB gap every 2 s;
+ * the pointer always stays LPIB. Writable; takes effect at the next
+ * stream start. Reporting the DMA position as the pointer was tried
+ * (2026-11-05) and dropped: it moves in ~100-frame jumps, and with
+ * headroom in place it only added underruns at 192/384 kHz.
+ */
+static unsigned int pcm_posbuf;
+module_param(pcm_posbuf, uint, 0644);
+MODULE_PARM_DESC(pcm_posbuf, "DMA position buffer: 0 off (default), 1 log how far the DMA reads ahead of LPIB");
+
+static void ae9_posbuf_off(struct creative_chip *chip)
+{
+	if (!chip->posbuf)
+		return;
+	/* stop the controller writing before the memory goes away */
+	creative_hda_writel(chip, AZX_REG_DPLBASE, 0);
+	creative_hda_writel(chip, AZX_REG_DPUBASE, 0);
+	creative_hda_readl(chip, AZX_REG_DPLBASE);
+	dma_free_coherent(chip->dev, PAGE_SIZE, chip->posbuf, chip->posbuf_dma);
+	chip->posbuf = NULL;
+}
+
+static void ae9_posbuf_on(struct creative_chip *chip)
+{
+	if (!pcm_posbuf) {
+		ae9_posbuf_off(chip);
+		return;
+	}
+	if (!chip->posbuf) {
+		chip->posbuf = dma_alloc_coherent(chip->dev, PAGE_SIZE,
+						  &chip->posbuf_dma, GFP_KERNEL);
+		if (!chip->posbuf) {
+			dev_warn(chip->dev, "posbuf: no memory, staying on LPIB\n");
+			return;
+		}
+	}
+	memset(chip->posbuf, 0, PAGE_SIZE);
+	chip->pb_min = U32_MAX;
+	chip->pb_max = chip->pb_n = chip->pb_last = chip->pb_moves = 0;
+	chip->pb_sum = 0;
+	chip->pb_next = jiffies + 2 * HZ;
+	creative_hda_writel(chip, AZX_REG_DPUBASE, upper_32_bits(chip->posbuf_dma));
+	creative_hda_writel(chip, AZX_REG_DPLBASE,
+			    lower_32_bits(chip->posbuf_dma) | AZX_DPLBASE_ENABLE);
+}
+
+/* the read-ahead stats: DMA position vs LPIB for this stream */
+static void ae9_posbuf_read(struct creative_chip *chip, u32 lpib, u32 bufsz,
+			    unsigned int frame_bytes)
+{
+	unsigned int idx = (chip->playback_stream_base - 0x80) / 0x20;
+	u32 dma = le32_to_cpu(READ_ONCE(((__le32 *)chip->posbuf)[idx * 2]));
+	u32 gap;
+
+	if (dma != chip->pb_last)
+		chip->pb_moves++;
+	chip->pb_last = dma;
+	if (dma < bufsz && lpib < bufsz) {
+		gap = (dma + bufsz - lpib) % bufsz;
+		chip->pb_min = min(chip->pb_min, gap);
+		chip->pb_max = max(chip->pb_max, gap);
+		chip->pb_sum += gap;
+		chip->pb_n++;
+	}
+	if (time_after(jiffies, chip->pb_next)) {
+		if (chip->pb_n && frame_bytes)
+			dev_info(chip->dev, "posbuf: DMA ahead of LPIB by %u-%u bytes (avg %llu) = %u-%u frames, %u samples, DMA position %s\n",
+				 chip->pb_min, chip->pb_max, div_u64(chip->pb_sum, chip->pb_n),
+				 chip->pb_min / frame_bytes, chip->pb_max / frame_bytes,
+				 chip->pb_n, chip->pb_moves ? "updating" : "NOT updating");
+		else
+			dev_info(chip->dev, "posbuf: no samples (DMA position 0x%x, %s)\n",
+				 dma, chip->pb_moves ? "updating" : "NOT updating");
+		chip->pb_min = U32_MAX;
+		chip->pb_max = chip->pb_n = chip->pb_moves = 0;
+		chip->pb_sum = 0;
+		chip->pb_next = jiffies + 2 * HZ;
+	}
+}
 
 /*
  * Build the 16-bit SDnFMT value (HD-Audio spec 3.7.1, same as the codec's
@@ -198,21 +307,21 @@ static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
 };
 
 /*
- * 6 channels only at 48 kHz, and above 48 kHz only 2. 5.1 at 96 kHz
- * (Direct Mode, 0x0845/0x0835) slowly fell apart while playing, twice,
- * the second time on a freshly power-cycled card; 5.1 at 48 kHz has been
- * clean every time, 24- and 32-bit. Windows' 5.1 captures are 48 kHz too.
- * surround_96k=1 lifts it (below).
+ * 6 channels up to 96 kHz (48 kHz with surround_96k=0), and above that
+ * only 2. Direct Mode only: DSP mode opens at 48 kHz. Windows' 5.1
+ * captures are all 48 kHz.
  */
 #define AE9_SURROUND_RATE_MAX	(surround_96k ? 96000 : 48000)
 
-/* Here be dragons: 5.1 at 96 kHz stutters more and more as it plays (a
- * third time on 2026-11-04, calm, nothing else changing). Left reachable
- * for testing until a Windows capture of 5.1 at 96 kHz shows how it's
- * meant to be set up. */
-static unsigned int surround_96k;
+/* 5.1 at 96 kHz used to stutter more and more as it played: the start
+ * block gave it the stereo router setup (front slots only) and the 64 KB
+ * buffer was barely one quantum. Both fixed 2026-11-05: all six speakers
+ * right, no errors over 2 min; on by default since. The 96 kHz slot
+ * layout is our guess (no Windows capture of 5.1 above 48 kHz); 0 goes
+ * back to 5.1 at 48 kHz only. */
+static unsigned int surround_96k = 1;
 module_param(surround_96k, uint, 0644);
-MODULE_PARM_DESC(surround_96k, "EXPERIMENTAL, here be dragons: allow 5.1 at 96 kHz (stutters more and more as it plays; 0=off, default)");
+MODULE_PARM_DESC(surround_96k, "Allow 5.1 at 96 kHz in Direct Mode (1 = yes, default; 0 = 5.1 at 48 kHz only)");
 static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
 			       struct snd_pcm_hw_rule *rule)
 {
@@ -295,6 +404,8 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
+	if (pcm_nowakeup)
+		runtime->hw.info |= SNDRV_PCM_INFO_NO_PERIOD_WAKEUP;
 
 	/* ALSA's default thresholds (start_threshold = 1 underran at once).
 	 * Windows: node 0x02 format 0x31 (2 ch, 24-bit, 48 kHz) and a 2-entry
@@ -335,7 +446,7 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	/*
 	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
 	 * (captures 5, 6: format 0x35) and in Direct Mode with 5.1 speakers
-	 * (capture 6, 23:39:16). 6 channels at 48 kHz only (see
+	 * (capture 6, 23:39:16). 6 channels up to 96 kHz (see
 	 * AE9_SURROUND_RATE_MAX).
 	 */
 	if (ae9_surround) {
@@ -349,11 +460,21 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 				    ae9_rule_ch_by_rate, NULL,
 				    SNDRV_PCM_HW_PARAM_RATE, -1);
 	}
-	runtime->hw.buffer_bytes_max = 128 * 1024;
+	/* Room for PipeWire's default quantum at every rate: it scales 1024
+	 * frames at 48 kHz up with the rate (8192 at 384 kHz = 64 KB stereo),
+	 * and the old 64 KB buffer made one quantum the whole buffer there
+	 * (stutter, and PipeWire's headroom clamped to 0). */
+	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
 	runtime->hw.period_bytes_min = 4096;
-	runtime->hw.period_bytes_max = 64 * 1024;
+	runtime->hw.period_bytes_max = 128 * 1024;
 	runtime->hw.periods_min = 2;
-	runtime->hw.periods_max = 2;
+	runtime->hw.periods_max = clamp(pcm_periods, 2U, (unsigned int)CREATIVE_PCM_BDL_MAX);
+	/* whole periods only (the BDL has one entry per period, and the
+	 * buffer length must be their sum), each starting on the 128-byte
+	 * boundary the HD-Audio spec requires of a BDL entry's address */
+	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 128);
+	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 128);
 	chip->pcm_bits = pcm_bits == 32 ? 32 : 24;
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, chip->pcm_bits);
 	chip->pcm_start_sent = 0;
@@ -439,6 +560,7 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 		chip->pcm_start_sent = 0;
 	}
 
+	ae9_posbuf_off(chip);
 	if (chip->playback_bdl_raw) {
 		dma_free_coherent(chip->dev, chip->playback_bdl_size,
 				  chip->playback_bdl_raw,
@@ -471,7 +593,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	memset(chip->playback_bdl, 0, CREATIVE_PCM_BDL_SIZE);
 	addr = runtime->dma_addr;
 
-	for (i = 0; i < CREATIVE_PCM_BDL_ENTRIES; i++) {
+	for (i = 0; i < runtime->periods; i++) {
 		__le64 *bdl_addr = chip->playback_bdl + i * 16;
 		__le32 *bdl_len = chip->playback_bdl + i * 16 + 8;
 		__le32 *bdl_ioc = chip->playback_bdl + i * 16 + 12;
@@ -479,8 +601,9 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 		*bdl_addr = cpu_to_le64(addr);
 		*bdl_len = cpu_to_le32(period_size);
 		/* pcm_windows: interrupt per period; with IOC only on the last
-		 * entry ALSA heard once per buffer, found it empty and xran */
-		*bdl_ioc = cpu_to_le32(1);
+		 * entry ALSA heard once per buffer, found it empty and xran.
+		 * None at all when the app asked for no period wakeups. */
+		*bdl_ioc = cpu_to_le32(runtime->no_period_wakeup ? 0 : 1);
 
 		addr += period_size;
 	}
@@ -504,8 +627,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	}
 
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, buf_size);
-	creative_hda_writew(chip, base + AZX_REG_SD_LVI,
-			    CREATIVE_PCM_BDL_ENTRIES - 1);
+	creative_hda_writew(chip, base + AZX_REG_SD_LVI, runtime->periods - 1);
 
 	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41) */
 	format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
@@ -517,6 +639,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 			    lower_32_bits(chip->playback_bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->playback_bdl_dma));
+	ae9_posbuf_on(chip);
 
 	/* Windows' playback-start block sets format 0x31 and binds node
 	 * 0x02 to tag 1 itself. Once per open: xrun recovery re-prepares,
@@ -580,6 +703,9 @@ creative_ae9_pcm_pointer(struct snd_pcm_substream *substream)
 
 	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	wmb();
+	if (chip->posbuf)	/* pcm_posbuf: read-ahead stats only */
+		ae9_posbuf_read(chip, pos, snd_pcm_lib_buffer_bytes(substream),
+				frames_to_bytes(substream->runtime, 1));
 	/* Mask to buffer size to prevent pos == buffer_size (invalid to ALSA) */
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
 		pos = 0;
@@ -827,7 +953,7 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 
 	snd_pcm_lib_preallocate_pages_for_all(pcm,
 		SNDRV_DMA_TYPE_DEV, chip->dev,
-		64 * 1024, 64 * 1024);
+		CREATIVE_PCM_BUF_MAX, CREATIVE_PCM_BUF_MAX);
 
 	chip->pcm = pcm;
 	pcm->private_free = creative_ae9_pcm_free;

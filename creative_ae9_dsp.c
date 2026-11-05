@@ -3697,6 +3697,7 @@ static void ca0113_mmio_gpio_set(struct creative_chip *chip,
 static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
 		       unsigned int settle_us)
 {
+	chip->dac_start_key = 0;	/* DAC touched: next start sends all */
 	creative_ext_writel(chip, 0x210, 0x0000007e);
 	creative_ext_readl(chip, 0x210);
 	creative_ext_writel(chip, 0x210, 0x0000005a);

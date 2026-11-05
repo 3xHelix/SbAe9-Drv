@@ -1431,6 +1431,19 @@ void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
 				   msecs_to_jiffies(dsp_switch_ms));
 }
 
+/*
+ * Windows reprograms the ES9038 DAC at every stream start (12 commands,
+ * including its input setup 48/01 and master mode 48/0a), and the DAC
+ * re-locks: a brief hiccup ~0.5 s into each stream (heard in VLC, 2026-11-
+ * 05: 2 of 2 starts with the commands, 0 of 2 without). So they're sent
+ * only when the rate or output changed, or anything else touched the DAC
+ * (any CA0113 command or a resume clears dac_start_key). 0 = send them at
+ * every start, as Windows does.
+ */
+static bool dac_start_skip = true;
+module_param(dac_start_skip, bool, 0644);
+MODULE_PARM_DESC(dac_start_skip, "Skip the DAC start commands when rate and output are unchanged (1 = yes, default; 0 = every start, as Windows)");
+
 void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
 				  unsigned int rate, u16 format)
 {
@@ -1453,7 +1466,11 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		creative_ae9_dsp_mode_start(chip, format);
 		return;
 	}
-	if (start && !atomic && ae9_ca0113_windows) {
+	if (start && !atomic && ae9_ca0113_windows &&
+	    dac_start_skip && chip->dac_start_key == ((r + 1) | hp << 8)) {
+		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
+			ae9_pcm_rates[r].rate);
+	} else if (start && !atomic && ae9_ca0113_windows) {
 		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm)][3];
 
 		memcpy(cmds, ae9_cold_ca0113_pcm, sizeof(cmds));
@@ -1467,6 +1484,7 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		}
 		creative_dsp_ca0113_replay(chip, cmds, ARRAY_SIZE(cmds),
 					   "playback-start commands");
+		chip->dac_start_key = (r + 1) | hp << 8;
 	}
 	if (start) {
 		bool src = ae9_pcm_rates[r].route == AE9_ROUTE_SRC;
@@ -1477,7 +1495,10 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		 * after the switch (2026-11-04, try 1); started as before
 		 * (stereo setup, front only for those 3 s) it was fine.
 		 */
-		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 2 &&
+		/* ports <= 4: 48 and 96 kHz (this said <= 2 until 2026-11-05, so
+		 * 5.1 at 96 kHz got the stereo setup: front slots only, the
+		 * other channels went wherever the router pointed last) */
+		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 4 &&
 			   chip->fx.direct;
 		const u32 *in = ae9_cold_pcm_start;
 		size_t nin = ARRAY_SIZE(ae9_cold_pcm_start);
@@ -1542,17 +1563,34 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 			 * followed by 0x70d 0x90+k / 0x70e 0x14 / 0xf07 as for
 			 * the front pair.
 			 */
-			if (!src && v == 0x1150042c && six)
-				for (k = 2; k < 6; k++) {
-					static const u8 port51[6] = {
-						0x40, 0x41, 0x50, 0x51, 0x60, 0x61 };
+			if (!src && v == 0x1150042c && six) {
+				static const u8 port51[6] = {
+					0x40, 0x41, 0x50, 0x51, 0x60, 0x61 };
 
+				for (k = 2; k < 6; k++) {
 					n = ae9_chipio_w(t, n, 0x190060 + 4 * k,
 							 0x00010000 | (port51[k] << 8) | k);
 					t[n++] = 0x11570d90 + k;
 					t[n++] = 0x11570e14;
 					t[n++] = 0x115f0700;
 				}
+				/*
+				 * Above 48 kHz each channel takes one slot per
+				 * 48 kHz tick: 6 x the rate multiple slots. Stereo
+				 * maps slot k to 0x40 + k (FL 40, 42, ..; FR 41,
+				 * 43, ..), so sample s of a channel goes to its
+				 * DAC pair's input + 2s. Without these, 5.1 at
+				 * 96 kHz sent every second sample to whatever the
+				 * slot held last (front inputs left by a 384 kHz
+				 * stream): tinny, stuttering (2026-11-05). Our
+				 * guess from the stereo layout; no Windows capture
+				 * of 5.1 above 48 kHz.
+				 */
+				for (k = 6; k < 3 * ae9_pcm_rates[r].ports; k++)
+					n = ae9_chipio_w(t, n, 0x190060 + 4 * k,
+							 0x00010000 |
+							 ((port51[k % 6] + 2 * (k / 6)) << 8) | k);
+			}
 			/* stream channel param: 0xdb = 6 ch (captured 0x5b) */
 			if (six && v == 0x1157105b)
 				v = 0x115710db;
@@ -2509,6 +2547,30 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 			  "dacroute ret=%d\n", ret);
 		return len;
 	}
+	/* "hutext ABCD": hold text on the head-unit display (shown at the
+	 * next poll, within ~0.5 s); "hutext" alone goes back to the normal
+	 * volume/MUTE display. Printable ASCII only. The frame carries 8
+	 * characters but the display has 4 cells (left-aligned, no scroll;
+	 * dots ride on the cell before them), so only the first 4 show. */
+	if (!strncmp(buf, "hutext", 6)) {
+		char t[9] = "";
+		unsigned long flags;
+		int i, k = 0;
+
+		for (i = 6; buf[i] == ' '; i++)
+			;
+		for (; buf[i] && buf[i] != '\n' && k < 8; i++) {
+			if (buf[i] < 0x20 || buf[i] > 0x7e)
+				return -EINVAL;
+			t[k++] = buf[i];
+		}
+		spin_lock_irqsave(&g_dbg_chip->lock, flags);	/* vs. hu_label */
+		memcpy(g_dbg_chip->hu_text, t, sizeof(t));
+		spin_unlock_irqrestore(&g_dbg_chip->lock, flags);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result),
+			  k ? "hutext \"%s\"\n" : "hutext cleared\n", t);
+		return len;
+	}
 	/* "hutx <reg> [b0 b1 ...]" — send arbitrary head-unit I2C transaction
 	 * for live relay/amp probing. e.g. "hutx 0xb1 0x03"
 	 */
@@ -3067,14 +3129,22 @@ static void creative_ae9_hu_label(struct creative_chip *chip)
 {
 	u8 resp[24], label[13] = { 0xf0, 0x11, 0x09 };
 	char text[9] = "";
+	unsigned long flags;
 
-	if (chip->hu_ticks < chip->hu_name_until)
-		strscpy(text, chip->hu_output ? "-HP-" : "-SP-", sizeof(text));
-	else if (chip->hu_mute)
-		strscpy(text, "MUTE", sizeof(text));
-	else
-		snprintf(text, sizeof(text), "%s%u.%u", chip->hu_att ? "-" : "",
-			 chip->hu_att / 2, (chip->hu_att & 1) * 5);
+	spin_lock_irqsave(&chip->lock, flags);	/* debugfs "hutext" writes it */
+	strscpy(text, chip->hu_text, sizeof(text));
+	spin_unlock_irqrestore(&chip->lock, flags);
+	if (!text[0]) {			/* no "hutext" test text held */
+		if (chip->hu_ticks < chip->hu_name_until)
+			strscpy(text, chip->hu_output ? "-HP-" : "-SP-",
+				sizeof(text));
+		else if (chip->hu_mute)
+			strscpy(text, "MUTE", sizeof(text));
+		else
+			snprintf(text, sizeof(text), "%s%u.%u",
+				 chip->hu_att ? "-" : "",
+				 chip->hu_att / 2, (chip->hu_att & 1) * 5);
+	}
 	memcpy(label + 3, text, strlen(text));
 	label[12] = 0xf7;
 	creative_spi_frame_win(chip, label, sizeof(label), resp, sizeof(resp));
@@ -4655,6 +4725,8 @@ static void creative_ae9_resume_work(struct work_struct *work)
 		container_of(work, struct creative_chip, resume_work);
 	unsigned int want_hp = chip->hu_output, attempt;
 	int ret = -EIO;
+
+	chip->dac_start_key = 0;	/* the card lost power */
 
 	/* the boot replay brings the head unit up on speakers */
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;
