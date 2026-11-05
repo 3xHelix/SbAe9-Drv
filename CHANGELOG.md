@@ -3,6 +3,58 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.6.8 (2026-11-04)
+
+Turned this thing up to 384 kHz and lived to tell the tale. Also learned
+the hard way that this card is not a sports car: it does not do a 180 on
+a dime. Give it a second and it's solid as hell.
+
+### Added
+
+- **All the rates, out of the box:** 48, 96, 192 and 384 kHz in Direct
+  Mode, no module option needed anymore. Pick one in SbAe9-SBC, or with
+  `pw-metadata -n settings 0 clock.force-rate 192000` (0 = automatic).
+  At 192/384 kHz PipeWire wants a bigger quantum or it crackles (2048 at
+  384); the app sets that for you.
+- **"PCM Bit Depth" control, 24-bit or 32-bit.** 24 is the default like
+  Windows. Takes effect on the next stream; the app reopens it for you.
+- **EQ presets A to Z**, with the game presets (Project CARS, Racing,
+  Rocket League, RPG) at the bottom like the Windows app. Your saved
+  preset stays the same preset, it's stored by name.
+- [Helvum](https://gitlab.freedesktop.org/pipewire/helvum) gets a shout
+  in the README. Beautiful tool for watching the six 5.1 ports light up.
+
+### Fixed
+
+- **The echo.** 96 kHz with Direct Mode off played the song twice: once
+  straight through and once through the DSP a hair later. DSP mode now
+  runs at 48 kHz and PipeWire resamples into it. Direct Mode keeps every
+  rate.
+- **5.1 at 96 kHz stutters** more and more as it plays. Caught it four
+  times, the last on a fresh card with nothing else going on. 5.1 now plays
+  at 48 kHz, where it's rock solid at 24 and 32-bit. If you want to wrestle
+  it anyway: `surround_96k=1`. Here be dragons. Needs a Windows capture to
+  sort out.
+
+### Heads up
+
+- **Don't speedrun the settings.** Dozens of rate/mode/5.1/bit-depth
+  flips in a row can wear the card into a stuttering or silent state that
+  only a PSU power-off clears. Normal use never gets there. SbAe9-SBC now
+  shows an "Applying changes" notice and paces itself, just like Creative's
+  own app does on Windows.
+- 44.1/88.2 kHz still go through PipeWire's resampler.
+
+Tested on kernel 7.2.15, freshly power-cycled: stereo at 48/96/192/384 at
+24 and 32-bit, rate switching back and forth, 5.1 at 48 kHz at both
+depths, DSP mode, and the new SbAe9-SBC picker and speedbump end to end.
+
+Upgrading from 0.6.7: rebuild, replace the module (`sudo depmod -a`),
+reboot (PSU off is the safest start). You can drop `pcm_rates=1` and
+`pcm_bits=32` from your options file; use the control instead.
+
+-- Joe
+
 ## 0.6.7 (2026-11-04)
 
 **5.1 works.** Front, rear, center and sub, every one coming out of the

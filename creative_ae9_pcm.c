@@ -9,6 +9,7 @@
 //
 
 #include <linux/dma-mapping.h>
+#include <sound/control.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/hda_register.h>
@@ -166,9 +167,11 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
  * full 32 bits go to the card (format 0x41..., which Windows also uses).
  * Both writable at runtime; they apply to streams opened afterwards.
  */
-static unsigned int pcm_rates;
+/* 48/96/192/384 kHz by default (Direct Mode; DSP mode takes 48 kHz):
+ * every rate checked at 24 and 32 bit, switching back and forth, 2026-11-04 */
+static unsigned int pcm_rates = 1;
 module_param(pcm_rates, uint, 0644);
-MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only (default), 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz (experimental)");
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz (default), 2 = also 44.1/88.2 kHz (experimental)");
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
  * -> front RCA, Center/Sub jack, Rear jack; checked by ear 2026-11-04) and
@@ -194,7 +197,22 @@ static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
 	{ }
 };
 
-/* 6 channels only up to 96 kHz, and above 96 kHz only 2 */
+/*
+ * 6 channels only at 48 kHz, and above 48 kHz only 2. 5.1 at 96 kHz
+ * (Direct Mode, 0x0845/0x0835) slowly fell apart while playing, twice,
+ * the second time on a freshly power-cycled card; 5.1 at 48 kHz has been
+ * clean every time, 24- and 32-bit. Windows' 5.1 captures are 48 kHz too.
+ * surround_96k=1 lifts it (below).
+ */
+#define AE9_SURROUND_RATE_MAX	(surround_96k ? 96000 : 48000)
+
+/* Here be dragons: 5.1 at 96 kHz stutters more and more as it plays (a
+ * third time on 2026-11-04, calm, nothing else changing). Left reachable
+ * for testing until a Windows capture of 5.1 at 96 kHz shows how it's
+ * meant to be set up. */
+static unsigned int surround_96k;
+module_param(surround_96k, uint, 0644);
+MODULE_PARM_DESC(surround_96k, "EXPERIMENTAL, here be dragons: allow 5.1 at 96 kHz (stutters more and more as it plays; 0=off, default)");
 static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
 			       struct snd_pcm_hw_rule *rule)
 {
@@ -205,7 +223,7 @@ static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
 	if (ch->min <= 2)
 		return 0;
 	snd_interval_any(&t);
-	t.max = 96000;
+	t.max = AE9_SURROUND_RATE_MAX;
 	return snd_interval_refine(rate, &t);
 }
 
@@ -216,16 +234,56 @@ static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
 	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
 	struct snd_interval t;
 
-	if (rate->min <= 96000)
+	if (rate->min <= AE9_SURROUND_RATE_MAX)
 		return 0;
 	snd_interval_any(&t);
 	t.max = 2;
 	return snd_interval_refine(ch, &t);
 }
 
+/*
+ * Bits the card takes the stream as (the format's bits field; Windows: 24
+ * or 32 by source). ALSA can't negotiate it: both are S32_LE, 24-bit
+ * audio sitting in the top bits. Also the "PCM Bit Depth" control. Takes
+ * effect at the next stream open.
+ */
 static unsigned int pcm_bits = 24;
 module_param(pcm_bits, uint, 0644);
-MODULE_PARM_DESC(pcm_bits, "Playback sample bits sent to the card: 24 (default) or 32");
+MODULE_PARM_DESC(pcm_bits, "Playback sample bits sent to the card: 24 (default) or 32; also the 'PCM Bit Depth' control");
+
+static int pcm_bits_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	static const char * const names[] = { "24-bit", "32-bit" };
+
+	return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(names), names);
+}
+
+static int pcm_bits_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.enumerated.item[0] = pcm_bits == 32;
+	return 0;
+}
+
+static int pcm_bits_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	unsigned int want = uv->value.enumerated.item[0] ? 32 : 24;
+
+	if (uv->value.enumerated.item[0] > 1)
+		return -EINVAL;
+	if (want == (pcm_bits == 32 ? 32 : 24))
+		return 0;
+	pcm_bits = want;	/* the next stream opens with it */
+	return 1;
+}
+
+static const struct snd_kcontrol_new pcm_bits_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "PCM Bit Depth",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = pcm_bits_info,
+	.get = pcm_bits_get,
+	.put = pcm_bits_put,
+};
 
 static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 {
@@ -261,17 +319,24 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_min = 48000;
 		runtime->hw.rate_max = 48000;
 	}
-	/* Direct Mode off = through the DSP: Windows offers up to 96 kHz. */
+	/*
+	 * Direct Mode off = through the DSP: 48 kHz only. Windows offers up to
+	 * 96 kHz there, but our DSP-mode start only sets up a 48 kHz input:
+	 * at 96 kHz the router came up with no DSP input path while the direct
+	 * route stayed live, so the stream played twice, direct and through
+	 * the DSP a little later (an echo; 2026-11-04). PipeWire resamples
+	 * other rates to 48 kHz in DSP mode; Direct Mode keeps them all.
+	 */
 	if (!chip->fx.direct) {
-		runtime->hw.rates &= SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
-				     SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000;
-		runtime->hw.rate_max = min(runtime->hw.rate_max, 96000U);
+		runtime->hw.rates &= SNDRV_PCM_RATE_48000;
+		runtime->hw.rate_min = max(runtime->hw.rate_min, 48000U);
+		runtime->hw.rate_max = min(runtime->hw.rate_max, 48000U);
 	}
 	/*
 	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
 	 * (captures 5, 6: format 0x35) and in Direct Mode with 5.1 speakers
-	 * (capture 6, 23:39:16). Up to 96 kHz: at 192/384 kHz the direct path
-	 * already doubles the channel count.
+	 * (capture 6, 23:39:16). 6 channels at 48 kHz only (see
+	 * AE9_SURROUND_RATE_MAX).
 	 */
 	if (ae9_surround) {
 		runtime->hw.channels_max = 6;
@@ -770,6 +835,9 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 				     6, 0, NULL);
 	if (ret < 0)
 		dev_warn(chip->dev, "channel map control not added (%d)\n", ret);
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&pcm_bits_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "PCM Bit Depth control not added (%d)\n", ret);
 
 	dev_info(chip->dev, "PCM device initialized (playback + capture)\n");
 	return 0;

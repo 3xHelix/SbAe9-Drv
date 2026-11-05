@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-04, v0.6.7):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-04, v0.6.8):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -17,8 +17,8 @@ playback.
 > effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
-> 96, 192 and 384 kHz, 24- or 32-bit, is available as an option
-> (`pcm_rates=1`, `pcm_bits=32`); 44.1/88.2 kHz playback and recording above
+> 48, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
+> the box in Direct Mode; 44.1/88.2 kHz playback and recording above
 > 48 kHz are not done yet. SBX effects and the EQ work through the card's
 > DSP, with Direct Mode off. 5.1 works on the card's front, rear and
 > center/sub jacks, in Direct Mode and through the DSP.
@@ -158,19 +158,21 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   desktop volume slider and mute drive the card (hardware volume), and the
   knob moves the slider and OSD. "Pro Audio" also plays, but uses software
   volume only.
-- The PCM takes 2 channels, S32_LE: 24 significant bits by default (as
-  Windows' default format), all 32 with `pcm_bits=32`. 48 kHz by default;
-  with `pcm_rates=1` playback also runs at 96, 192 and 384 kHz (see below).
-  Recording is 48 kHz. PipeWire converts other rates.
-- Higher playback rates (opt-in): `pcm_rates=1` (and `pcm_bits=32` for
-  32-bit) in `config/ae9-options.conf`, or at runtime, e.g.
-  `echo 1 | sudo tee /sys/module/snd_hda_codec_creative_ae9/parameters/pcm_rates`
-  (applies to streams opened afterwards). Then let PipeWire use them, e.g.
+- The PCM takes 2 or 6 channels, S32_LE. "PCM Bit Depth" (24-bit, the
+  default as Windows, or 32-bit) sets how the card takes it; it applies to
+  the next stream (24-bit sources lose nothing at 32-bit). Rates: 48, 96,
+  192 and 384 kHz in Direct Mode, 48 kHz with Direct Mode off (PipeWire
+  resamples; 96 kHz through the DSP isn't done yet). Recording is 48 kHz.
+- Choosing a rate: PipeWire runs at 48 kHz unless told otherwise.
   `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`
-  to follow 48 kHz-family files, or `clock.force-rate 96000` to always run
-  at 96 kHz. Don't add 44100/88200: that family isn't working yet
+  follows 48 kHz-family files, `clock.force-rate 192000` forces one (0 =
+  back to automatic). At 192/384 kHz also set a bigger quantum, or it
+  crackles: `pw-metadata -n settings 0 clock.force-quantum 2048` (1024 is
+  enough at 192 kHz; 0 = automatic). SbAe9-SBC does all of this from its
+  rate picker. Don't add 44100/88200: that family isn't working yet
   (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
-  PipeWire resamples those files when they're left out.
+  PipeWire resamples those files when they're left out. `pcm_rates=0`
+  limits the card to 48 kHz.
 - Recording: the head unit's XLR mic input (`arecord -D hw:AE9 -c 2 -r 48000
   -f S32_LE`, or the AE-9 input in PipeWire/Audacity). "XLR Gain" sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
@@ -196,11 +198,15 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) switches the desktop
   profile from its Speaker Config and has a speaker test.
   `scripts/ae9-surround-test.sh` speaks each channel's name (stops PipeWire
-  while it runs). 6 channels go up to 96 kHz.
+  while it runs). 5.1 plays at 48 kHz (above that it's stereo only).
+- [Helvum](https://gitlab.freedesktop.org/pipewire/helvum) (on Flathub)
+  draws PipeWire's patchbay: a great way to see the AE-9's ports (FL FR on
+  stereo, all six on the 5.1 profile) and what's feeding them.
 - SBX effects and EQ (new in 0.6.0): two stages, as in Windows.
   "Direct Mode Switch" (default on) plays straight to the DAC at the
   stream's rate, DSP bypassed. Turn it off and the audio goes through the
-  DSP at 96 kHz (stereo only for now); then "SBX Switch" turns the effects
+  DSP (streams at 48 kHz there, PipeWire resamples the rest; stereo or
+  5.1); then "SBX Switch" turns the effects
   on or off, and "Speaker Config" (2.0 or 2.1, default 2.1 as Windows) tells
   the DSP your speaker setup. With both, the "FX Surround / Dialog Plus / Smart Volume /
   Crystalizer / Bass" switches and volumes (0-100), "FX Smart Volume Mode",
@@ -274,6 +280,11 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   bus reset`), tries a few times, and if it says `never answered`, power
   off at the PSU for ~20 s; only that clears it (a warm reboot sometimes
   does, a reload doesn't).
+- Lots of rapid switching in a row (sample rates, Direct Mode, stereo/5.1,
+  bit depth, dozens of times) can wear the card into a bad state: a stream
+  that stutters more and more, or plays nothing while the player runs.
+  A warm reboot doesn't clear it, a PSU power-off does. Normal use doesn't
+  get there; it showed up during heavy testing.
 - SBX: if Direct Mode off ever gives silence or echoey, crunched audio
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
@@ -317,6 +328,9 @@ code path for comparison:
   the 4.0/4.1/5.1 speaker configs; 0 = stereo only. `surround_ports`
   (0x50,0x51,0x60,0x61) the router targets for the DSP's center, LFE, rear
   L/R outputs.
+  `surround_96k` (0, writable at runtime) — **here be dragons**: allows 5.1
+  at 96 kHz, which stutters more and more as it plays. For testing only,
+  until a Windows capture of 5.1 at 96 kHz shows how it should be set up.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
   actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
   the routine per-stream and per-step lines (command blocks, router, volume

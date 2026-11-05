@@ -63,41 +63,45 @@ static const char * const eq_names[FX_EQ_VALUES] = {
 };
 
 /*
- * EQ presets as the Creative app sends them for the AE-9, in its list
- * order (capture 5, 22:59-23:03, every preset in turn; Rock and Gaming
- * match capture 3). 0.1 dB, pre-gain first. Pop and Stadium have finer
+ * EQ presets as the Creative app sends them for the AE-9 (capture 5,
+ * 22:59-23:03, every preset in turn; Rock and Gaming match capture 3).
+ * Listed A-Z, the game presets A-Z at the end, as Joe asked (cleaner, and
+ * closer to the app). Saved settings are restored by name, so the order
+ * can change. 0.1 dB, pre-gain first. Pop and Stadium have finer
  * values (Pop 8 kHz 1.19624, Stadium 62 Hz 5.68521), rounded to 0.1 dB.
  * Night sends the same EQ as Concert, and the game presets (Project CARS,
  * Racing, Rocket League, RPG) a flat one: whatever else they do in Windows
  * isn't sent to the card. Other presets: set the bands.
  */
 static const char * const eq_preset_names[] = {
-	"Flat", "Rock", "Concert", "Night", "Acoustic", "Classical", "Country",
-	"Dance", "Hip Hop", "Jazz", "Pop", "R&B", "Vocal", "Gaming", "Cinema",
-	"Project CARS", "Racing", "Rocket League", "RPG", "Stadium",
+	"Acoustic", "Cinema", "Classical", "Concert", "Country", "Dance",
+	"Flat", "Gaming", "Hip Hop", "Jazz", "Night", "Pop",
+	"R&B", "Rock", "Stadium", "Vocal", "Project CARS", "Racing",
+	"Rocket League", "RPG",
 };
+#define EQ_PRESET_FLAT	6	/* index of "Flat" */
 static const s16 eq_presets[][FX_EQ_VALUES] = {
 	/* pre  31   62  125  250  500   1k   2k   4k   8k  16k */
-	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Flat */
-	{   0,   0,   0,  20,  10,   0,  30,  10, -10,  30,  30 },	/* Rock */
-	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Concert */
-	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Night */
 	{   0,   0,   0,  20,   0,   0,  25,  20,  20,  20,  30 },	/* Acoustic */
+	{   0,   0,   0,   0,   0,  20,  30,   0,   0,  10,  10 },	/* Cinema */
 	{   0,   0,   0,  15,  20,  10,  30,  10,   0,  30,  30 },	/* Classical */
+	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Concert */
 	{   0,   0,   0,   0,   0,  20,  25,  25,  20,  30,  30 },	/* Country */
 	{   0,   0,   0,  10,  15,   5,  15,  20,  10,  25,  25 },	/* Dance */
+	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Flat */
+	{   0,   0,   0,  30, -20,   0,  30,   0,   0,  30,  20 },	/* Gaming */
 	{   0,   0,   0,  20,  25,  15,  25,   0, -25, -10, -15 },	/* Hip Hop */
 	{   0,   0,   0,   0,  25,  25,  30,  10,  10,  30,  30 },	/* Jazz */
+	{   0,   0,   0,   0,   0,   0,   0,   0, -10,  30, -50 },	/* Night */
 	{ -10,  17,  26,  21,  27,   7,  34,  12,  56,  60,  52 },	/* Pop */
 	{   0,   0,   0,   0, -15,  25,  15,  20,   0,  20,  10 },	/* R&B */
+	{   0,   0,   0,  20,  10,   0,  30,  10, -10,  30,  30 },	/* Rock */
+	{   0,  39,  57,  43,  30,  36,  35,  33,  40,  60,  68 },	/* Stadium */
 	{   0,   0,   0, -15,  -5,  30,  30,  30,   0,   0,  10 },	/* Vocal */
-	{   0,   0,   0,  30, -20,   0,  30,   0,   0,  30,  20 },	/* Gaming */
-	{   0,   0,   0,   0,   0,  20,  30,   0,   0,  10,  10 },	/* Cinema */
 	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Project CARS */
 	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Racing */
 	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* Rocket League */
 	{   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0 },	/* RPG */
-	{   0,  39,  57,  43,  30,  36,  35,  33,  40,  60,  68 },	/* Stadium */
 };
 
 /* Scout Mode (capture 3): Smart Volume on at 0.9, mode 0, and this EQ. */
@@ -351,6 +355,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 	unsigned int i;
 
 	memset(fx, 0, sizeof(*fx));
+	fx->eq_preset = EQ_PRESET_FLAT;	/* the EQ values above are flat (0) */
 	fx->direct = true;
 	fx->spk = fx_spk_cfg == 1 ? 0 : 1;
 	for (i = 0; i < FX_COUNT; i++) {
@@ -492,6 +497,13 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			/* nothing playing: switch at the next stream (see
 			 * creative_ae9_dsp_switch_work) */
 			chip->dsp_switch_pending = true;
+		} else if (!fx->direct && chip->pcm_start_rate != 48000) {
+			/* a direct stream above 48 kHz can't go through the DSP
+			 * (see pcm_open): it plays on direct, and the next
+			 * stream opens at 48 kHz and switches */
+			chip->dsp_switch_pending = true;
+			dev_info(chip->dev, "Direct Mode off: the stream plays at %u Hz, so it stays direct; DSP mode starts with the next stream (48 kHz)\n",
+				 chip->pcm_start_rate);
 		} else if (!fx->direct) {
 			/* Windows' Direct Mode off, live: DSP routing, profile */
 			chip->dsp_switch_pending = false;
