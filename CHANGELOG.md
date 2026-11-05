@@ -3,8 +3,23 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
-## Unreleased
+## 0.8.0 (2026-11-05)
 
+The optical jacks wake up. 🔦
+
+- Optical S/PDIF, both ways. Turns out the optical port was already lit
+  and locked the whole time, just sending silence: it lives on the card's
+  second codec, the boot sequence switches it on, and nothing ever gave
+  it any audio. Now:
+  - Optical out plays what the main output plays (stereo, 24-bit, up to
+    192 kHz; silent at 32-bit, 384 kHz and in 5.1). "Optical Out Playback
+    Switch" turns it off. No SBX on it, and the knob doesn't change its
+    level: your receiver does.
+  - Optical in is a new recording device, `hw:AE9,1`, 44.1 to 192 kHz,
+    next to the XLR mic. `config/ae9-optical-in.conf` adds it to
+    PipeWire as "AE-9 Optical In". Record at the sender's rate.
+  Tested with a USB codec looped both ways, thanks to a tip from
+  DarkNikGr's notes on where the optical port sits.
 - License made plain: a COPYING file with the GPL-2.0 text, a license tag
   on every file, and a License section in the README. Nothing changed in
   the driver itself.

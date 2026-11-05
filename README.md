@@ -7,9 +7,11 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-05, v0.7.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-05, v0.8.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR mic input works (arecord, Audacity).
+> Optical S/PDIF works both ways: out mirrors the main output (stereo, up
+> to 24-bit/192 kHz), in is its own recording device.
 > The ACM head unit shows the volume; its knob sets the volume, a press
 > mutes, a medium hold switches between the RCA outputs and the head unit's
 > headphone jack, and a long hold toggles the knob light. The SBX button
@@ -185,6 +187,25 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
   ES9038's fast or slow roll-off, as the Creative app sets it; Default keeps
   Windows' startup filter). Kept across sleep/resume.
+- Optical (S/PDIF, new): both ways, stereo, on the card's optical jacks.
+  - Out plays what the main output plays, whenever it's stereo at 24-bit
+    (the default "PCM Bit Depth") up to 192 kHz. It's silent at 32-bit,
+    at 384 kHz and in 5.1 (S/PDIF carries stereo up to 24-bit/192 kHz).
+    It takes the stream as the app sends it, before the DSP: no SBX on
+    it, and app volume shows on it but the knob and system volume don't
+    (those set the card's analog output). Your receiver sets the level.
+    "Optical Out Playback Switch" turns it off
+    (`amixer -c AE9 cset name='Optical Out Playback Switch' off`).
+  - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1 to
+    192 kHz, so it records alongside the XLR mic
+    (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). For PipeWire,
+    copy `config/ae9-optical-in.conf` to
+    `~/.config/pipewire/pipewire.conf.d/` and run
+    `systemctl --user restart pipewire`: an "AE-9 Optical In" source
+    appears (never the default input). S/PDIF input can't resample, so
+    record at the sender's rate (PipeWire runs at 48 kHz unless told
+    otherwise). With nothing sending, recording fails at once and the
+    kernel log says "no signal on the optical input".
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
   card's RCA jacks, center and LFE out of the Center/Sub jack, rear L/R
@@ -285,6 +306,9 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 
 ### Known issues
 
+- Optical in: if the S/PDIF signal stops in the middle of a recording,
+  the recording stalls (the card sends nothing without a signal) until
+  the app gives up; start it again once the source is back.
 - Unloading and reloading the driver several times in a row can stall the
   DSP ("tail replay done: ... N failed", DBGCNTL 0x00003400 instead of
   0x004d0000): playback works but recording is dead (arecord EIO), and a
@@ -338,7 +362,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands |
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
-| `creative_ae9_pcm.c` | ALSA PCM playback and capture (2 ch S32_LE 48 kHz) |
+| `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (follows playback) and optical in (device 1) |
 | `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
@@ -346,6 +370,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `config/` | Boot binding (udev rule, modprobe hook, dracut omit) and optional module options |
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
+| `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
 
 ## Module parameters
 
@@ -409,6 +434,10 @@ code path for comparison:
   position (see "Low latency"); `dac_start_skip` (1) sends the DAC's start
   commands only when the rate or output changed (each send makes it
   re-lock, a brief hiccup); 0 sends them at every start, as Windows.
+
+- Optical: `spdif_out` (1, writable at runtime; also the "Optical Out
+  Playback Switch") optical out follows the main output; 0 keeps it
+  silent.
 
 Older parameters:
 
