@@ -3,6 +3,12 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## Unreleased
+
+- License made plain: a COPYING file with the GPL-2.0 text, a license tag
+  on every file, and a License section in the README. Nothing changed in
+  the driver itself.
+
 ## 0.7.0 (2026-11-05)
 
 Spent a day chasing crackles at tiny quantums and came out the other side

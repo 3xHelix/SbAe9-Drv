@@ -429,6 +429,15 @@ decode tools live in the development repository; the `creative_ae9_*_verbs.h`
 tables here hold everything the driver uses from them. Creative's Windows
 driver files are not included.
 
+## License
+
+GPL-2.0-only, the same license as the Linux kernel: see [COPYING](COPYING).
+Use it, change it and share it freely; if you share it, share the source
+too, under the same terms. `ca0132_regs.h` comes from the kernel's CA0132
+driver and keeps its GPL-2.0-or-later license. The DSP firmware is
+Creative's and is not part of this repository: `extract_firmware.py` pulls
+it from your own copy of the Windows driver.
+
 ## Disclaimer
 
 Experimental and reverse-engineered. Use at your own risk. Not affiliated

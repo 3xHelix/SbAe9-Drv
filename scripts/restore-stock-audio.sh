@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # restore-stock-audio.sh — remove the out-of-tree AE-9 driver and its boot
 # setup, so the stock kernel drivers own the card again.
 #
