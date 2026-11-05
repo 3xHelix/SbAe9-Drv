@@ -138,6 +138,8 @@ struct creative_chip {
 	struct snd_card		*card;
 
 	void __iomem		*hda_regs;	/* BAR0 */
+	bool			card_gone;	/* dropped off the bus: registers and
+						 * config space read all-ones */
 	void __iomem		*ext_regs;	/* BAR2 */
 
 	spinlock_t		lock;
@@ -307,6 +309,30 @@ struct creative_chip {
 	bool			overlay_sent;	/* overlay transfer ran this bring-up */
 	unsigned long		hu_next_full;
 };
+
+/*
+ * Has the card dropped off the bus? An ASMedia-bridge AE-9 (bugzilla
+ * 219552 #81) vanishes during bring-up: every register and even config
+ * space then read all-ones, and waiting on them spun the CPU until the
+ * machine froze. Checked where a timeout or an all-ones read suggests it;
+ * once set, every command path returns -ENODEV straight away.
+ */
+static inline bool creative_ae9_gone(struct creative_chip *chip, const char *where)
+{
+	u16 vid = 0;
+
+	if (chip->card_gone)
+		return true;
+	if (readl(chip->hda_regs + 0x08) != 0xffffffff)	/* GCTL */
+		return false;
+	pci_read_config_word(chip->pci, PCI_VENDOR_ID, &vid);
+	if (vid != 0xffff)
+		return false;
+	chip->card_gone = true;
+	dev_err(chip->dev, "card dropped off the bus (%s): registers and config space read all-ones; stopping\n",
+		where);
+	return true;
+}
 
 /* ------------------------------------------------------------------ */
 /* Function declarations						  */

@@ -188,10 +188,12 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	dev_info(chip->dev, "INTCTL=0x%08x (expected 0xc0000000)\n",
 		 creative_hda_readl(chip, AZX_REG_INTCTL));
 
-	dev_dbg(chip->dev, "CORB @ DMA 0x%llx (buf %p), RIRB @ DMA 0x%llx (buf %p)\n",
-		(unsigned long long)chip->corb_dma, chip->corb_buf,
-		(unsigned long long)chip->rirb_dma, chip->rirb_buf);
+	dev_info(chip->dev, "CORB at DMA 0x%llx, RIRB at DMA 0x%llx\n",
+		 (unsigned long long)chip->corb_dma,
+		 (unsigned long long)chip->rirb_dma);
 
+	if (creative_ae9_gone(chip, "CORB/RIRB start"))
+		return -ENODEV;
 	return 0;
 }
 
@@ -232,7 +234,7 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 	u32 *corb;
 
 	/* rings parked (suspend) or not set up: nothing to send through */
-	if (!chip->corb_buf)
+	if (!chip->corb_buf || chip->card_gone)
 		return -ENODEV;
 
 	wp = readw(chip->hda_regs + AZX_REG_CORBWP);
@@ -291,7 +293,7 @@ void creative_ae9_corb_send_verb_wait(struct creative_chip *chip, u32 verb)
 	if (!chip->corb_buf)
 		return;
 	while (timeout--) {
-		if (creative_ae9_corb_send_verb(chip, verb) == 0)
+		if (creative_ae9_corb_send_verb(chip, verb) == 0 || chip->card_gone)
 			return;
 		/* CORB full: spin 1µs and retry */
 		udelay(1);
@@ -316,6 +318,8 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	 * Without this, concurrent callers (ACM heartbeat, PCM prepare,
 	 * select_lineout) interleave verbs and lose responses.
 	 */
+	if (chip->card_gone)
+		return -ENODEV;
 	mutex_lock(&chip->corb_mutex);
 	if (!chip->corb_buf || !chip->rirb_buf) {	/* rings parked (suspend) */
 		mutex_unlock(&chip->corb_mutex);
@@ -382,6 +386,10 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		} while (--timeout);
 	}
 
+	if (creative_ae9_gone(chip, "CORB verb")) {
+		mutex_unlock(&chip->corb_mutex);
+		return -ENODEV;
+	}
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
 
