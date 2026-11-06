@@ -40,34 +40,8 @@ MODULE_DESCRIPTION(CREATIVE_AE9_DRV_DESC);
 MODULE_LICENSE("GPL");
 MODULE_VERSION(CREATIVE_AE9_DRV_VERSION);
 
-/*
- * init_mask: bitmask gating each BAR2-touching init stage, for bisecting
- * which write turns off the card LEDs.
- *   bit 0 (0x01): VFIO BAR2 init (Phase 1-5)
- *   bit 1 (0x02): HW_CTRL toggle (0x1c)
- *   bit 2 (0x04): stream enable (0x304)
- *   bit 3 (0x08): DSP I2C controller init (0xC00 area)
- *   bit 4 (0x10): ACM I2C init (29 transactions)
- * HDA reset, codec detect, D0 power, and GPIO verbs always run.
- * Default 0x00 = no BAR2 writes (LED-safe baseline).
- */
-static unsigned int init_mask = 0x1f;
-module_param(init_mask, uint, 0444);
-MODULE_PARM_DESC(init_mask, "Bitmask of BAR2 init stages (see source)");
-
-/*
- * vfio_mask: gates each phase of the VFIO BAR2 init (when init_mask bit 0 set):
- *   bit 0 (0x01): Phase 1 stream status clear (0x4xc/0x4x c)
- *   bit 1 (0x02): Phase 2 stream enable (0x400/0x408/0x40c/0x410)
- *   bit 2 (0x04): Phase 3 scratch 0x100 (0x600/0x60f/0x70f)
- *   bit 3 (0x08): Phase 4 DSP boot (0x830/0x86c/0x800=0x6b/0x89c)
- *   bit 4 (0x10): Phase 5 preserve (0x800/0x804/0x20c)
- * Default 0x1b = all phases EXCEPT P3 (0x100 scratch writes turn off
- * the card LEDs on the AE-9; 0x60f/0x70f are the culprits).
- */
-static unsigned int vfio_mask = 0x1b;
-module_param(vfio_mask, uint, 0444);
-MODULE_PARM_DESC(vfio_mask, "Bitmask of VFIO BAR2 init phases (see source)");
+/* seconds after a bring-up during which phantom power "on" is refused */
+#define AE9_PHANTOM_HOLD_S	30
 
 /*
  * enable_pcm: register the PCM playback device. No HDA interrupts are used
@@ -79,15 +53,6 @@ module_param(enable_pcm, uint, 0444);
 MODULE_PARM_DESC(enable_pcm, "Register PCM playback device (1=on, default)");
 
 /*
- * full_init: replay the captured Windows codec init verb sequence (via ICW)
- * after our base init. Bit 0 = codec 1, bit 1 = codec 2. Default 0 (off) so
- * the known-good LED/display boot is unaffected until validated.
- */
-static unsigned int full_init;
-module_param(full_init, uint, 0444);
-MODULE_PARM_DESC(full_init, "Replay captured codec init verbs (1=cad1, 2=cad2, 3=both)");
-
-/*
  * load_fw: download the DSP firmware (ctefx-desktop.bin) during probe and
  * stand up the DSP (firmware -> codec verb replay -> DSP audio streams ->
  * output routing), in the order the DSP requires.
@@ -95,25 +60,6 @@ MODULE_PARM_DESC(full_init, "Replay captured codec init verbs (1=cad1, 2=cad2, 3
 static unsigned int load_fw = 1;
 module_param(load_fw, uint, 0444);
 MODULE_PARM_DESC(load_fw, "Download DSP firmware + stand up DSP at probe (1=on, default)");
-
-/*
- * Head-unit MCU boots a few seconds after card power-up. The I2C-bridge
- * STS goes "ready" almost immediately (that's the bridge, not the MCU),
- * so we cannot poll for true MCU readiness. Instead, delay the first ACM
- * display init until acm_first_delay_ms after probe, then run acm_passes
- * total passes spaced acm_pass_gap_ms apart. Tunable without recompiling.
- */
-static unsigned int acm_first_delay_ms = 12000;
-module_param(acm_first_delay_ms, uint, 0444);
-MODULE_PARM_DESC(acm_first_delay_ms, "Delay before first ACM head-unit init (ms)");
-
-static unsigned int acm_pass_gap_ms = 4000;
-module_param(acm_pass_gap_ms, uint, 0444);
-MODULE_PARM_DESC(acm_pass_gap_ms, "Gap between ACM head-unit init passes (ms)");
-
-static unsigned int acm_passes = 2;
-module_param(acm_passes, uint, 0444);
-MODULE_PARM_DESC(acm_passes, "Number of ACM head-unit init passes");
 
 /*
  * After the init passes, poll the head unit every acm_heartbeat_ms to keep
@@ -135,49 +81,15 @@ module_param(pcicfg40_fix, uint, 0444);
 MODULE_PARM_DESC(pcicfg40_fix, "PCI config reg 0x40 bit 15: 1=clear at probe, 2=set at probe and clear after codec detection, 0=leave");
 
 /*
- * The Windows boot capture configures codec 2 (head unit, CORB #120-364)
- * before codec 1's main init and DSP setup (#365 onward). Another AE-9
- * driver effort (bugzilla 219552 #53) also needed codec 2 first.
- */
-static unsigned int codec2_first = 1;
-module_param(codec2_first, uint, 0444);
-MODULE_PARM_DESC(codec2_first, "Replay codec 2 init verbs before codec 1, as Windows does (1=on, default)");
-
-/*
- * fw_split: ae9_initseq_codec1 is Windows' codec-1 boot stream, including
+ * Split replay: ae9_initseq_codec1 is Windows' codec-1 boot stream, including
  * its firmware-download procedure, the DSP start (DBGCNTL run) and the
  * MASTERCONTROL boot handshake. Replaying it whole before our own download
- * starts the DSP with no firmware. With fw_split=1 only the pre-download
+ * starts the DSP with no firmware, so only the pre-download
  * part is replayed at probe/self-reset; after our firmware is running we
  * run the boot handshake properly (polling the DSP's replies) and then
  * replay Windows' post-handshake setup (the table tail). See
  * WINDOWS-CAPTURE-ANALYSIS.md, sections 1 and 4.
  */
-static unsigned int fw_split = 1;
-module_param(fw_split, uint, 0444);
-MODULE_PARM_DESC(fw_split, "Split the codec-1 replay around our firmware download + run the DSP boot handshake (1=on, default)");
-
-/*
- * bar2_first: the cold-boot Windows capture (vm_capture_coldboot_20261101_
- * 160959) does the whole BAR2 init *before* the HDA controller reset, and
- * its codecs then report subsystem 0x11020071/0x11020072 (BAR2+0x4 reads
- * 0x7172000a just before the reset). We reset first and init BAR2 after,
- * and our codecs report the default 0x11020010.
- */
-static unsigned int bar2_first = 1;
-module_param(bar2_first, uint, 0444);
-MODULE_PARM_DESC(bar2_first, "Run Windows' exact BAR2 init before the HDA controller reset (1=on, default)");
-
-/*
- * cold_prefw: replay the cold-boot capture's pre-download verbs
- * (ae9_cold_prefw, both codecs interleaved as Windows sent them) instead
- * of the codec-2 table + warm codec-1 prefix, and skip our own AFG
- * power-up and GPIO verbs, which Windows doesn't send before the
- * download. Use with fw_split (post-download handshake + tail).
- */
-static unsigned int cold_prefw = 1;
-module_param(cold_prefw, uint, 0444);
-MODULE_PARM_DESC(cold_prefw, "Replay the cold-boot Windows pre-download verbs instead of the warm tables (1=on, use with fw_split)");
 
 /*
  * Windows reads the codec subsystem IDs ~0.5 ms after the controller reset
@@ -207,9 +119,6 @@ MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM s
  * other pre-download verb through the CORB. With win_reset2=1 we do the
  * same before the pre-download replay.
  */
-/* seconds after a bring-up during which phantom power "on" is refused */
-#define AE9_PHANTOM_HOLD_S	30
-
 static unsigned int win_reset2 = 1;
 module_param(win_reset2, uint, 0444);
 MODULE_PARM_DESC(win_reset2, "Second controller reset + CORB start before the pre-download replay, as Windows does (1=on, default)");
@@ -620,8 +529,6 @@ static bool creative_ae9_fw_split_ok(struct creative_chip *chip)
 	const struct ae9_initverb *tl = &ae9_initseq_codec1[AE9_INITSEQ1_TAIL];
 	static bool warned;
 
-	if (!fw_split)
-		return false;
 	if (ARRAY_SIZE(ae9_initseq_codec1) > AE9_INITSEQ1_TAIL &&
 	    dl->nid == 0x15 && dl->verb == 0x200 && dl->payload == 0x47 &&
 	    tl->nid == 0x15 && tl->verb == 0x00e && tl->payload == 0x34)
@@ -758,6 +665,12 @@ static const struct {
 	{  88200, AE9_ROUTE_SRC,    0x0a, 0, 0, 0, 0x02,
 	   { 0x02, 0x42, 0x08101204, 0x7b, 0x43 } },
 	{  96000, AE9_ROUTE_DIRECT, 0x0b, 0x0001f101, 0x00014004,  4, 0x02 },
+	/* 176.4 kHz through the converter, from Windows' converter table
+	 * (CtxHda.sys 6.0.105.0065: 0x18a020 k = 2, 0x0c101204 / 0x3b);
+	 * rate code 0x0d = ca0132's SR_176_400. Windows never played it in
+	 * our captures. */
+	{ 176400, AE9_ROUTE_SRC,    0x0d, 0, 0, 0, 0x02,
+	   { 0x02, 0x82, 0x0c101204, 0x3b, 0x83 } },
 	{ 192000, AE9_ROUTE_DIRECT, 0x0e, 0x0001f102, 0x00022003,  8, 0x02 },
 	{ 384000, AE9_ROUTE_DIRECT, 0x0e, 0x0001f103, 0x00031002, 16, 0x12 },
 };
@@ -1498,11 +1411,11 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		creative_ae9_dsp_mode_start(chip, format);
 		return;
 	}
-	if (start && !atomic && ae9_ca0113_windows &&
+	if (start && !atomic &&
 	    dac_start_skip && chip->dac_start_key == ((r + 1) | hp << 8)) {
 		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
 			ae9_pcm_rates[r].rate);
-	} else if (start && !atomic && ae9_ca0113_windows) {
+	} else if (start && !atomic) {
 		/* the captured 12, plus two for the 44.1 kHz family */
 		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm) + 2][3];
 		bool fam441 = ae9_pcm_rates[r].route == AE9_ROUTE_SRC && dac_441;
@@ -1817,12 +1730,12 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 		 ARRAY_SIZE(ae9_cold_prefw), errs);
 }
 
-/* Replay both codecs' captured init verbs via ICW, in the codec2_first order. */
+/* Replay both codecs' captured init verbs (codec 2 first, as Windows). */
 static void creative_ae9_replay_both(struct creative_chip *chip)
 {
 	size_t n1 = creative_ae9_codec1_prefw_count(chip);
 
-	if (cold_prefw && creative_ae9_fw_split_ok(chip)) {
+	if (creative_ae9_fw_split_ok(chip)) {
 		creative_ae9_replay_cold(chip);
 		return;
 	}
@@ -1830,16 +1743,10 @@ static void creative_ae9_replay_both(struct creative_chip *chip)
 	if (n1 != ARRAY_SIZE(ae9_initseq_codec1))
 		dev_info(chip->dev, "fw_split: replaying codec 1 entries 0-%zu only (pre-download)\n",
 			 n1 - 1);
-	if (codec2_first) {
-		dev_info(chip->dev, "replaying codec 2 before codec 1 (codec2_first=1)\n");
-		creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
-					 ARRAY_SIZE(ae9_initseq_codec2));
-		creative_ae9_replay_init(chip, 1, ae9_initseq_codec1, n1);
-	} else {
-		creative_ae9_replay_init(chip, 1, ae9_initseq_codec1, n1);
-		creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
-					 ARRAY_SIZE(ae9_initseq_codec2));
-	}
+	/* fallback when the table layout changed: the warm tables */
+	creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
+				 ARRAY_SIZE(ae9_initseq_codec2));
+	creative_ae9_replay_init(chip, 1, ae9_initseq_codec1, n1);
 }
 
 /*
@@ -1909,12 +1816,9 @@ static void creative_ae9_dsp_health(struct creative_chip *chip, u32 dbgcntl)
  * are ones Windows' own startup never sends and the DSP rejects (error
  * replies 0x0e4e9620 etc. at every boot): output effects 0x96 requests
  * 0x16 (bass redirect crossover), 0x1e (sub gain), 0x27/0x28 (surround L/R
- * level), 0x37/0x38 (surround L/R delay). tail_drop_rejected=1 (default)
- * leaves them out, so the effects module sees what Windows' startup sends.
+ * level), 0x37/0x38 (surround L/R delay). They're left out, so the
+ * effects module sees what Windows' startup sends.
  */
-static bool tail_drop_rejected = true;
-module_param(tail_drop_rejected, bool, 0444);
-MODULE_PARM_DESC(tail_drop_rejected, "Leave out the 6 startup SCP messages the DSP rejects (1=yes, default)");
 
 static bool ae9_tail_rejected(u32 hdr)
 {
@@ -1978,8 +1882,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 					/* A DSP that stops taking commands makes
 					 * every send wait out its timeout; stop
 					 * sending SCP after 8 failures in a row. */
-					if (tail_drop_rejected &&
-					    ae9_tail_rejected(words[0])) {
+					if (ae9_tail_rejected(words[0])) {
 						msg_dropped++;
 					} else if (consec_err >= 8) {
 						msg_skipped++;
@@ -2132,160 +2035,9 @@ static void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 		 creative_ext_readl(chip, 0x4));
 }
 
-static int creative_ae9_bar2_init(struct creative_chip *chip)
-{
-	dev_dbg(chip->dev, "BAR2 extended register init (AE-9 inline)\n");
-
-	/*
-	 * AE-9 inlined init — matches ca0132_mmio_init_ae9() exactly.
-	 * Does NOT pre-write 0x01c before the table (unlike AE-7).
-	 * Uses AE-9 specific values (confirmed from ae9_build + VM trace).
-	 * No readl() on 0xC00-0xC7F (Windows never reads these).
-	 */
-
-	/* Indices 0-8: stream descriptors */
-	creative_ext_writel(chip, 0x400, 0x00000001); creative_ext_readl(chip, 0x400);
-	creative_ext_writel(chip, 0x42c, 0x00000000); creative_ext_readl(chip, 0x42c);
-	creative_ext_writel(chip, 0x46c, 0x00000000); creative_ext_readl(chip, 0x46c);
-	creative_ext_writel(chip, 0x4ac, 0x00000000); creative_ext_readl(chip, 0x4ac);
-	creative_ext_writel(chip, 0x4ec, 0x00000000); creative_ext_readl(chip, 0x4ec);
-	creative_ext_writel(chip, 0x43c, 0x00000000); creative_ext_readl(chip, 0x43c);
-	creative_ext_writel(chip, 0x47c, 0x00000000); creative_ext_readl(chip, 0x47c);
-	creative_ext_writel(chip, 0x4bc, 0x00000000); creative_ext_readl(chip, 0x4bc);
-	creative_ext_writel(chip, 0x4fc, 0x00000000); creative_ext_readl(chip, 0x4fc);
-	/* Indices 9-15: stream/clock control */
-	creative_ext_writel(chip, 0x408, 0x00000001); creative_ext_readl(chip, 0x408);
-	creative_ext_writel(chip, 0x100, 0x00000600); creative_ext_readl(chip, 0x100);
-	creative_ext_writel(chip, 0x410, 0x00000014); creative_ext_readl(chip, 0x410);
-	creative_ext_writel(chip, 0x40c, 0x00000001); creative_ext_readl(chip, 0x40c);
-	creative_ext_writel(chip, 0x100, 0x0000060f); creative_ext_readl(chip, 0x100);
-	creative_ext_writel(chip, 0x100, 0x0000070f); creative_ext_readl(chip, 0x100);
-	creative_ext_writel(chip, 0x830, 0x00000aff); creative_ext_readl(chip, 0x830);
-	/* Indices 16-20: DMA reset/enable + I2S clock + group */
-	creative_ext_writel(chip, 0x86c, 0x00000000); creative_ext_readl(chip, 0x86c);
-	creative_ext_writel(chip, 0x800, 0x0000006b); creative_ext_readl(chip, 0x800);
-	creative_ext_writel(chip, 0x86c, 0x00000001); creative_ext_readl(chip, 0x86c);
-	creative_ext_writel(chip, 0x800, 0x0000006b); creative_ext_readl(chip, 0x800);
-	creative_ext_writel(chip, 0x804, 0x00000057); creative_ext_readl(chip, 0x804);
-
-	/*
-	 * AE-9: I2C bus init — MUST happen here, immediately after 0x804=0x57.
-	 * ae9_build ca0132_mmio_init_ae9(): "Windows VFIO Phase 3 shows this
-	 * sequence immediately after 0x804=0x57, BEFORE the 0x20c/0x1c writes."
-	 * No readl() on 0xC00-0xC7F — Windows never reads these.
-	 */
-	creative_ext_writel(chip, 0xC0C, 0x80);
-	creative_ext_writel(chip, 0xC00, 0x30);
-	creative_ext_writel(chip, 0xC04, 0x00);
-	creative_ext_writel(chip, 0xC0C, 0x00);
-	creative_ext_writel(chip, 0xC0C, 0x03);
-	creative_ext_writel(chip, 0xC0C, 0x03);
-	creative_ext_writel(chip, 0xC0C, 0x03);
-	creative_ext_writel(chip, 0xC08, 0x01);
-	creative_ext_writel(chip, 0xC08, 0xf1);
-	creative_ext_writel(chip, 0xC08, 0x01);
-	creative_ext_writel(chip, 0xC08, 0xc7);
-	creative_ext_writel(chip, 0xC08, 0xc1);
-	creative_ext_writel(chip, 0xC04, 0x80);
-
-	/* Index 21: 0x20c reset — AE-9 uses 0x00800000 (not AE-7's 0x00800001) */
-	creative_ext_writel(chip, 0x20c, 0x00800000); creative_ext_readl(chip, 0x20c);
-	/* Index 22: 0x01c I2S clock — AE-9 values 0x480/0x880480 (not AE-7's 0x680) */
-	creative_ext_writel(chip, 0x01c, 0x00000480); creative_ext_readl(chip, 0x01c);
-	creative_ext_writel(chip, 0x01c, 0x00880480); creative_ext_readl(chip, 0x01c);
-
-	dev_dbg(chip->dev, "BAR2 init complete (AE-9 inline)\n");
-	return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /* BAR2 init: VFIO-capture-based (Phase 1-5)			  */
 /* This is the sequence that previously produced ACM display output. */
-/* ------------------------------------------------------------------ */
-void creative_ae9_hw_init(struct creative_chip *chip)
-{
-	u32 val;
-	int s;
-	unsigned int timeout;
-
-	/* Phase 1: Stream status clear (4 streams, stride 0x40) */
-	if (vfio_mask & 0x01) {
-		dev_info(chip->dev, "vfio: P1 stream status clear\n");
-		for (s = 0; s < CREATIVE_BAR2_NUM_STREAMS; s++) {
-			unsigned int base = 0x400 + s * CREATIVE_BAR2_STREAM_STRIDE;
-
-			val = creative_ext_readl(chip, base + 0x2c);
-			if (val & BIT(0)) {
-				creative_ext_writel(chip, base + 0x2c, 0x0);
-				creative_ext_readl(chip, base + 0x2c);
-			}
-			creative_ext_writel(chip, base + 0x3c, 0x0);
-			creative_ext_readl(chip, base + 0x3c);
-		}
-	}
-
-	/* Phase 2: Stream 0 enable */
-	if (vfio_mask & 0x02) {
-		dev_info(chip->dev, "vfio: P2 stream enable\n");
-		creative_ext_writel(chip, 0x400, 0x1);
-		creative_ext_readl(chip, 0x400);
-		creative_ext_writel(chip, 0x408, 0x1);
-		creative_ext_readl(chip, 0x408);
-		creative_ext_writel(chip, 0x40c, 0x1);
-		creative_ext_readl(chip, 0x40c);
-		creative_ext_writel(chip, 0x410, 0x14);
-		creative_ext_readl(chip, 0x410);
-	}
-
-	/* Phase 3: Scratch register 0x100: 0x600 → 0x60f → 0x70f */
-	if (vfio_mask & 0x04) {
-		dev_info(chip->dev, "vfio: P3 scratch 0x100\n");
-		creative_ext_writel(chip, 0x100, 0x600);
-		creative_ext_readl(chip, 0x100);
-		creative_ext_writel(chip, 0x100, 0x60f);
-		creative_ext_readl(chip, 0x100);
-		creative_ext_writel(chip, 0x100, 0x70f);
-		creative_ext_readl(chip, 0x100);
-	}
-
-	/* Phase 4: DSP boot */
-	if (vfio_mask & 0x08) {
-		dev_info(chip->dev, "vfio: P4 DSP boot\n");
-		val = creative_ext_readl(chip, 0x830);
-		creative_ext_writel(chip, 0x830, val);
-		val = creative_ext_readl(chip, 0x86c);
-		if (val & BIT(0)) {
-			creative_ext_writel(chip, 0x86c, 0x0);
-			creative_ext_readl(chip, 0x86c);
-		}
-		creative_ext_writel(chip, 0x800, 0x6b);
-		creative_ext_readl(chip, 0x800);
-
-		timeout = CREATIVE_DSP_WAIT_MS * 100;
-		do {
-			val = creative_ext_readl(chip, 0x89c);
-			if (val & BIT(0))
-				break;
-			udelay(10);
-		} while (--timeout);
-
-		creative_ext_writel(chip, 0x86c, 0x1);
-		creative_ext_readl(chip, 0x86c);
-	}
-
-	/* Phase 5: Preserve 0x800, 0x804, 0x20c */
-	if (vfio_mask & 0x10) {
-		dev_info(chip->dev, "vfio: P5 preserve\n");
-		val = creative_ext_readl(chip, 0x800);
-		creative_ext_writel(chip, 0x800, val);
-		val = creative_ext_readl(chip, 0x804);
-		creative_ext_writel(chip, 0x804, val);
-		val = creative_ext_readl(chip, 0x20c);
-		creative_ext_writel(chip, 0x20c, val);
-	}
-
-	dev_dbg(chip->dev, "BAR2 VFIO init complete\n");
-}
 
 /* ------------------------------------------------------------------ */
 /* debugfs register-poke interface					  */
@@ -3567,7 +3319,6 @@ static void creative_ae9_hb_work(struct work_struct *work)
 		if (time_after_eq(jiffies, chip->hu_next_full)) {
 			chip->hu_next_full = jiffies + msecs_to_jiffies(acm_heartbeat_ms);
 			creative_ae9_hb_windows(chip);
-			creative_dsp_keepalive(chip);
 		} else {
 			creative_ae9_hb_fast(chip);
 		}
@@ -3677,8 +3428,8 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			 cfg40, after, pcicfg40_fix);
 	}
 
-	if (bar2_first)
-		creative_ae9_bar2_init_windows(chip);
+	/* Windows' BAR2 init, before the controller reset as in its cold boot */
+	creative_ae9_bar2_init_windows(chip);
 
 	/* Reset HDA controller */
 	ret = creative_ae9_hw_reset(chip);
@@ -3690,23 +3441,6 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
 	if (codec_probe_delay_ms)
 		msleep(codec_probe_delay_ms);
-
-	/*
-	 * BAR2 init: full AE-9 specific MMIO register sequence.
-	 * Matches ae9_build ca0132_mmio_init_ae9() exactly:
-	 * AE-9 inlined table + I2C bus init + 0x20c=0x800000 + 0x1c=0x480.
-	 * This supersedes both the old VFIO hw_init and the HW_CTRL toggle.
-	 */
-	if ((init_mask & 0x01) && !bar2_first) {
-		dev_info(chip->dev, "init: AE-9 BAR2 inline init\n");
-		creative_ae9_bar2_init(chip);
-	}
-
-	/* Legacy VFIO-capture-based phases (kept for reference, skipped by default) */
-	if (init_mask & 0x80) {
-		dev_info(chip->dev, "init: VFIO BAR2 legacy\n");
-		creative_ae9_hw_init(chip);
-	}
 
 	/* CORBSIZE init: bits 3-2 = 10 (256 entries), preserve cap bits 1-0 */
 	creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
@@ -3743,49 +3477,13 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		return 0;
 	}
 
-	/* Wake codecs from D3: send SET_POWER_STATE D0 to AFG (node 0x01)
-	 * of each detected codec. ca0132's exit verbs put the codec in D3
-	 * on unbind, killing the card LEDs / head unit. (verb 0x705, p=0)
-	 */
-	if (!cold_prefw) {
-		int cad;
-		for (cad = 0; cad < HDA_MAX_CODECS; cad++) {
-			u32 resp;
-			int pret;
-			if (!(chip->codec_mask & BIT(cad)))
-				continue;
-			pret = creative_ae9_icw_send_verb(chip,
-				creative_ae9_verb(cad, 0x01, 0x705, 0x00),
-				&resp);
-			dev_info(chip->dev,
-				 "Codec %d AFG D0: ret=%d resp=0x%08x\n",
-				 cad, pret, resp);
-		}
-		msleep(10);
-	}
-
-	/* GPIO init (ca0132 AE-5/AE-7 vendor verbs) to codec 1 node 0x01.
-	 * These configure GPIO that may drive the card LEDs.
-	 */
-	if (!cold_prefw) {
-		u32 resp;
-		int g0, g1, g2;
-		g0 = creative_ae9_icw_send_verb(chip,
-			creative_ae9_verb(1, 0x01, 0x793, 0x00), &resp);
-		g1 = creative_ae9_icw_send_verb(chip,
-			creative_ae9_verb(1, 0x01, 0x794, 0x53), &resp);
-		g2 = creative_ae9_icw_send_verb(chip,
-			creative_ae9_verb(1, 0x01, 0x790, 0x23), &resp);
-		dev_info(chip->dev, "GPIO init verbs: %d/%d/%d\n", g0, g1, g2);
-	}
-
 	/*
 	 * DSP standup, in the order the CA0132 requires:
 	 *   1. download firmware (DSP must be running before its config takes)
 	 *   2. replay the captured codec init verbs (now applied to live DSP)
 	 *   3. start the DSP internal audio-router streams
 	 *   4. route DSP output to line-out
-	 * If load_fw is not set, fall back to the bare verb replay (full_init).
+	 * Without load_fw only the old stream-enable and DSP I2C init below run.
 	 */
 	if (load_fw) {
 		int fret;
@@ -3871,7 +3569,6 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			 * audio_loop_start confirmed the MCU is alive, we only
 			 * need ~500ms for the 8051 to settle after HELLO.
 			 */
-			chip->acm_retries = acm_passes;
 			queue_delayed_work(chip->wq, &chip->acm_work,
 					      msecs_to_jiffies(500));
 		}
@@ -3883,26 +3580,19 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		 * audio playback. So we DO drive the head unit with firmware,
 		 * via the same deferred ACM work scheduled below.
 		 */
-	} else {
-		if (full_init & 0x01)
-			creative_ae9_replay_init(chip, 1, ae9_initseq_codec1,
-						 ARRAY_SIZE(ae9_initseq_codec1));
-		if (full_init & 0x02)
-			creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
-						 ARRAY_SIZE(ae9_initseq_codec2));
 	}
 
 	/* Stream enable */
 	/* post_windows: the replay already set these up as Windows does;
 	 * the DSP I2C init's CMD=0x30 re-init cuts off the head unit */
-	if ((init_mask & 0x04) && !chip->dsp_done) {
+	if (!chip->dsp_done) {
 		dev_info(chip->dev, "init: stream enable\n");
 		writeb(0x3f, chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
 		wmb();
 	}
 
 	/* DSP I2C controller init */
-	if ((init_mask & 0x08) && !chip->dsp_done) {
+	if (!chip->dsp_done) {
 		dev_info(chip->dev, "init: DSP I2C\n");
 		creative_i2c_dsp_init(chip);
 	}
@@ -4144,15 +3834,6 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	if (vlog_buf)
 		debugfs_create_file("verblog", 0400, chip->dbg_dir, NULL,
 				    &vlog_seq_fops);
-
-	if ((init_mask & 0x10) && !chip->dsp_done) {
-		chip->acm_retries = acm_passes;
-		dev_info(chip->dev,
-			 "scheduling first ACM init in %u ms (%u passes, %u ms gap)\n",
-			 acm_first_delay_ms, acm_passes, acm_pass_gap_ms);
-		queue_delayed_work(chip->wq, &chip->acm_work,
-				      msecs_to_jiffies(acm_first_delay_ms));
-	}
 
 	dev_info(chip->dev, "Init complete: card %s\n", chip->card->longname);
 	return 0;

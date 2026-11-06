@@ -3,6 +3,28 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.7 (2026-11-06)
+
+Every rate Windows plays, and a lighter driver. 🧹
+Pairs with [SbAe9-SBC v0.11.0](https://github.com/3xHelix/SbAe9-SBC), as 0.9.5.
+
+- **176.4 kHz playback** (stereo, Direct Mode), through the card's
+  sample-rate converter like 44.1/88.2 kHz, with the values from Windows'
+  own driver. The AE-9 now plays 44.1, 48, 88.2, 96, 176.4, 192 and
+  384 kHz. Add 176400 to PipeWire's `clock.allowed-rates` to use it;
+  `pcm_176k4=0` leaves it out.
+- **Cleanup:** 23 old module options are gone. Each only switched back to
+  an earlier, replaced start-up path (`bar2_first`, `cold_prefw`,
+  `codec2_first`, `prep_windows`, `full_init`, `init_mask`, `vfio_mask`,
+  `fw_split`, `dl_windows`, `dl_reset_chunks`, `dl_bdl64`, `hs_immediate`,
+  `tail_drop_rejected`, `scp_win_read`, `chipio_nocache`,
+  `ca0113_windows`, `pll_windows`, `hu_dsp_keepalive`,
+  `acm_first_delay_ms`, `acm_pass_gap_ms`, `acm_passes`,
+  `acm_tx_settle_us`, `acm_i2c_debug`). Nothing changes with the defaults;
+  a leftover one in modprobe.d only logs "unknown parameter".
+
+-- 3xHelix
+
 ## 0.9.6 (2026-11-06)
 
 A fix for 44.1/88.2 kHz, found with the dump script's new check. 🩹

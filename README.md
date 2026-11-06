@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.6):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.7):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -20,7 +20,7 @@ playback.
 > effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
-> 44.1, 48, 88.2, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
+> 44.1, 48, 88.2, 96, 176.4, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
 > the box in Direct Mode. SBX effects and the EQ work through the card's
 > DSP, with Direct Mode off. 5.1 works on the card's RCA, Rear and
 > C/Sub jacks, at 48, 96 or 192 kHz in Direct Mode and 48 or 96 kHz through
@@ -33,7 +33,7 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.6 pairs with SbAe9-SBC v0.11.0 (phantom power button, What U
+> Driver v0.9.7 pairs with SbAe9-SBC v0.11.0 (phantom power button, What U
 > Hear rate picker, rates per mode); older SbC versions still work, with
 > fewer controls.
 
@@ -182,11 +182,11 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - The PCM takes 2 or 6 channels, S32_LE. "PCM Bit Depth" (24-bit, the
   default as Windows, or 32-bit) sets how the card takes it; it applies to
   the next stream (24-bit sources lose nothing at 32-bit). Rates: 44.1, 48,
-  88.2, 96, 192 and 384 kHz in Direct Mode (44.1/88.2 kHz stereo only),
+  88.2, 96, 176.4, 192 and 384 kHz in Direct Mode (44.1/88.2/176.4 kHz stereo only),
   48 or 96 kHz with Direct Mode off, through the DSP (v0.9.4; PipeWire
   resamples other rates). Recording is 48 or 96 kHz.
 - Choosing a rate: PipeWire runs at 48 kHz unless told otherwise.
-  `pw-metadata -n settings 0 clock.allowed-rates '[ 44100 48000 88200 96000 192000 384000 ]'`
+  `pw-metadata -n settings 0 clock.allowed-rates '[ 44100 48000 88200 96000 176400 192000 384000 ]'`
   follows each file's rate, `clock.force-rate 192000` forces one (0 =
   back to automatic). SbAe9-SBC does this from its rate picker. For
   small quantums, see "Low latency" below. 44.1/88.2 kHz (v0.9.4) play
@@ -380,8 +380,9 @@ the apps that are playing; look it over before posting.
 - Rarely, playback restarting after a pause comes up silent even though
   the stream runs and the audio reaches the card (every start block
   succeeds). Closing and reopening the player, or reloading the driver,
-  brings it back. Cause inside the card not found yet; `hu_dsp_keepalive=2`
-  logs the DSP's run state to help catch it.
+  brings it back. Cause inside the card not found yet; if it happens, run
+  `scripts/ae9-full-dump.sh` while it's silent: its I2S and power register
+  section shows whether the card's output setup has moved.
 - No sound from one app while others play: check whether it has a stream at
   all with `pactl list sink-inputs | grep -E "Sink:|application.name"`. Seen
   with Chrome Canary after output switches or a reboot (no stream; VLC
@@ -426,20 +427,16 @@ the apps that are playing; look it over before posting.
 
 ## Module parameters
 
-Windows-aligned set (each replaces one of our earlier guesses with what the
-cold-boot Windows capture does). Since 2026-11-02 the values below are the
-built-in defaults; set one to the other value only to go back to the older
-code path for comparison:
+The bring-up follows Windows' cold boot with no options needed. Since 0.9.7
+the old "go back to our earlier code" switches are gone (see the changelog);
+what's left is tuning and diagnostics:
 
 - `enable_pcm=1`, `load_fw=1` — PCM device and DSP firmware.
 - `bus_reset` — secondary bus reset at probe (codec SSIDs only read
   0x11020071/72 after one; a VM start does the same).
-- `bar2_first`, `win_reset2`, `cold_prefw`, `codec2_first`, `prep_windows` —
-  pre-download init as Windows does it (815-verb cold table).
-- `fw_split`, `dl_windows`, `dl_reset_chunks` (default 1), `dl_bdl64`
-  (default 1), `hs_immediate`, `scp_event`, `scp_win_read`, `chipio_nocache`,
-  `sentinel_clear=0` —
-  firmware download, DSP start and the MASTERCONTROL boot handshake.
+- `win_reset2`, `scp_event` (both 1) — Windows' second controller reset and
+  announced DSP replies; kept switchable for cards behind other bridges.
+- `sentinel_clear` (0) — clear the DSP's 0x0bad0add sentinel area.
 - `overlay` — transfer the DSP overlay image during the handshake.
 - `surround` (default 1, writable at runtime) — 6-channel (5.1) playback and
   the 4.0/4.1/5.1 speaker configs; 0 = stereo only. `surround_ports`
@@ -455,6 +452,7 @@ code path for comparison:
   Windows' DAC commands for 44.1/88.2 kHz (without them those rates play
   garbled or silent). `src_reclock` (1) sets the I2S to its 48 kHz clocks before
   44.1/88.2 kHz (0.9.6; without it they went silent after a 384 kHz stream).
+  `pcm_176k4` (1) offers 176.4 kHz with them (0.9.7).
 - `wuh_96k` (1, writable at runtime) — What U Hear at 48 or 96 kHz
   (0.9.5); 0 = 48 kHz only.
 - `dsp_96k` (1, writable at runtime) — 96 kHz with Direct Mode off, through
@@ -469,7 +467,6 @@ code path for comparison:
   the whole bring-up anyway: 2-3 min of timeouts, for experiments only.
 - `fw_verify` (default 0) — read the firmware back after download and count
   mismatches.
-- `ca0113_windows` — head-unit DAC commands with Windows' protocol/values.
 - Head unit: the driver replays Windows' post-boot BAR2 activity (speaker
   mode) and runs Windows' head-unit poll, volume display and knob, with the
   ALSA controls "Head Unit Playback Volume" / "Head Unit Playback Switch"
@@ -481,12 +478,9 @@ code path for comparison:
   `pcm_stop_block` (1, writable at runtime) send Windows' playback stop
   block at stream release; 0 skips it (experiment for the rare silent
   restart after a pause);
-  `hu_dsp_keepalive` (0) heartbeat DSP keepalive (1 = old forced
-  run state, which left playback silent after the output idled; 2 = log only);
   `hu_fast_ms` (40) knob poll interval; `hu_cmd_settle_us` (4000, writable at
   runtime) CA0113 settle time for volume changes;
-  `tail_drop_rejected` (1) leave out the six startup SCP messages the DSP
-  rejects.
+  `acm_heartbeat_ms` (500) head-unit heartbeat (0 = off).
 - SBX: `fx_spk_cfg` (2) the "Speaker Config" setting at load (1 = 2.0,
   2 = 2.1 as Windows); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
   stream plays direct before the switch to the DSP.
@@ -504,16 +498,6 @@ code path for comparison:
 - Optical: `spdif_out` (1, writable at runtime; also the "Optical Out
   Playback Switch") optical out follows the main output; 0 keeps it
   silent.
-
-Older parameters:
-
-- `init_mask` (default `0x1f`) — gates BAR2 init stages.
-- `vfio_mask` (default `0x1b`) — VFIO BAR2 sub-phases; **P3 disabled** (it turns
-  off the card LEDs on this board).
-- `full_init` (default `0`) — replay captured codec init verbs (bitmask:
-  1=cad1, 2=cad2, 3=both).
-- `acm_first_delay_ms` / `acm_pass_gap_ms` / `acm_passes` / `acm_heartbeat_ms`
-  (12 s / 4 s / 2 / 500 ms) — head-unit init and keepalive timing.
 
 ## Where this comes from
 

@@ -281,7 +281,14 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
  * 44.1/88.2 kHz at 32 bit, before and after 96 kHz, 2026-11-06 */
 static unsigned int pcm_rates = 2;
 module_param(pcm_rates, uint, 0644);
-MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz stereo (default)");
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2/176.4 kHz stereo (default)");
+
+/* 176.4 kHz (stereo, through the converter like 44.1/88.2), with
+ * pcm_rates=2. Windows' converter table has it; tested 2026-11-06. */
+static bool pcm_176k4 = true;
+module_param(pcm_176k4, bool, 0644);
+MODULE_PARM_DESC(pcm_176k4, "Offer 176.4 kHz playback with pcm_rates=2 (1 = yes, default; 0 = no)");
+
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
  * -> card's RCA, C/Sub jack, Rear jack; checked by ear 2026-11-04) and
@@ -553,6 +560,8 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 				    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
 				    SNDRV_PCM_RATE_192000 | SNDRV_PCM_RATE_384000;
+		if (pcm_176k4)
+			runtime->hw.rates |= SNDRV_PCM_RATE_176400;
 		runtime->hw.rate_min = 44100;
 		runtime->hw.rate_max = 384000;
 	} else if (pcm_rates) {
