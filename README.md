@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.3):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.4):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -20,11 +20,11 @@ playback.
 > effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
-> 48, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
-> the box in Direct Mode; 44.1/88.2 kHz playback is not done yet. SBX effects and the EQ work through the card's
+> 44.1, 48, 88.2, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
+> the box in Direct Mode. SBX effects and the EQ work through the card's
 > DSP, with Direct Mode off. 5.1 works on the card's RCA, Rear and
-> C/Sub jacks, at 48 or 96 kHz in Direct Mode and 48 kHz through the
-> DSP.
+> C/Sub jacks, at 48, 96 or 192 kHz in Direct Mode and 48 or 96 kHz through
+> the DSP.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -33,6 +33,8 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
+> Driver v0.9.4 pairs with SbAe9-SBC v0.10.0 (its rate picker knows each
+> mode's rates); older SbC versions still work, with shorter rate lists.
 
 ## Hardware / Environment
 
@@ -172,17 +174,18 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   volume only.
 - The PCM takes 2 or 6 channels, S32_LE. "PCM Bit Depth" (24-bit, the
   default as Windows, or 32-bit) sets how the card takes it; it applies to
-  the next stream (24-bit sources lose nothing at 32-bit). Rates: 48, 96,
-  192 and 384 kHz in Direct Mode, 48 kHz with Direct Mode off (PipeWire
-  resamples; 96 kHz through the DSP isn't done yet). Recording is 48 kHz.
+  the next stream (24-bit sources lose nothing at 32-bit). Rates: 44.1, 48,
+  88.2, 96, 192 and 384 kHz in Direct Mode (44.1/88.2 kHz stereo only),
+  48 or 96 kHz with Direct Mode off, through the DSP (v0.9.4; PipeWire
+  resamples other rates). Recording is 48 or 96 kHz.
 - Choosing a rate: PipeWire runs at 48 kHz unless told otherwise.
-  `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`
-  follows 48 kHz-family files, `clock.force-rate 192000` forces one (0 =
+  `pw-metadata -n settings 0 clock.allowed-rates '[ 44100 48000 88200 96000 192000 384000 ]'`
+  follows each file's rate, `clock.force-rate 192000` forces one (0 =
   back to automatic). SbAe9-SBC does this from its rate picker. For
-  small quantums, see "Low latency" below. Don't add 44100/88200: that family isn't working yet
-  (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
-  PipeWire resamples those files when they're left out. `pcm_rates=0`
-  limits the card to 48 kHz.
+  small quantums, see "Low latency" below. 44.1/88.2 kHz (v0.9.4) play
+  through the card's sample-rate converter; leave 44100/88200 out and
+  PipeWire resamples those files to 48 kHz instead. `pcm_rates=1` drops
+  44.1/88.2 kHz from the card's list, `pcm_rates=0` limits it to 48 kHz.
 - Recording: the head unit's input, at 48 or 96 kHz (`arecord -D hw:AE9 -c 2
   -r 96000 -f S32_LE`, or the AE-9 input in PipeWire/Audacity). The head unit's
   XLR/TRS jack and its 3.5 mm mic jack share it (Windows lists them as
@@ -237,9 +240,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
   card's RCA jacks, center and LFE out of its 3.5 mm C/Sub jack, rear L/R
-  out of its 3.5 mm Rear jack. Works in Direct Mode (straight to the DACs, 48 or
-  96 kHz; 192/384 kHz stay stereo) and with Direct Mode off (through the
-  DSP, 48 kHz). With Direct Mode off, "Speaker
+  out of its 3.5 mm Rear jack. Works in Direct Mode (straight to the DACs, 48,
+  96 or 192 kHz; 384 kHz stays stereo) and with Direct Mode off (through the
+  DSP, 48 or 96 kHz). With Direct Mode off, "Speaker
   Config" tells the DSP your layout: 2.0/2.1 fold the six channels down
   to the front (and sub), 4.0/4.1 drop the center, 5.1 uses all six. It
   follows the stream by itself: a 5.1 stream turns 2.0/2.1 into 5.1, a
@@ -435,6 +438,14 @@ code path for comparison:
   `surround_96k` (1, writable at runtime) — 5.1 at 96 kHz in Direct Mode
   (fixed 2026-11-05: all six speakers right, clean over minutes); 0 limits
   5.1 to 48 kHz. Pick the 5.1 profile and `clock.force-rate 96000`.
+  `surround_192k` (1, writable at runtime) — 5.1 at 192 kHz in Direct Mode
+  (v0.9.4, Windows' router layout); 0 limits 5.1 to 96 kHz.
+- `pcm_rates` (2, writable at runtime) — playback rates: 2 = 44.1-384
+  kHz, 1 = without 44.1/88.2 kHz, 0 = 48 kHz only. `dac_441` (1) sends
+  Windows' DAC commands for 44.1/88.2 kHz (without them those rates play
+  garbled or silent).
+- `dsp_96k` (1, writable at runtime) — 96 kHz with Direct Mode off, through
+  the DSP (v0.9.4); 0 limits DSP mode to 48 kHz.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
   actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
   the routine per-stream and per-step lines (command blocks, router, volume

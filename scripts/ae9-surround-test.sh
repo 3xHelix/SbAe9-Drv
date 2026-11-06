@@ -9,6 +9,8 @@
 #   scripts/ae9-surround-test.sh [--direct] [loops]   (default 4 loops)
 #
 # --direct tests 5.1 in Direct Mode (no DSP; Speaker Config doesn't apply).
+# RATE=96000 or RATE=192000 (with --direct) tests 5.1 at that rate
+# (default 48000; DSP mode is 48 kHz only).
 #
 # Pauses PipeWire for the test (desktop audio stops) and starts it again
 # at the end. Sets surround=1, Direct Mode off, SBX off, Speaker Config 5.1.
@@ -19,6 +21,11 @@ set -u
 DIRECT=off
 if [ "${1:-}" = "--direct" ]; then DIRECT=on; shift; fi
 LOOPS=${1:-4}
+RATE=${RATE:-48000}
+if [ "$DIRECT" = off ] && [ "$RATE" != 48000 ]; then
+	echo "DSP mode plays 48 kHz only; use --direct for RATE=$RATE" >&2
+	exit 1
+fi
 P=/sys/module/snd_hda_codec_creative_ae9/parameters
 CMD=/sys/kernel/debug/creative_ae9/cmd
 
@@ -34,11 +41,28 @@ systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire pipewire-pu
 sleep 1
 
 # plughw: speaker-test's voice WAVs are 16-bit, the card takes 32-bit only
-speaker-test -D plughw:AE9 -c 6 -r 48000 -t wav -l "$LOOPS" &
+# speaker-test needs its voice clips at the stream rate: make copies
+WAVDIR=/usr/share/sounds/alsa
+if [ "$RATE" != 48000 ]; then
+	WAVDIR="$(dirname "$0")/../.tmp/audio/voices-$RATE"
+	mkdir -p "$WAVDIR"
+	for f in /usr/share/sounds/alsa/*.wav; do
+		# raw from ffmpeg, plain PCM header from Python: ffmpeg's WAV
+		# header above 48 kHz is WAVE_FORMAT_EXTENSIBLE, which
+		# speaker-test can't read
+		[ -s "$WAVDIR/${f##*/}" ] ||
+			ffmpeg -loglevel error -i "$f" -f s16le -ac 1 -ar "$RATE" - |
+			python3 -c 'import sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(1); w.setsampwidth(2)
+w.setframerate(int(sys.argv[2])); w.writeframes(sys.stdin.buffer.read()); w.close()' \
+				"$WAVDIR/${f##*/}" "$RATE" || exit 1
+	done
+fi
+speaker-test -D plughw:AE9 -c 6 -r "$RATE" -t wav -W "$WAVDIR" -l "$LOOPS" &
 ST=$!
 sleep 12	# past the direct-to-DSP switch, mid-stream
 {
-	echo "# router while playing 6 ch, $(date -Is)"
+	echo "# router while playing 6 ch at $RATE Hz, $(date -Is)"
 	for i in $(seq 0 127); do
 		a=$(printf '0x%x' $((0x190000 + i * 4)))
 		echo "chipior $a" | sudo tee $CMD >/dev/null

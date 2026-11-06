@@ -3,6 +3,34 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.4 (2026-11-06)
+
+More rates, more surround, and Direct Mode that switches cleanly. 🎚️
+All found by reading a fresh Windows capture overnight, then tested on the
+card. Pairs with [SbAe9-SBC v0.10.0](https://github.com/3xHelix/SbAe9-SBC),
+released alongside: its rate picker offers each mode's rates.
+
+- **44.1 and 88.2 kHz playback works, on by default** (stereo). The DAC
+  needed three commands Windows sends only for that family; without them
+  these rates played garbled or silent. `pcm_rates=2` is the new default
+  (1 = without 44.1/88.2, 0 = 48 kHz only); `dac_441` (1) sends the
+  commands. Add 44100 and 88200 to PipeWire's `clock.allowed-rates` and
+  44.1 kHz music plays at its own rate.
+- **5.1 at 192 kHz** in Direct Mode, all six jacks right. The router
+  layout is Windows' own (our 96 kHz one, extended). `surround_192k` (1);
+  384 kHz stays stereo, as on Windows. 5.1 opens at 48, 96 or 192 kHz.
+- **96 kHz through the DSP** (Direct Mode off), stereo and 5.1, with SBX.
+  `dsp_96k` (1; 0 = 48 kHz only, as before).
+- **Direct Mode on while playing:** the stream now restarts by itself and
+  plays on, direct. Before, it went silent until you paused and played.
+- **Fixed: a left/right echo in DSP mode** after a 5.1 (or 96 kHz+) stream
+  in Direct Mode. Leftover direct routes played one channel twice; DSP mode
+  now switches them off. The same leftovers caused the old 96 kHz echo.
+- `scripts/ae9-surround-test.sh` takes `RATE=96000` or `RATE=192000` with
+  `--direct`.
+
+-- 3xHelix
+
 ## 0.9.3 (2026-11-06)
 
 The head unit learns what's plugged into it. 🎧

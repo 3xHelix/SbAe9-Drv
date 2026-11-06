@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.3"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.4"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -422,6 +422,7 @@ extern unsigned int ae9_ca0113_windows;
  */
 extern unsigned int ae9_debug;
 extern unsigned int ae9_surround;	/* 5.1 (default on) */
+extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 #define ae9_dbg(chip, fmt, ...) do {					\
 		if (ae9_debug)						\
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\

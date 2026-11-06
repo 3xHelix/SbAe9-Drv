@@ -1103,6 +1103,13 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 			else if (dst == 0xe1 && er < 0)
 				er = src;
 		}
+		/*
+		 * DSP inputs: at 48 kHz HDA -> SRC -> DSP (00 -> 91 -> c0 ...);
+		 * at 96 kHz, the DSP's own rate, the 8051 wires HDA slots
+		 * straight in (00..0b -> c0..cb, state 3; 2026-11-06 dumps).
+		 */
+		if ((dst & 0xe0) == 0xc0 && src < 0x20)
+			inputs++;
 		if ((dst & 0xe0) == 0xc0 && src >= 0x80 && src < 0xc0) {
 			inputs++;
 			if (src == 0x90)
@@ -1138,6 +1145,35 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 			ins++;
 			inputs++;
 		}
+	}
+	/*
+	 * Stale direct bypasses: in DSP mode host audio reaches the DACs only
+	 * through the DSP, so an HDA slot wired straight to a DAC port is
+	 * left over from an earlier Direct Mode stream (5.1, or above
+	 * 48 kHz). Nothing removed them: 0x190068 = HDA 01 -> 0x41 played
+	 * the right channel direct and through the DSP, a left/right echo
+	 * (2026-11-06, 48 kHz stereo after a 5.1 direct stream). Switch them
+	 * off; the 5.1 ports below are rewritten after this.
+	 */
+	{
+		unsigned int stale = 0;
+
+		for (i = 0; i < n; i++) {
+			u32 a = 0x190000 + 4 * i;
+			u8 sv = e[i] & 0xff, dv = (e[i] >> 8) & 0xff;
+
+			if (a == AE9_RT_FRONT_L || a == AE9_RT_FRONT_R ||
+			    !((e[i] >> 16) & 3) || sv >= 0x20 ||
+			    dv < 0x40 || dv >= 0x80)
+				continue;
+			ae9_rt_write_checked(chip, a, e[i] & 0xffff,
+					     &unsteady, &retried, &failed);
+			e[i] &= 0xffff;
+			stale++;
+		}
+		if (stale)
+			dev_info(chip->dev, "SBX: router: switched off %u stale direct bypass%s (HDA -> DAC)\n",
+				 stale, stale == 1 ? "" : "es");
 	}
 	ae9_rt_write_checked(chip, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
 			     &unsteady, &retried, &failed);
@@ -1446,6 +1482,11 @@ void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
  * (any CA0113 command or a resume clears dac_start_key). 0 = send them at
  * every start, as Windows does.
  */
+/* 44.1/88.2 kHz: send Windows' extra DAC commands (see below). */
+static bool dac_441 = true;
+module_param(dac_441, bool, 0644);
+MODULE_PARM_DESC(dac_441, "44.1/88.2 kHz: send Windows' DAC commands 48/01 = 0xc1, 48/0b = 0x00, 0x20 (1 = yes, default; 0 = as before)");
+
 static bool dac_start_skip = true;
 module_param(dac_start_skip, bool, 0644);
 MODULE_PARM_DESC(dac_start_skip, "Skip the DAC start commands when rate and output are unchanged (1 = yes, default; 0 = every start, as Windows)");
@@ -1477,38 +1518,69 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
 			ae9_pcm_rates[r].rate);
 	} else if (start && !atomic && ae9_ca0113_windows) {
-		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm)][3];
+		/* the captured 12, plus two for the 44.1 kHz family */
+		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm) + 2][3];
+		bool fam441 = ae9_pcm_rates[r].route == AE9_ROUTE_SRC && dac_441;
+		size_t n = 0;
 
-		memcpy(cmds, ae9_cold_ca0113_pcm, sizeof(cmds));
-		for (i = 0; i < ARRAY_SIZE(cmds); i++) {
-			if (cmds[i][0] == 0x48 && cmds[i][1] == 0x1d)
-				cmds[i][2] = hp ? 0x80 : 0x40;
-			else if (cmds[i][0] == 0x48 && cmds[i][1] == 0x19)
-				cmds[i][2] = hp ? 0x01 : 0x00;
-			else if (cmds[i][0] == 0x48 && cmds[i][1] == 0x0a)
-				cmds[i][2] = ae9_pcm_rates[r].dac0a;
+		for (i = 0; i < ARRAY_SIZE(ae9_cold_ca0113_pcm); i++) {
+			u8 *c = cmds[n];
+
+			memcpy(c, ae9_cold_ca0113_pcm[i], 3);
+			if (c[0] == 0x48 && c[1] == 0x1d)
+				c[2] = hp ? 0x80 : 0x40;
+			else if (c[0] == 0x48 && c[1] == 0x19)
+				c[2] = hp ? 0x01 : 0x00;
+			else if (c[0] == 0x48 && c[1] == 0x01 && fam441)
+				c[2] = 0xc1;
+			else if (c[0] == 0x48 && c[1] == 0x0a) {
+				/*
+				 * 44.1/88.2 kHz: Windows sends 48/01 = 0xc1
+				 * (0xc0 for the 48 kHz family) and 48/0b =
+				 * 0x00 then 0x20 before 48/0a, at every such
+				 * start (all captures; 2026-11-05 01:59:56
+				 * and 02:00:18). Without them our 44.1 kHz
+				 * played garbled or silent.
+				 */
+				if (fam441) {
+					static const u8 b0[3] = { 0x48, 0x0b, 0x00 };
+					static const u8 b20[3] = { 0x48, 0x0b, 0x20 };
+
+					memcpy(cmds[n++], b0, 3);
+					memcpy(cmds[n++], b20, 3);
+					c = cmds[n];
+					memcpy(c, ae9_cold_ca0113_pcm[i], 3);
+				}
+				c[2] = ae9_pcm_rates[r].dac0a;
+			}
+			n++;
 		}
-		creative_dsp_ca0113_replay(chip, cmds, ARRAY_SIZE(cmds),
-					   "playback-start commands");
+		creative_dsp_ca0113_replay(chip, cmds, n,
+					   fam441 ? "playback-start commands (44.1 kHz family)" :
+						    "playback-start commands");
 		chip->dac_start_key = (r + 1) | hp << 8;
 	}
 	if (start) {
 		bool src = ae9_pcm_rates[r].route == AE9_ROUTE_SRC;
 		/*
-		 * A 6-channel stream (5.1) in Direct Mode, at up to 96 kHz. Not
+		 * A 6-channel stream (5.1) in Direct Mode, at up to 192 kHz. Not
 		 * for the DSP-mode lead-in (Direct Mode off, switch pending): a
 		 * lead-in started this way left the DSP with only the front pair
 		 * after the switch (2026-11-04, try 1); started as before
 		 * (stereo setup, front only for those 3 s) it was fine.
 		 */
-		/* ports <= 4: 48 and 96 kHz (this said <= 2 until 2026-11-05, so
-		 * 5.1 at 96 kHz got the stereo setup: front slots only, the
-		 * other channels went wherever the router pointed last) */
-		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 4 &&
+		/* ports <= 8: 48, 96 and 192 kHz (this said <= 2 until
+		 * 2026-11-05, so 5.1 at 96 kHz got the stereo setup: front
+		 * slots only, the other channels went wherever the router
+		 * pointed last) */
+		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 8 &&
 			   chip->fx.direct;
 		const u32 *in = ae9_cold_pcm_start;
 		size_t nin = ARRAY_SIZE(ae9_cold_pcm_start);
-		u32 *t = kmalloc_array(nin + 16 * 4, sizeof(u32),
+		/* room for the added writes: 5.1 at 192 kHz is 4 x 7 words
+		 * for slots 2..5 plus 18 x 4 for slots 6..23 = 100 words;
+		 * stereo 384 kHz 14 x 4 = 56; the converter 26 */
+		u32 *t = kmalloc_array(nin + 32 * 4, sizeof(u32),
 				       atomic ? GFP_ATOMIC : GFP_KERNEL);
 		u32 addr = 0, data;
 		size_t n = 0, k;
@@ -1588,9 +1660,9 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 				 * DAC pair's input + 2s. Without these, 5.1 at
 				 * 96 kHz sent every second sample to whatever the
 				 * slot held last (front inputs left by a 384 kHz
-				 * stream): tinny, stuttering (2026-11-05). Our
-				 * guess from the stereo layout; no Windows capture
-				 * of 5.1 above 48 kHz.
+				 * stream): tinny, stuttering (2026-11-05). Same as
+				 * Windows, slot for slot: 12 slots at 96 kHz, 24 at
+				 * 192 kHz (capture 2026-11-05, 02:01:48 / 02:02:20).
 				 */
 				for (k = 6; k < 3 * ae9_pcm_rates[r].ports; k++)
 					n = ae9_chipio_w(t, n, 0x190060 + 4 * k,

@@ -147,8 +147,8 @@ static void ae9_posbuf_read(struct creative_chip *chip, u32 lpib, u32 bufsz,
  * 2 ch, 24-bit, 48 kHz is 0x0031. 384 kHz is beyond the link's x4
  * multiplier: Windows sends it as 192 kHz with twice the channels (two
  * stereo samples per frame, the same bytes in the same order), 0x1833.
- * Playback offers 44.1-384 kHz with pcm_rates=1; the other entries are
- * unused.
+ * Playback offers 44.1-384 kHz with pcm_rates=2 (default); the other
+ * entries are unused.
  */
 static const struct {
 	unsigned int rate;
@@ -265,23 +265,23 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 /* ------------------------------------------------------------------ */
 
 /*
- * pcm_rates: 0 (default) = playback at 48 kHz only, as Windows' captured
- * start block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the
- * way Windows does it (creative_ae9_cold_pcm_replay). 2 = also 44.1 and
- * 88.2 kHz through the card's sample-rate converter: EXPERIMENTAL, it plays
- * silent or garbled on our card so far (Windows played its first 44.1 kHz
- * stream straight after startup; the clock state before it seems to
- * matter). PipeWire resamples 44.1 kHz files when those rates are left out.
- * Recording stays at 48 kHz.
+ * pcm_rates: 0 = playback at 48 kHz only, as Windows' captured start
+ * block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the way
+ * Windows does it (creative_ae9_cold_pcm_replay). 2 (default) = also 44.1
+ * and 88.2 kHz, stereo, through the card's sample-rate converter. These
+ * played silent or garbled until the DAC got Windows' 44.1 kHz-family
+ * commands (dac_441, 2026-11-06). PipeWire resamples 44.1 kHz files when
+ * those rates are left out. Recording: 48 or 96 kHz (capture side).
  * pcm_bits: 24 (default, as Windows' default format) or 32: the samples'
  * full 32 bits go to the card (format 0x41..., which Windows also uses).
  * Both writable at runtime; they apply to streams opened afterwards.
  */
-/* 48/96/192/384 kHz by default (Direct Mode; DSP mode takes 48 kHz):
- * every rate checked at 24 and 32 bit, switching back and forth, 2026-11-04 */
-static unsigned int pcm_rates = 1;
+/* 44.1-384 kHz by default (Direct Mode; DSP mode takes 48/96 kHz): 48 kHz
+ * family checked at 24 and 32 bit, switching back and forth, 2026-11-04;
+ * 44.1/88.2 kHz at 32 bit, before and after 96 kHz, 2026-11-06 */
+static unsigned int pcm_rates = 2;
 module_param(pcm_rates, uint, 0644);
-MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz (default), 2 = also 44.1/88.2 kHz (experimental)");
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz stereo (default)");
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
  * -> card's RCA, C/Sub jack, Rear jack; checked by ear 2026-11-04) and
@@ -308,33 +308,62 @@ static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
 };
 
 /*
- * 6 channels up to 96 kHz (48 kHz with surround_96k=0), and above that
- * only 2. Direct Mode only: DSP mode opens at 48 kHz. Windows' 5.1
- * captures are all 48 kHz.
+ * 6 channels up to 192 kHz (96 kHz with surround_192k=0, 48 kHz with
+ * surround_96k=0), and at 384 kHz only 2: Creative's 5.1 maximum is
+ * 192 kHz and Windows never offers 5.1 at 384 kHz. Direct Mode off (DSP
+ * mode) opens at 48 or 96 kHz (dsp_96k).
  */
-#define AE9_SURROUND_RATE_MAX	(surround_96k ? 96000 : 48000)
+#define AE9_SURROUND_RATE_MAX	(!surround_96k ? 48000 : \
+				 surround_192k ? 192000 : 96000)
 
 /* 5.1 at 96 kHz used to stutter more and more as it played: the start
  * block gave it the stereo router setup (front slots only) and the 64 KB
  * buffer was barely one quantum. Both fixed 2026-11-05: all six speakers
  * right, no errors over 2 min; on by default since. The 96 kHz slot
- * layout is our guess (no Windows capture of 5.1 above 48 kHz); 0 goes
+ * layout matches Windows' exactly (capture 2026-11-05, 02:01:48); 0 goes
  * back to 5.1 at 48 kHz only. */
 static unsigned int surround_96k = 1;
 module_param(surround_96k, uint, 0644);
 MODULE_PARM_DESC(surround_96k, "Allow 5.1 at 96 kHz in Direct Mode (1 = yes, default; 0 = 5.1 at 48 kHz only)");
+
+/* 5.1 at 192 kHz: Windows' router layout is our 96 kHz one with twice the
+ * slots (capture 2026-11-05, 02:02:20). 0 = 5.1 up to 96 kHz. */
+static unsigned int surround_192k = 1;
+module_param(surround_192k, uint, 0644);
+MODULE_PARM_DESC(surround_192k, "Allow 5.1 at 192 kHz in Direct Mode (1 = yes, default; 0 = 5.1 up to 96 kHz; needs surround_96k=1)");
+
+/* 96 kHz through the DSP (Direct Mode off), as Windows offers: stereo and
+ * 5.1 with SBX, live Direct Mode switches, no echo (2026-11-06). */
+bool ae9_dsp_96k = true;
+module_param_named(dsp_96k, ae9_dsp_96k, bool, 0644);
+MODULE_PARM_DESC(dsp_96k, "Allow 96 kHz with Direct Mode off, through the DSP (1 = yes, default; 0 = 48 kHz only); applies to streams opened afterwards");
+
+/*
+ * 5.1 rates: the 48 kHz family up to AE9_SURROUND_RATE_MAX. 44.1/88.2 kHz
+ * go through the sample-rate converter, which carries one stereo pair
+ * (Windows offers them in stereo only, capture 2026-11-05 format probes).
+ */
+static unsigned int ae9_surround_rates(unsigned int *list)
+{
+	static const unsigned int r[] = { 48000, 96000, 192000 };
+	unsigned int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(r); i++)
+		if (r[i] <= AE9_SURROUND_RATE_MAX)
+			list[n++] = r[i];
+	return n;
+}
+
 static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
 			       struct snd_pcm_hw_rule *rule)
 {
 	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-	struct snd_interval t;
+	unsigned int list[3];
 
 	if (ch->min <= 2)
 		return 0;
-	snd_interval_any(&t);
-	t.max = AE9_SURROUND_RATE_MAX;
-	return snd_interval_refine(rate, &t);
+	return snd_interval_list(rate, ae9_surround_rates(list), list, 0);
 }
 
 static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
@@ -343,9 +372,11 @@ static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
 	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
 	struct snd_interval t;
+	unsigned int list[3], i, n = ae9_surround_rates(list);
 
-	if (rate->min <= AE9_SURROUND_RATE_MAX)
-		return 0;
+	for (i = 0; i < n; i++)
+		if (snd_interval_test(rate, list[i]))
+			return 0;	/* a 5.1 rate is still possible */
 	snd_interval_any(&t);
 	t.max = 2;
 	return snd_interval_refine(ch, &t);
@@ -535,22 +566,27 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_max = 48000;
 	}
 	/*
-	 * Direct Mode off = through the DSP: 48 kHz only. Windows offers up to
-	 * 96 kHz there, but our DSP-mode start only sets up a 48 kHz input:
-	 * at 96 kHz the router came up with no DSP input path while the direct
-	 * route stayed live, so the stream played twice, direct and through
-	 * the DSP a little later (an echo; 2026-11-04). PipeWire resamples
-	 * other rates to 48 kHz in DSP mode; Direct Mode keeps them all.
+	 * Direct Mode off = through the DSP: 48 kHz, and 96 kHz with dsp_96k.
+	 * Windows offers up to 96 kHz there. Our first 96 kHz try played the
+	 * stream twice, direct and through the DSP a little later (an echo;
+	 * 2026-11-04): most likely stale direct bypass entries (HDA 02/03 ->
+	 * DAC 0x42/0x43) from an earlier 96 kHz+ Direct Mode stream, which
+	 * DSP mode now switches off (creative_ae9_router_front_dsp). Windows
+	 * sends nothing rate-specific for 96 kHz in DSP mode (capture
+	 * 2026-11-05, 01:55:36). PipeWire resamples other rates.
 	 */
 	if (!chip->fx.direct) {
-		runtime->hw.rates &= SNDRV_PCM_RATE_48000;
+		unsigned int top = ae9_dsp_96k ? 96000 : 48000;
+
+		runtime->hw.rates &= SNDRV_PCM_RATE_48000 |
+				     (ae9_dsp_96k ? SNDRV_PCM_RATE_96000 : 0);
 		runtime->hw.rate_min = max(runtime->hw.rate_min, 48000U);
-		runtime->hw.rate_max = min(runtime->hw.rate_max, 48000U);
+		runtime->hw.rate_max = min(runtime->hw.rate_max, top);
 	}
 	/*
 	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
 	 * (captures 5, 6: format 0x35) and in Direct Mode with 5.1 speakers
-	 * (capture 6, 23:39:16). 6 channels up to 96 kHz (see
+	 * (capture 6, 23:39:16). 6 channels up to 192 kHz (see
 	 * AE9_SURROUND_RATE_MAX).
 	 */
 	if (ae9_surround) {

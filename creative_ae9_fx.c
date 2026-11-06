@@ -501,7 +501,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			/* nothing playing: switch at the next stream (see
 			 * creative_ae9_dsp_switch_work) */
 			chip->dsp_switch_pending = true;
-		} else if (!fx->direct && chip->pcm_start_rate != 48000) {
+		} else if (!fx->direct && chip->pcm_start_rate != 48000 &&
+			   !(ae9_dsp_96k && chip->pcm_start_rate == 96000)) {
 			/* a direct stream above 48 kHz can't go through the DSP
 			 * (see pcm_open): it plays on direct, and the next
 			 * stream opens at 48 kHz and switches */
@@ -514,10 +515,31 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			creative_ae9_dsp_mode(chip, true);
 			fx_apply_all(chip);
 		} else {
+			bool was_dsp = chip->dsp_active;
+			struct snd_pcm_substream *ss = READ_ONCE(chip->playback_substream);
+
 			chip->dsp_switch_pending = false;
 			/* effects off (speaker config 8), then route direct */
 			fx_apply_all(chip);
 			creative_ae9_dsp_mode(chip, false);
+			/*
+			 * The running stream is now unbound and silent. Windows
+			 * stops it too and leaves the restart to the app
+			 * (capture 2026-11-05, 02:07:01). Report it stopped so
+			 * PipeWire restarts it, and the normal start block routes
+			 * it direct. Does nothing if no stream is running.
+			 * The start block normally goes out once per open, so
+			 * mark it unsent or the restart plays unrouted (first
+			 * test, 2026-11-06: silent until the stream closed).
+			 * The DAC start commands go out again too: DSP mode
+			 * changed the I2S clock under them.
+			 */
+			if (was_dsp && ss) {
+				dev_info(chip->dev, "Direct Mode on: restarting the running stream\n");
+				chip->pcm_start_sent = 0;
+				chip->dac_start_key = 0;
+				snd_pcm_stop_xrun(ss);
+			}
 		}
 		fx_update_active(chip);
 		return 1;
