@@ -39,19 +39,12 @@
 #include "creative_ae9.h"
 
 /*
- * Per-transaction MCU settle budget (microseconds). After each ACM
- * transaction we wait up to this long for the head-unit MCU status to
- * return to idle (0x6/0x3) before sending the next one, so the slow MCU
- * does not drop transactions. Tunable without recompiling.
+ * Per-transaction MCU settle budget (microseconds). After each transaction
+ * (the old I2C-style sender: debugfs hutx, and the no-firmware init) we wait
+ * up to this long for the head-unit MCU status to return to idle (0x6/0x3)
+ * before sending the next one, so the slow MCU does not drop transactions.
  */
-unsigned int acm_tx_settle_us = 20000;
-module_param(acm_tx_settle_us, uint, 0444);
-MODULE_PARM_DESC(acm_tx_settle_us,
-		 "Max per-transaction MCU completion wait for ACM init (us)");
-
-unsigned int acm_i2c_debug;
-module_param(acm_i2c_debug, uint, 0644);
-MODULE_PARM_DESC(acm_i2c_debug, "Log per-transaction ACM I2C handshake (1=on)");
+#define ACM_TX_SETTLE_US	20000
 
 /* Head-unit UART registers in BAR2 (historical names, see the top) */
 #define DSP_REG_CMD		0xC00
@@ -117,11 +110,10 @@ static int creative_i2c_send_tx(struct creative_chip *chip,
 	 * 0x40 completion before returning.
 	 */
 	if (count > 0 && bytes[count - 1] == I2C_STOP) {
-		unsigned int t2 = acm_tx_settle_us;
+		unsigned int t2 = ACM_TX_SETTLE_US;
 		u32 sts_last = 0;
 		int frame_bytes = 0;
 		u32 last_c00 = 0;
-		u8 frame_buf[16] = {0};
 
 		/*
 		 * Mirror the capture's EXACT post-STOP response-frame protocol
@@ -147,7 +139,6 @@ static int creative_i2c_send_tx(struct creative_chip *chip,
 			if (r == 0x41 && frame_bytes < 16) {
 				last_c00 = creative_ext_readl(chip,
 							      DSP_REG_CMD) & 0xff;
-				frame_buf[frame_bytes] = last_c00;
 				frame_bytes++;
 				/* terminator + idle status => settled */
 				if (last_c00 == I2C_STOP) {
@@ -167,14 +158,6 @@ static int creative_i2c_send_tx(struct creative_chip *chip,
 			t2 -= 5;
 		}
 
-		if (acm_i2c_debug)
-			pr_info("ae9-i2c: reg=0x%02x frame=%d [%*ph] resp=0x%x sts=0x%x\n",
-				count > 1 ? bytes[1] : 0, frame_bytes,
-				min(frame_bytes, 12), frame_buf, r, sts_last);
-		if (0)
-			pr_info("ae9-i2c: reg=0x%02x frame=%d lastc00=0x%x resp=0x%x p2left=%u sts=0x%x\n",
-				count > 1 ? bytes[1] : 0, frame_bytes,
-				last_c00, r, t2, sts_last);
 
 		if (resp)
 			*resp = r;
@@ -223,7 +206,7 @@ static int creative_i2c_send_raw(struct creative_chip *chip,
 	 * rest of "AE-9"/"-HP-"/version never appeared. Gate each
 	 * transaction on STS returning to the idle/ready value 0x6.
 	 */
-	for (waited = 0; waited < acm_tx_settle_us / 20; waited++) {
+	for (waited = 0; waited < ACM_TX_SETTLE_US / 20; waited++) {
 		sts = creative_ext_readl(chip, DSP_REG_STS) & 0xff;
 		if (sts == 0x6 || sts == 0x3)
 			break;

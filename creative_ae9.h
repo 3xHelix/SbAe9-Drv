@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.6"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.7"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -248,7 +248,6 @@ struct creative_chip {
 
 	/* Delayed ACM head-unit re-init (MCU not ready at early boot) */
 	struct delayed_work	acm_work;
-	int			acm_retries;
 	bool			acm_settled;
 
 	/* Periodic head-unit heartbeat (keeps MCU/DAC alive) */
@@ -402,17 +401,14 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip, u32 verb, u32 *resp);
 u32 creative_ae9_verb(unsigned int cad, unsigned int nid,
 		      unsigned int verb_id, unsigned int payload);
 int creative_ae9_hw_reset(struct creative_chip *chip);
-void creative_ae9_hw_init(struct creative_chip *chip);
 
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
 			      unsigned int addx, unsigned int data);
 int creative_dsp_chipio_read(struct creative_chip *chip,
 			     unsigned int addx, unsigned int *data);
-void creative_dsp_enable_clocks(struct creative_chip *chip);
 int creative_dsp_prepare(struct creative_chip *chip);
 int creative_dsp_load_firmware(struct creative_chip *chip);
-void creative_dsp_keepalive(struct creative_chip *chip);
 void creative_ae9_vlog(u32 val, u32 ex, bool is_resp);
 void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
 				  unsigned int rate, u16 format);
@@ -426,7 +422,6 @@ int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
 void creative_dsp_chipio_addr_invalidate(void);
 int creative_dsp_boot_handshake(struct creative_chip *chip);
-extern unsigned int ae9_ca0113_windows;
 
 /*
  * debug=0 (default): startup, user actions and problems only. debug=1:

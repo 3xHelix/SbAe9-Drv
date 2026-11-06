@@ -35,9 +35,6 @@
  * 00=ff for clock enable. The old tables had address and data swapped
  * (c8=44 ...), plus 44=c2 and 05=0b/06=ff, none of which Windows writes.
  */
-static unsigned int pll_windows = 1;
-module_param(pll_windows, uint, 0444);
-MODULE_PARM_DESC(pll_windows, "Use the Windows capture's 8051 PLL/PMU writes (1=on, 0=old swapped tables)");
 
 /*
  * SCP GET replies: Windows reads the reply header, then sends 0x704 p=0x02,
@@ -127,40 +124,6 @@ static int ae9_rings_unpark(struct creative_chip *chip, const char *what)
 }
 
 /*
- * prep_windows=1 (use with fw_split): skip creative_dsp_prepare()'s codec
- * verbs and dspload_image()'s extra DSPIO_DSP_INIT. The fw_split
- * pre-download replay already sends all of them in Windows' order
- * (CT extensions, clock enable, control flags, 0x18b0a4, codec-1 AFG reset
- * x2 at seq 752-754, then 0x708 p=0x80 + 0x703 at seq 1002-1004).
- * prepare() repeated the AFG reset *after* 0x708 p=0x80, and dspload
- * sent a second 0x703; Windows does neither.
- */
-static unsigned int prep_windows = 1;
-module_param(prep_windows, uint, 0444);
-MODULE_PARM_DESC(prep_windows, "Skip the duplicate pre-download codec verbs (AFG reset, flags, DSP_INIT) that fw_split's replay already sends (1=on, default)");
-
-/*
- * dl_windows=1: firmware download the way the cold-boot capture does it:
- * stream descriptor 0x100 with tag 1 (Windows uses the same stream for the
- * download and later for playback; ours used 0x120/tag 7), ChipIO stream
- * bind before port allocation, stream reset after the transfer, and no
- * 0x40004/0x801c pre-writes.
- */
-static unsigned int dl_windows = 1;
-module_param(dl_windows, uint, 0444);
-MODULE_PARM_DESC(dl_windows, "Firmware download on stream 0x100/tag 1 in Windows' order, reset after (1=on, default)");
-
-/*
- * hs_immediate=1: send the MASTERCONTROL boot handshake straight after the
- * DBGCNTL run writes, as Windows does (its SET 0x80/0x0c=3 follows within
- * a few verbs), instead of after our ~35 ms of load-flag polling and
- * register reads. Also skips the DBGCNTL read right after the run.
- */
-static unsigned int hs_immediate = 1;
-module_param(hs_immediate, uint, 0444);
-MODULE_PARM_DESC(hs_immediate, "Run the DSP boot handshake immediately after starting the firmware (1=on, default)");
-
-/*
  * fw_verify=1: after the firmware download and before starting the DSP,
  * read samples of every segment back through ChipIO and compare them with
  * the image. Done while the DSP is still halted, so data memory hasn't
@@ -169,28 +132,6 @@ MODULE_PARM_DESC(hs_immediate, "Run the DSP boot handshake immediately after sta
 static unsigned int fw_verify;
 module_param(fw_verify, uint, 0444);
 MODULE_PARM_DESC(fw_verify, "Read back the downloaded firmware before starting the DSP and compare (1=on)");
-
-/*
- * dl_reset_chunks (default 1): reset and reprogram the firmware-download
- * stream before every DMA chunk. Without it the stream's read position
- * carried on from the previous chunk (log: chunk 2 "LPIB 31ac0->..."), so
- * only the first chunk arrived intact: fw_verify read segment 1 back 677/677
- * correct but segments 2-3 about half wrong. Windows resets the stream per
- * chunk; upstream ca0132 resets its DMA engine per chunk too.
- */
-static unsigned int dl_reset_chunks = 1;
-module_param(dl_reset_chunks, uint, 0444);
-MODULE_PARM_DESC(dl_reset_chunks, "Reset the download stream before each firmware DMA chunk (1=on, default)");
-
-/*
- * dl_bdl64 (default 1): describe the 256 KB download buffer with 64 BDL
- * entries of 4 KB (LVI 63), as Windows does. We used a single entry
- * (LVI 0), which the HDA spec doesn't allow (at least two entries), and
- * the tail of every partial DMA chunk then failed to arrive.
- */
-static unsigned int dl_bdl64 = 1;
-module_param(dl_bdl64, uint, 0444);
-MODULE_PARM_DESC(dl_bdl64, "Firmware download buffer as 64 BDL entries of 4 KB, as Windows (1=on, default)");
 
 #define DSPLOAD_BDL_BYTES	1024	/* room for 64 entries */
 
@@ -204,28 +145,12 @@ module_param(overlay, uint, 0444);
 MODULE_PARM_DESC(overlay, "Transfer the DSP overlay image (ctefx-ae9-overlay.bin) during the boot handshake (1=on, default)");
 #define AE9_OVERLAY_FILE	"ctefx-ae9-overlay.bin"
 
-/*
- * ca0113_windows=1: send the CA0113 (head-unit DAC) commands Windows sends,
- * exactly as in the cold-boot capture, with its protocol (0x20c = 0x800005,
- * 0x800005, 0x800004 around each command), and make our own CA0113 command
- * calls no-ops (GPIO writes stay). Ours used the AE-5/AE-7 protocol
- * (0x800001/0x800003/0x800002) for most commands, which Windows never
- * uses, and several values differ (e.g. 48/0d, 48/1d, 48/07, 49/02-05).
- */
-unsigned int ae9_ca0113_windows = 1;
-module_param_named(ca0113_windows, ae9_ca0113_windows, uint, 0444);
-MODULE_PARM_DESC(ca0113_windows, "Head-unit DAC (CA0113) commands exactly as in the Windows capture (1=on, default)");
-
 /* wait between a CA0113 command's value write and its commit: 20 ms for
  * the boot commands; volume changes (replay_quiet) use hu_cmd_settle_us */
 #define CA0113_SETTLE_US	20000
 static unsigned int hu_cmd_settle_us = 4000;
 module_param(hu_cmd_settle_us, uint, 0644);
 MODULE_PARM_DESC(hu_cmd_settle_us, "post_windows: CA0113 settle time for volume changes (us)");
-
-static unsigned int scp_win_read = 1;
-module_param(scp_win_read, uint, 0444);
-MODULE_PARM_DESC(scp_win_read, "Read SCP GET replies with the Windows 0x704/0xF04 step (1=on, default)");
 
 #define CAD			1		/* main codec address */
 #define WIDGET_CHIP_CTRL	0x15
@@ -356,26 +281,6 @@ static void dsp_write(struct creative_chip *chip, u8 nid, u16 verb, u16 payload)
 	verb_send(chip, creative_ae9_verb(CAD, nid, verb, payload), &resp);
 }
 
-/*
- * dsp_write_nowait - fire-and-forget verb, no RIRB wait.
- *
- * Used only for verbs where the codec may not generate an RIRB response
- * promptly — specifically the 8051 PLL/PMU writes (0x70C/0x70D/0x70E)
- * which cause the 8051 to enter a PLL relock cycle and stop responding.
- * All other writes use dsp_write() which waits for the RIRB response to
- * confirm the verb was accepted before proceeding.
- */
-static void dsp_write_nowait(struct creative_chip *chip, u8 nid, u16 verb,
-			     u16 payload)
-{
-	u32 v = creative_ae9_verb(CAD, nid, verb, payload);
-
-	if (chip->corb_buf)
-		creative_ae9_corb_send_verb(chip, v);
-	else
-		creative_ae9_icw_send_verb(chip, v, NULL);
-}
-
 /* ------------------------------------------------------------------ */
 /* ChipIO layer							  */
 /* ------------------------------------------------------------------ */
@@ -417,17 +322,11 @@ static unsigned int curr_chip_addx;
  * back with another register's or the previous read's data. Sending the
  * address on every access removes the cache from the picture.
  */
-static unsigned int chipio_nocache = 1;
-module_param(chipio_nocache, uint, 0444);
-MODULE_PARM_DESC(chipio_nocache, "Send the ChipIO address on every access instead of caching it (1=on, default)");
 
 static int chipio_write_address(struct creative_chip *chip,
 				unsigned int chip_addx)
 {
 	int res;
-
-	if (!chipio_nocache && curr_chip_addx == chip_addx)
-		return 0;
 
 	res = chipio_send(chip, VENDOR_CHIPIO_ADDRESS_LOW, chip_addx & 0xffff);
 	if (res != -EIO)
@@ -483,47 +382,6 @@ int creative_dsp_chipio_read(struct creative_chip *chip,
 	if (err < 0)
 		return err;
 	return chipio_read_data(chip, data);
-}
-
-static void chipio_set_control_flag(struct creative_chip *chip,
-				    int flag_id, bool flag_state)
-{
-	unsigned int val = ((flag_state ? 1 : 0) << 7) | (flag_id & 0x7f);
-
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_FLAG_SET, val);
-}
-
-/* 8051 / PLL-PMU */
-static void chipio_8051_set_address(struct creative_chip *chip, unsigned int a)
-{
-	/* 8051 address writes: no RIRB wait — 8051 may be mid-PLL-relock */
-	dsp_write_nowait(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_8051_ADDRESS_LOW,
-			 a & 0xff);
-	dsp_write_nowait(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_8051_ADDRESS_HIGH,
-			 (a >> 8) & 0xff);
-}
-
-static void chipio_8051_set_data_pll(struct creative_chip *chip, unsigned int d)
-{
-	/* PLL write: no RIRB wait — 8051 enters relock, stops responding */
-	dsp_write_nowait(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PLL_PMU_WRITE,
-			 d & 0xff);
-}
-
-static void chipio_8051_write_pll_pmu(struct creative_chip *chip,
-				      unsigned int addr, unsigned int data)
-{
-	chipio_8051_set_address(chip, addr & 0xff);
-	chipio_8051_set_data_pll(chip, data);
-}
-
-void creative_dsp_enable_clocks(struct creative_chip *chip)
-{
-	chipio_8051_write_pll_pmu(chip, 0x00, 0xff);
-	if (pll_windows)
-		return;
-	chipio_8051_write_pll_pmu(chip, 0x05, 0x0b);
-	chipio_8051_write_pll_pmu(chip, 0x06, 0xff);
 }
 
 /* ------------------------------------------------------------------ */
@@ -996,7 +854,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 		reply_data_size = hdr >> 27;
 		if (reply_data_size > SCP_MAX_DATA_WORDS)
 			reply_data_size = SCP_MAX_DATA_WORDS;
-		if (matched && scp_win_read && reply_data_size) {
+		if (matched && reply_data_size) {
 			/* Windows: 0x704 p=0x02, status, count via 0xF04 */
 			unsigned int cnt;
 
@@ -1514,18 +1372,6 @@ static int dsp_dma_stop(struct creative_chip *chip, unsigned int dma_chan)
 			1 << (dma_chan + DSPDMAC_CHNLSTART_DIS_LOBIT));
 }
 
-static int dsp_reset(struct creative_chip *chip)
-{
-	unsigned int res;
-	int retry = 20;
-
-	do {
-		res = dspio_send(chip, VENDOR_DSPIO_DSP_INIT, 0);
-		retry--;
-	} while (res == (unsigned int)-EIO && retry);
-	return retry ? 0 : -EIO;
-}
-
 static int dsp_set_run_state(struct creative_chip *chip)
 {
 	unsigned int reg, halt_state;
@@ -1550,67 +1396,6 @@ static int dsp_set_run_state(struct creative_chip *chip)
 			return err;
 	}
 	return 0;
-}
-
-/*
- * Lightweight periodic DSP keepalive (called from the 500ms heartbeat).
- * Quietly checks the 8051 run state and un-halts it if it has fallen into a
- * halt state (DBGCNTL STATE != 0), which intermittently jams the SCP queue.
- * No logging unless it actually had to act. Sub-millisecond; safe to call
- * often. Does nothing if the DSP isn't loaded/responding.
- */
-
-/*
- * hu_dsp_keepalive: 0 = off (default; Windows never touches DBGCNTL while
- * running), 1 = read DBGCNTL each heartbeat and force run state if its
- * state bits are set (old behaviour), 2 = read and log only. With the
- * Windows setup the old standup never runs, so the standup_done guard
- * below never applied and the heartbeat poked the DSP every 500 ms;
- * suspected of leaving it silent after a minute or two of idle.
- */
-static unsigned int hu_dsp_keepalive;
-module_param(hu_dsp_keepalive, uint, 0644);
-MODULE_PARM_DESC(hu_dsp_keepalive, "Heartbeat DSP keepalive: 0=off (default), 1=un-halt (old), 2=log only");
-
-void creative_dsp_keepalive(struct creative_chip *chip)
-{
-	static unsigned int last = ~0U;
-	unsigned int reg = 0;
-	int err;
-
-	if (!chip->dsp_done || !hu_dsp_keepalive)
-		return;
-
-	/*
-	 * Read DBGCNTL via ChipIO (sync CORB read). After HELLO ACK the 8051
-	 * is in audio-loop mode and stops servicing CORB promptly, causing 1s
-	 * timeouts. The 500ms heartbeat fires this every 500ms — 2 timeouts/s
-	 * that block PCM prepare for several seconds.
-	 *
-	 * The keepalive's job is to un-halt the 8051 if it enters a halt state.
-	 * In practice the 8051 does not halt during normal playback (DBGCNTL
-	 * shows 0x4d0000 throughout). Skip the read entirely post-standup —
-	 * the standup checkpoints (halt=0 at each stage) already confirm health,
-	 * and any real halt would be caught by the self-reset mechanism on the
-	 * next module load.
-	 */
-	if (chip->standup_done)
-		return;
-
-	err = creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &reg);
-	if (err < 0)
-		return;
-
-	if (reg != last) {
-		dev_info(chip->dev, "dsp keepalive: DBGCNTL 0x%x -> 0x%x%s\n", last, reg,
-			 (reg & DSP_DBGCNTL_STATE_MASK) ? " (state bits set)" : "");
-		last = reg;
-	}
-	if ((reg & DSP_DBGCNTL_STATE_MASK) != 0 && hu_dsp_keepalive == 1) {
-		dsp_set_run_state(chip);
-		dev_info(chip->dev, "dsp keepalive: forced run state (DBGCNTL=0x%x)\n",
-			 reg);
-	}
 }
 
 /* Router ports (ChipIO) */
@@ -1665,8 +1450,8 @@ static void dspload_post_setup(struct creative_chip *chip)
 /* Uses HDA output stream descriptor index 5 (BAR0+0x120), tag 7.	  */
 /* ------------------------------------------------------------------ */
 /* stream descriptor 5 / tag 7, or Windows' descriptor 4 / tag 1 */
-#define DSPLOAD_STREAM_BASE	(dl_windows ? 0x100 : 0x120)
-#define DSPLOAD_STREAM_TAG	(dl_windows ? 1 : 7)
+#define DSPLOAD_STREAM_BASE	0x100	/* Windows: descriptor 4, as for playback */
+#define DSPLOAD_STREAM_TAG	1
 #define DSPLOAD_BUF_SIZE	(256 * 1024)
 
 struct ae9_dma_engine {
@@ -1700,7 +1485,7 @@ static void dma_program(struct ae9_dma_engine *dma)
 
 	writel((dma->stream_tag & 0xf) << 20, sd + AZX_REG_SD_CTL);
 	writel(dma->buf_size, sd + AZX_REG_SD_CBL);
-	writew(dl_bdl64 ? 63 : 0, sd + AZX_REG_SD_LVI);
+	writew(63, sd + AZX_REG_SD_LVI);	/* 64 BDL entries, as Windows */
 	writew(dma->hda_format, sd + AZX_REG_SD_FORMAT);
 	writel(lower_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPL);
 	writel(upper_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPU);
@@ -1729,7 +1514,8 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	dma->stream_tag = DSPLOAD_STREAM_TAG;
 
 	bdl = dma->bdl;
-	if (dl_bdl64) {
+	/* 64 entries of 4 KB, as Windows (one entry broke partial chunks) */
+	{
 		unsigned int i, n = 64, len = dma->buf_size / 64;
 
 		for (i = 0; i < n; i++) {
@@ -1740,11 +1526,6 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 			bdl[i * 4 + 2] = cpu_to_le32(len);
 			bdl[i * 4 + 3] = cpu_to_le32(0);
 		}
-	} else {
-		bdl[0] = cpu_to_le32(lower_32_bits(dma->buf_dma));
-		bdl[1] = cpu_to_le32(upper_32_bits(dma->buf_dma));
-		bdl[2] = cpu_to_le32(dma->buf_size);
-		bdl[3] = cpu_to_le32(0);
 	}
 	wmb();
 
@@ -1765,8 +1546,7 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	writel(dma->buf_size,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CBL);
-	writew(dl_bdl64 ? 63 : 0,
-	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_LVI);
+	writew(63, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_LVI);
 	writew(dma->hda_format,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_FORMAT);
 	writel(lower_32_bits(dma->bdl_dma),
@@ -1796,16 +1576,14 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 	writel(ctl & ~SD_CTL_DMA_START,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
-	if (dl_windows) {
-		/* Windows resets the download stream right after the transfer */
-		writel(SD_CTL_STREAM_RESET,
-		       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
-		wmb();
-		udelay(50);
-		writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
-		wmb();
-		udelay(50);
-	}
+	/* Windows resets the download stream right after the transfer */
+	writel(SD_CTL_STREAM_RESET,
+	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
+	wmb();
+	udelay(50);
+	writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
+	wmb();
+	udelay(50);
 	if (dma->posbuf) {
 		writel(0, chip->hda_regs + AZX_REG_DPLBASE);
 		writel(0, chip->hda_regs + AZX_REG_DPUBASE);
@@ -1954,8 +1732,7 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		unsigned int flicker;
 
 		run_size_words = min(buffer_size_words, words_to_write);
-		if (dl_reset_chunks)
-			dma_program(dma);	/* read position back to 0 */
+		dma_program(dma);	/* read position back to 0 (Windows resets per chunk) */
 		memcpy(dma->buf, data, run_size_words * sizeof(u32));
 		if (!comm_done) {
 			status = dsp_dma_stop(chip, dma_chan);
@@ -2091,10 +1868,9 @@ static int dspxfr_image(struct creative_chip *chip,
 		return status;
 
 	/* Windows binds node 0x15 to the load stream before allocating ports */
-	if (dl_windows)
-		verb_send(chip,
-			creative_ae9_verb(CAD, WIDGET_CHIP_CTRL, 0x706,
-					  (dma.stream_tag << 4)), &response);
+	verb_send(chip,
+		  creative_ae9_verb(CAD, WIDGET_CHIP_CTRL, 0x706,
+				    (dma.stream_tag << 4)), &response);
 
 	status = dsp_allocate_ports_format(chip, hda_format, &port_map_mask);
 	dev_info(chip->dev, "dspxfr: alloc_ports ret=%d port_map_mask=0x%x\n",
@@ -2113,12 +1889,6 @@ static int dspxfr_image(struct creative_chip *chip,
 			 "dspxfr: port_map_mask=0 (DSP cold), using fallback 0xff\n");
 		port_map_mask = 0xff;
 	}
-
-	/* bind node 0x15 to the load stream tag */
-	if (!dl_windows)
-		verb_send(chip,
-			creative_ae9_verb(CAD, WIDGET_CHIP_CTRL, 0x706,
-					  (dma.stream_tag << 4)), &response);
 
 	/* walk all FLS segments */
 	while (fls_data && !seg_is_last(fls_data)) {
@@ -2220,11 +1990,6 @@ static int dspload_image(struct creative_chip *chip,
 		channels /= 2;
 	}
 
-	if (!prep_windows) {
-		status = dsp_reset(chip);
-		if (status < 0)
-			return status;
-	}
 	parked = ae9_rings_park(chip, "firmware");
 	status = dspxfr_image(chip, fls, sample_rate, channels);
 	if (parked) {
@@ -2248,7 +2013,8 @@ static int dspload_image(struct creative_chip *chip,
 	dspload_post_setup(chip);
 	if (fw_verify)
 		dsp_verify_image(chip, fls);
-	if (hs_immediate) {
+	/* the MASTERCONTROL boot handshake straight after the run, as Windows */
+	{
 		int r = dsp_set_run_state(chip);
 		int hs = creative_dsp_boot_handshake(chip);
 
@@ -2259,16 +2025,6 @@ static int dspload_image(struct creative_chip *chip,
 			 r, hs ? "INCOMPLETE" : "complete", hs);
 		if (hs && chip->resuming)
 			return -EIO;
-		return r;
-	}
-	{
-		unsigned int dbgcntl = 0;
-		int r = dsp_set_run_state(chip);
-		creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbgcntl);
-		dev_info(chip->dev,
-			 "dspload: dsp_set_run_state ret=%d DBGCNTL=0x%x (halt_state=0x%x)\n",
-			 r, dbgcntl,
-			 (dbgcntl & DSP_DBGCNTL_STATE_MASK) >> DSP_DBGCNTL_STATE_LOBIT);
 		return r;
 	}
 }
@@ -2507,10 +2263,6 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	 *
 	 * Also clear 0x801c so the audio-loop counter starts at 0.
 	 */
-	if (!dl_windows) {
-		creative_dsp_chipio_write(chip, 0x40004, 0);
-		creative_dsp_chipio_write(chip, 0x801c,  0);
-	}
 	dev_info(chip->dev, "dsp_load: cleared 0x40004 and 0x801c before download\n");
 
 	dev_info(chip->dev, "dsp_load: calling dspload_image\n");
@@ -2652,13 +2404,8 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 /* ------------------------------------------------------------------ */
 int creative_dsp_prepare(struct creative_chip *chip)
 {
-	unsigned int val = 0;
-	int err = -EIO;
-	u32 resp;
-	int attempt;
-
 	/*
-	 * Force-reset the firmware DMA stream (at 0x120) before use.
+	 * Force-reset the firmware DMA stream before use.
 	 * If a previous session crashed mid-transfer, the stream descriptor
 	 * may be in an invalid state causing dma_prepare() to fail with
 	 * -EINVAL. Explicitly stop and reset it here regardless of state.
@@ -2682,120 +2429,8 @@ int creative_dsp_prepare(struct creative_chip *chip)
 		udelay(50);
 	}
 
-	if (prep_windows) {
-		dev_info(chip->dev,
-			 "DSP prepare: codec verbs skipped (prep_windows=1, replay already sent them)\n");
-		return 0;
-	}
-
-	/*
-	 * Bad-boot auto-recovery: on some cold boots the codec/ChipIO channel
-	 * comes up wedged (codec IDs read garbage, chipio_read returns -EIO).
-	 * Retry the CT-extensions-enable + clock-enable a few times until
-	 * ChipIO responds, so a flaky boot self-heals instead of needing a
-	 * manual power-cycle.
-	 */
-	for (attempt = 0; attempt < 5; attempt++) {
-		curr_chip_addx = ~0U;
-
-		/* Enable CT extensions on the chip control widget */
-		dsp_write(chip, WIDGET_CHIP_CTRL,
-			  VENDOR_CHIPIO_CT_EXTENSIONS_ENABLE, 1);
-		creative_dsp_enable_clocks(chip);
-
-		err = creative_dsp_chipio_read(chip, 0x801c, &val);
-		if (err == 0)
-			break;
-
-		dev_warn(chip->dev,
-			 "DSP prepare: ChipIO wedged (attempt %d, ret=%d), retrying\n",
-			 attempt + 1, err);
-		msleep(50);
-	}
-
-	if (err < 0) {
-		dev_err(chip->dev,
-			"DSP prepare: ChipIO not responding after retries\n");
-		return err;
-	}
-
-	/*
-	 * Set 96KHz clock flags for AE-9 before firmware download.
-	 *
-	 * Decompiled CA0132 v0.73_kernel18 ca0132_codec_init (line 24145):
-	 * For AE-series cards (is_ae_series bit 0 = 0, which includes AE-9),
-	 * DSP_96KHZ and DAC_96KHZ are set to TRUE before firmware download.
-	 * This is NOT in ae9_setup_defaults — it runs in codec_init, matching
-	 * the timing here (before firmware). Our standup previously set these
-	 * to FALSE, which was wrong both in value and timing.
-	 */
-	chipio_set_control_flag(chip, CONTROL_FLAG_DSP_96KHZ, 1);
-	chipio_set_control_flag(chip, CONTROL_FLAG_DAC_96KHZ, 1);
-
-	/*
-	 * Disable 8051 IDLE mode before firmware download.
-	 *
-	 * The decompiled driver does not explicitly set IDLE_ENABLE, but our
-	 * SPI HELLO path puts the 8051 in a different operational mode than
-	 * the pure Linux codec path. Without IDLE_ENABLE=0, the firmware's
-	 * IDLE logic halts the 8051 (halt=1) between audio processing steps,
-	 * preventing continuous audio frame processing. Setting it here (before
-	 * firmware download, matching the timing of other pre-firmware flag
-	 * setup) keeps the 8051 running during playback.
-	 */
-	chipio_set_control_flag(chip, CONTROL_FLAG_IDLE_ENABLE, 0);
-
-	/*
-	 * Windows-style chip reset BEFORE firmware download.
-	 */
-	creative_dsp_chipio_write(chip, 0x18b0a4, 0x000000c2);
-	/* Reset codec AFG (node 0x01) twice, as Windows does. */
-	verb_send(chip,
-		creative_ae9_verb(CAD, 0x01, 0x7ff, 0x00), &resp);
-	verb_send(chip,
-		creative_ae9_verb(CAD, 0x01, 0x7ff, 0x00), &resp);
-
-	/*
-	 * Force-clear DBGCNTL (0x100e30) to 0 after the AFG double-reset.
-	 *
-	 * Problem: DBGCNTL is a ChipIO register — it is NOT reset by GCTL
-	 * toggle. After bare-metal Windows shutdown, DBGCNTL=0xfff93c60
-	 * (halt_state=0xf = fatal exception) survives through our self-reset
-	 * sequence. When firmware DMA finishes, dsp_set_run_state() inside
-	 * dspload_image cannot clear halt=0xf (STATE bits [13:10] are set by
-	 * the 8051 hardware exception mechanism and can only be cleared by
-	 * putting the DSP core into a clean reset state).
-	 *
-	 * The two AFG resets (verb 0x7ff × 2) above put the DSP core into
-	 * hardware reset. At this point the STATE bits in DBGCNTL become
-	 * clearable. Writing 0 unconditionally clears all halt/exception bits,
-	 * giving the 8051 a clean slate to boot from the incoming firmware.
-	 *
-	 * Confirmed from decompiled Creative CA0132 v0.73_kernel18 (DWARF5):
-	 * the decompiled driver never encounters halt=0xf before firmware load
-	 * (it always loads from cold), so it never needs this explicit clear.
-	 * Our self-reset path does encounter it, hence the explicit write here.
-	 */
-	{
-		unsigned int dbg_before = 0, dbg_after = 0;
-		creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET,
-					 &dbg_before);
-		creative_dsp_chipio_write(chip, DSP_DBGCNTL_INST_OFFSET, 0);
-		creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET,
-					 &dbg_after);
-		dev_info(chip->dev,
-			 "DSP prepare: DBGCNTL 0x%x→0x%x (halt %u→%u) after force-clear\n",
-			 dbg_before, dbg_after,
-			 (dbg_before & DSP_DBGCNTL_STATE_MASK) >>
-				DSP_DBGCNTL_STATE_LOBIT,
-			 (dbg_after & DSP_DBGCNTL_STATE_MASK) >>
-				DSP_DBGCNTL_STATE_LOBIT);
-	}
-
-	/* sanity: read a DSP debug register via ChipIO */
-	err = creative_dsp_chipio_read(chip, 0x801c, &val);
-	dev_info(chip->dev, "DSP prepare: chipio_read(0x801c)=0x%x ret=%d\n",
-		 val, err);
-	return err;
+	/* the pre-download replay already sent the codec verbs in Windows'
+	 * order (CT extensions, clocks, flags, AFG resets, DSP init) */
+	return 0;
 }
 
