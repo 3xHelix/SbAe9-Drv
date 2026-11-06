@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.8):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.9):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -33,7 +33,7 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.8 pairs with SbAe9-SBC v0.11.2 (phantom power button, What U
+> Driver v0.9.9 pairs with SbAe9-SBC v0.11.2 (phantom power button, What U
 > Hear rate picker, rates per mode incl. 176.4 kHz, ignores virtual PipeWire devices); older SbC versions still work, with
 > fewer controls.
 
@@ -60,11 +60,63 @@ playback.
 
 ## Setup
 
+### Fedora: install from COPR (recommended)
+
+Packages for every release, with the module rebuilt for each new kernel by
+akmods (Fedora's usual way for out-of-tree drivers). They also do steps 3
+and 4 below for you.
+
+```sh
+sudo dnf copr enable 3xhelix/SbAe9-Drv
+sudo dnf install creative-ae9
+```
+
+akmods builds the module right after the install, which takes about a
+minute (`modinfo -n snd-hda-codec-creative-ae9` shows it once it's there).
+Then install the firmware (next section) and power the PC fully off and on.
+
+**Fedora Atomic** (Silverblue, Kinoite and the other rpm-ostree desktops):
+
+```sh
+sudo curl -o /etc/yum.repos.d/SbAe9-Drv.repo https://copr.fedorainfracloud.org/coprs/3xhelix/SbAe9-Drv/repo/fedora-$(rpm -E %fedora)/3xhelix-SbAe9-Drv-fedora-$(rpm -E %fedora).repo
+rpm-ostree install creative-ae9
+```
+
+Reboot into the new deployment, install the firmware, reboot once more
+(the firmware location becomes a kernel option there; see below).
+
+**Secure Boot:** akmods signs the module with a key of its own. Enroll it
+once with `sudo mokutil --import /etc/pki/akmods/certs/public_key.der`,
+reboot, and confirm the enrollment in the blue MOK screen. Without that,
+a Secure Boot kernel refuses the module.
+
+**Moving over from DKMS or a hand install:** remove that first (see "One
+install method per machine" below), then install the package.
+
+Packages: `creative-ae9` (boot setup, PipeWire profiles, `ae9-get-firmware`,
+`ae9-full-dump`) pulls in `akmod-creative-ae9` (the module).
+`sudo dnf remove creative-ae9 akmod-creative-ae9` takes it all out.
+
 ### 1. Firmware
 
-The DSP firmware isn't in the repo; extract it from Creative's Windows driver.
-Get the "Sound Blaster AE-Series Driver" package from Creative, unpack it, and
-find `AESeriesDriver/Driver/AMD64/CtxHda.sys`. Then:
+The DSP firmware isn't in the repo or the packages: it's Creative's. Get the
+"Sound Blaster AE-Series Driver" package from Creative, unpack it, and find
+`AESeriesDriver/Driver/AMD64/CtxHda.sys` (a Windows install has it as
+`C:\Windows\System32\drivers\CtxHda.sys`). Then:
+
+```sh
+sudo ae9-get-firmware /path/to/CtxHda.sys          # installed from the package
+sudo scripts/ae9-get-firmware.sh /path/to/CtxHda.sys   # from this repo
+```
+
+It extracts both images (the main DSP image and the AE-9 overlay), checks
+them against the MD5 of the firmware this driver is tested with
+(`85c8f2b4…` main image, `0e222c94…` overlay), and installs them to
+`/lib/firmware`. On Fedora Atomic it uses `/etc/firmware` and adds the kernel
+option `firmware_class.path=/etc/firmware`, active after the next reboot.
+`ae9-get-firmware --check` shows what's installed.
+
+By hand, the same thing:
 
 ```sh
 python3 extract_firmware.py /path/to/CtxHda.sys ctefx-desktop.bin   # main DSP image
@@ -72,14 +124,12 @@ python3 extract_overlay.py  /path/to/CtxHda.sys ctefx-ae9-overlay.bin
 sudo cp ctefx-desktop.bin ctefx-ae9-overlay.bin /lib/firmware/
 ```
 
-Both scripts check the extracted image against the MD5 of the firmware this
-driver is tested with (`85c8f2b4…` main image, `0e222c94…` overlay) and
-refuse a different one unless you pass `--force`.
+Both scripts refuse a different image unless you pass `--force`.
 
-### 2. Build and install
+### 2. Build and install (other distributions, or from source)
 
-**With DKMS (recommended):** new kernels get the driver rebuilt
-automatically, nothing to redo after a kernel update.
+**With DKMS:** new kernels get the driver rebuilt automatically, nothing to
+redo after a kernel update.
 
 ```sh
 sudo dnf install dkms kernel-devel     # once
@@ -127,8 +177,8 @@ sudo cp config/ae9-options.conf /etc/modprobe.d/          # optional: debug/tuni
 sudo dracut -f
 ```
 
-`ae9-override.conf` hardcodes the card's PCI address (`0000:06:00.0`); check
-yours with `lspci -d 1102:0010` and edit it. The module must load from the
+Both find the card by its IDs, in any slot (since 0.9.9; before, the
+modprobe file had the PCI address written in). The module must load from the
 root filesystem (after `/lib/firmware` is available), which is what the
 dracut omit is for.
 

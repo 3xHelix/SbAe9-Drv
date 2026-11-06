@@ -3,6 +3,28 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.9.9 (2026-11-06)
+Fedora packages: install with dnf, updates with your kernel. 📦
+Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC), as 0.9.8.
+
+- **Packages for Fedora and Fedora Atomic** in the COPR repository
+  `3xhelix/SbAe9-Drv`: `sudo dnf copr enable 3xhelix/SbAe9-Drv && sudo dnf
+  install creative-ae9`. akmods rebuilds the module for every new kernel, so
+  nothing to redo after a kernel update. On Silverblue, Kinoite and the other
+  rpm-ostree desktops: `rpm-ostree install creative-ae9` (README). The
+  package also sets up the boot binding and the PipeWire profiles.
+- **`ae9-get-firmware`**: one command extracts the DSP firmware from your
+  copy of Creative's driver, checks it and installs it
+  (`sudo ae9-get-firmware /path/to/CtxHda.sys`; `--check` shows what's
+  there). On Fedora Atomic it uses `/etc/firmware` and sets the kernel
+  option that points there.
+- **The boot binding finds the card by its IDs**: `config/ae9-override.conf`
+  no longer has the PCI address written in, so it works in any slot with
+  nothing to edit. Hand installs: copy the new file over the old one.
+- No driver code changes: the module is the same as 0.9.8.
+
+-- 3xHelix
+
 ## 0.9.8 (2026-11-06)
 AE-9s behind an ASMedia bridge work. 🎉
 Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC).

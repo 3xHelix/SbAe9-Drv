@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# The non-module half of the AE-9 driver: hands the card to the driver at
+# boot (instead of snd_hda_intel), PipeWire profiles, the firmware helper and
+# the dump script. Pulls in the akmod.
+%global srcname SbAe9-Drv
+
+Name:           creative-ae9
+Version:        0.9.9
+Release:        1%{?dist}
+Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
+License:        GPL-2.0-or-later
+URL:            https://github.com/3xHelix/%{srcname}
+Source0:        %{url}/archive/v%{version}/%{srcname}-%{version}.tar.gz
+BuildArch:      noarch
+
+BuildRequires:  systemd-rpm-macros
+# the akmod/kmod packages want this
+Provides:       %{name}-kmod-common = %{version}
+Requires:       %{name}-kmod >= %{version}
+# firmware extraction
+Requires:       python3
+
+%description
+Everything around the AE-9 kernel module except the module itself:
+- a udev rule and a modprobe fallback that hand the AE-9 to this driver at
+  boot instead of snd_hda_intel (found by its PCI IDs, any slot)
+- keeps the module out of the initramfs (it needs the root filesystem's
+  firmware)
+- the PipeWire profile set (stereo duplex and 5.1)
+- ae9-get-firmware: extracts the DSP firmware from your copy of Creative's
+  Windows driver and installs it (also on read-only Fedora Atomic systems)
+- ae9-full-dump: the state dump for bug reports
+
+The firmware itself is Creative's and not included.
+
+%prep
+%setup -q -n %{srcname}-%{version}
+
+%build
+
+%install
+install -D -m 644 config/00-ae9-override.rules %{buildroot}%{_udevrulesdir}/00-ae9-override.rules
+install -D -m 644 config/89-ae9-pipewire.rules %{buildroot}%{_udevrulesdir}/89-ae9-pipewire.rules
+install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-override.conf
+install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
+install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
+install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
+install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
+# optional extras, copied by hand if wanted (see README)
+for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf; do
+	install -D -m 644 config/$f %{buildroot}%{_datadir}/%{name}/examples/$f
+done
+
+%post
+udevadm control --reload >/dev/null 2>&1 || :
+if [ "$1" -eq 1 ]; then
+	echo "creative-ae9: the DSP firmware isn't included. Install it with"
+	echo "  sudo ae9-get-firmware /path/to/CtxHda.sys"
+	echo "(from Creative's AE-Series driver package), then power the PC fully off and on."
+fi
+
+%postun
+udevadm control --reload >/dev/null 2>&1 || :
+
+%files
+%license COPYING
+%doc README.md CHANGELOG.md
+%{_udevrulesdir}/00-ae9-override.rules
+%{_udevrulesdir}/89-ae9-pipewire.rules
+%{_modprobedir}/ae9-override.conf
+%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+%{_bindir}/ae9-get-firmware
+%{_bindir}/ae9-full-dump
+%{_datadir}/%{name}/
+
+%changelog
+* Fri Nov 06 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.9.9-1
+- First package: boot setup, PipeWire profiles, firmware helper, dump script
