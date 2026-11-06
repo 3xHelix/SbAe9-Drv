@@ -30,6 +30,21 @@ MODULE_PARM_DESC(ring_irq, "Command-ring interrupts (1=on, default; 0=off, diagn
 
 #define CORBCTL_RUN	(ring_irq ? 0x03 : 0x02)	/* run (+ memory-error irq) */
 
+/*
+ * ring_order: 0 = our long-standing order (default on master): the run bits are set
+ * before the ring base addresses, the ring sizes after the rings run.
+ * 1 = Windows' effective order and the HD Audio spec's: both DMA engines
+ * stopped (and seen stopped) while the base addresses and sizes are set,
+ * then switched on. Windows writes the run bits too, but resets the
+ * controller right after, which clears them (cold capture 2026-11-03,
+ * 23:24:10.544-.608). For ASMedia-bridged cards (bugzilla 219552), where
+ * a stray ring DMA before the bases are valid may be what takes the
+ * bridge down.
+ */
+static unsigned int ring_order = 1;	/* asmedia-debug: Windows' order (round 3c) */
+module_param(ring_order, uint, 0444);
+MODULE_PARM_DESC(ring_order, "Command-ring start order: 0 = as before, 1 = addresses and sizes while stopped, as Windows and the HDA spec (default on this branch)");
+
 int creative_ae9_corb_init(struct creative_chip *chip)
 {
 	u32 corb_addr_low, corb_addr_high;
@@ -118,12 +133,24 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0x00);
 	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x00);
 
-	/* Step 3: CORBCTL = 0x03 and RIRBCTL = 0x07 BEFORE base addresses.
-	 * Fresh capture confirms this order (lines 187-188).
-	 */
-	creative_hda_writeb(chip, AZX_REG_CORBCTL, CORBCTL_RUN);
-	creative_hda_writeb(chip, AZX_REG_RIRBCTL, ring_irq ? 0x07 : 0x02);
-	wmb();
+	if (ring_order) {
+		unsigned int t;
+
+		/* wait (up to 1 ms) for both DMA engines to report stopped */
+		for (t = 0; t < 100; t++) {
+			if (!(creative_hda_readb(chip, AZX_REG_CORBCTL) & 0x02) &&
+			    !(creative_hda_readb(chip, AZX_REG_RIRBCTL) & 0x02))
+				break;
+			udelay(10);
+		}
+	} else {
+		/* Step 3: CORBCTL = 0x03 and RIRBCTL = 0x07 BEFORE base
+		 * addresses, as the first two writes of the capture (which
+		 * then resets the controller; see ring_order). */
+		creative_hda_writeb(chip, AZX_REG_CORBCTL, CORBCTL_RUN);
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, ring_irq ? 0x07 : 0x02);
+		wmb();
+	}
 
 	/* Step 3: write CORB and RIRB base addresses */
 	corb_addr_low  = (u32)(chip->corb_dma & 0xffffffff);
@@ -135,6 +162,13 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	rirb_addr_high = (u32)((chip->rirb_dma >> 32) & 0xffffffff);
 	creative_hda_writel(chip, AZX_REG_RIRBUBASE, rirb_addr_high);
 	creative_hda_writel(chip, AZX_REG_RIRBLBASE, rirb_addr_low);
+
+	/* ring_order=1: the sizes too while stopped (256 entries) */
+	if (ring_order) {
+		creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
+		creative_hda_writeb(chip, AZX_REG_RIRBSIZE, 0x0a);
+		wmb();
+	}
 
 	/* Step 4: INTCTL — CIE (bit 30), then GIE (bit 31) + CIE, as Windows
 	 * does. Stream interrupt enables (bits 0-29) are set per stream in
@@ -201,8 +235,10 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 * CA0132 appears to ignore CORBSIZE (live dump shows 0x00 with
 	 * CORBWP=58 and no wrap), but we set it for spec compliance.
 	 */
-	creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
-	creative_hda_writeb(chip, AZX_REG_RIRBSIZE, 0x0a);
+	if (!ring_order) {
+		creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
+		creative_hda_writeb(chip, AZX_REG_RIRBSIZE, 0x0a);
+	}
 
 	/* Seed CORBWP from the current CORBRP so the engine starts cleanly */
 	chip->corb_wp = readw(chip->hda_regs + AZX_REG_CORBRP) & 0xff;
@@ -214,7 +250,8 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	udelay(10);
 
 	ctl = creative_hda_readb(chip, AZX_REG_CORBCTL);
-	dev_info(chip->dev, "CORBCTL=0x%02x (expected 0x%02x)\n", ctl, ring_irq ? 0x01 : 0x00);
+	dev_info(chip->dev, "CORBCTL=0x%02x (expected 0x%02x)%s\n", ctl, ring_irq ? 0x01 : 0x00,
+		 ring_order ? " (ring_order=1: addresses and sizes set while stopped)" : "");
 	ctl = creative_hda_readb(chip, AZX_REG_RINTCNT);
 	dev_info(chip->dev, "RINTCNT=0x%02x (expected 0xc0)\n", ctl);
 	dev_info(chip->dev, "RIRBCTL=0x%02x (expected 0x%02x)\n",
