@@ -835,11 +835,57 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 
 /* ------------------------------------------------------------------ */
 /* Capture: input stream 0 (BAR0+0x80), tag 1, from codec 1 node 0x07	  */
-/* (the head unit's XLR input), as in the Windows recording capture.	  */
+/* (the head unit's input: the XLR/TRS combo and the 3.5 mm line-in	  */
+/* share it; Windows lists them as Microphone and Aux), as in the	  */
+/* Windows recording capture. 48 or 96 kHz (Creative: mic up to 96 kHz); */
+/* Windows' 96 kHz recording is the stream format 0x831 and the same	  */
+/* format on node 0x07, nothing else (VM capture 2026-11-05).		  */
 /* ------------------------------------------------------------------ */
 #define CREATIVE_CAP_STREAM_BASE	0x80	/* input stream descriptor 0 */
 #define CREATIVE_CAP_STREAM_TAG		1
 #define CREATIVE_CAP_BDL_MAX		8
+
+/*
+ * cap_bits: the recording's sample bits, 24 (default) or 32, as Windows'
+ * recording format choice (VM captures 2026-11-03: node 0x07 format 0x41 /
+ * 0x841 at 32-bit). Same S32_LE container either way; taken at the next
+ * recording start, like "PCM Bit Depth" for playback.
+ */
+static unsigned int cap_bits = 24;
+module_param(cap_bits, uint, 0644);
+MODULE_PARM_DESC(cap_bits, "Recording sample bits: 24 (default) or 32; also the 'Capture Bit Depth' control");
+
+static int cap_bits_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.enumerated.item[0] = cap_bits == 32;
+	return 0;
+}
+
+static int cap_bits_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	unsigned int want = uv->value.enumerated.item[0] ? 32 : 24;
+
+	if (uv->value.enumerated.item[0] > 1)
+		return -EINVAL;
+	if (want == (cap_bits == 32 ? 32 : 24))
+		return 0;
+	cap_bits = want;	/* the next recording opens with it */
+	return 1;
+}
+
+static const struct snd_kcontrol_new cap_bits_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Capture Bit Depth",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = pcm_bits_info,		/* "24-bit", "32-bit" */
+	.get = cap_bits_get,
+	.put = cap_bits_put,
+};
+
+static unsigned int cap_bits_now(void)
+{
+	return cap_bits == 32 ? 32 : 24;
+}
 
 static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 {
@@ -849,19 +895,20 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 	chip->capture_substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
-	/* Windows: format 0x31 (2 ch, 24-bit in 32-bit containers, 48 kHz) */
+	/* Windows: format 0x31 (2 ch, 24-bit in 32-bit containers, 48 kHz),
+	 * 0x831 at 96 kHz */
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	runtime->hw.rates = SNDRV_PCM_RATE_48000;
+	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000;
 	runtime->hw.rate_min = 48000;
-	runtime->hw.rate_max = 48000;
-	runtime->hw.buffer_bytes_max = 64 * 1024;
+	runtime->hw.rate_max = 96000;
+	runtime->hw.buffer_bytes_max = 128 * 1024;	/* ~170 ms at 96 kHz */
 	runtime->hw.period_bytes_min = 1920;	/* 5 ms */
 	runtime->hw.period_bytes_max = 32 * 1024;
 	runtime->hw.periods_min = 2;
 	runtime->hw.periods_max = CREATIVE_CAP_BDL_MAX;
-	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
+	snd_pcm_hw_constraint_msbits(runtime, 0, 32, cap_bits_now());
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	chip->cap_start_sent = 0;
 	return 0;
@@ -958,13 +1005,16 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, period * periods);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, periods - 1);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT,
-			    creative_ae9_stream_format(runtime->channels, 24,
+			    creative_ae9_stream_format(runtime->channels, cap_bits_now(),
 						    runtime->rate));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
 
 	/* Windows' start block once per open (re-prepares after an xrun
-	 * must not resend it) */
+	 * must not resend it), with node 0x07 given this recording's format
+	 * before its bind (see creative_ae9_cap_replay) */
+	chip->cap_format = creative_ae9_stream_format(runtime->channels, cap_bits_now(),
+						      runtime->rate);
 	if (!chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, true);
 		if (chip->mic_level != 99)
@@ -1351,6 +1401,9 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	ret = snd_ctl_add(chip->card, snd_ctl_new1(&pcm_bits_control, chip));
 	if (ret < 0)
 		dev_warn(chip->dev, "PCM Bit Depth control not added (%d)\n", ret);
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&cap_bits_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "Capture Bit Depth control not added (%d)\n", ret);
 
 	/* optical: out follows the main stream, in is PCM device 1 */
 	chip->spdif_out = spdif_out;

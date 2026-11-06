@@ -7,9 +7,9 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.1):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
-> Recording from the head unit's XLR mic input works (arecord, Audacity).
+> Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
 > to 24-bit/192 kHz), in is its own recording device. What U Hear records
 > what the card plays.
@@ -175,8 +175,17 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
   PipeWire resamples those files when they're left out. `pcm_rates=0`
   limits the card to 48 kHz.
-- Recording: the head unit's XLR mic input (`arecord -D hw:AE9 -c 2 -r 48000
-  -f S32_LE`, or the AE-9 input in PipeWire/Audacity). "XLR Gain" sets
+- Recording: the head unit's input, at 48 or 96 kHz (`arecord -D hw:AE9 -c 2
+  -r 96000 -f S32_LE`, or the AE-9 input in PipeWire/Audacity). The XLR/TRS
+  combo and the head unit's 3.5 mm line-in share it (Windows lists them as
+  Microphone and Aux; the mic's own mute switch affects both). "Capture Bit
+  Depth" picks 24-bit (default) or 32-bit samples, as Windows' recording
+  format choice (`amixer -c AE9 cset name='Capture Bit Depth' 32-bit`; it
+  takes effect at the next recording start). For a clearer
+  desktop name, copy `config/61-ae9-names.conf` to
+  `~/.config/wireplumber/wireplumber.conf.d/` and run
+  `systemctl --user restart wireplumber`: the source shows as "AE-9 Mic /
+  Line In" (node names stay the same). "XLR Gain" sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
   `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'XLR Gain' 0|1|2`. "Capture"
   is the mic level, -89 to +9 dB in 1 dB steps with mute at 0 (default +9 dB,
@@ -383,6 +392,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 | `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
 | `config/ae9-what-u-hear.conf` | Optional PipeWire source for What U Hear (see "What U Hear") |
+| `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Mic / Line In" |
 
 ## Module parameters
 
@@ -447,6 +457,8 @@ code path for comparison:
   commands only when the rate or output changed (each send makes it
   re-lock, a brief hiccup); 0 sends them at every start, as Windows.
 
+- Recording: `cap_bits` (24, writable at runtime; also the "Capture Bit
+  Depth" control) 24- or 32-bit recording samples.
 - Optical: `spdif_out` (1, writable at runtime; also the "Optical Out
   Playback Switch") optical out follows the main output; 0 keeps it
   silent.

@@ -1657,11 +1657,22 @@ void creative_ae9_cap_replay(struct creative_chip *chip, bool start)
 	if (!chip->corb_buf)
 		return;
 	if (start) {
+		/* Windows' start block sets node 0x07 to its 48 kHz format
+		 * (0x10720031) and then binds it (0x10770610). The codec takes
+		 * the rate at the bind, so the recording's own format goes in
+		 * that slot, before the bind: changing it after left a 96 kHz
+		 * recording getting 48 kHz-rate data (2026-11-06). */
+		u32 start_blk[ARRAY_SIZE(ae9_cap_start)];
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(ae9_cap_start); i++)
+			start_blk[i] = ae9_cap_start[i] == 0x10720031 && chip->cap_format ?
+				       0x10720000 | chip->cap_format : ae9_cap_start[i];
 		creative_ae9_verb_block_replay(chip, ae9_cap_level,
 					       ARRAY_SIZE(ae9_cap_level), false,
 					       "capture: level block");
-		creative_ae9_verb_block_replay(chip, ae9_cap_start,
-					       ARRAY_SIZE(ae9_cap_start), false,
+		creative_ae9_verb_block_replay(chip, start_blk,
+					       ARRAY_SIZE(start_blk), false,
 					       "capture: record start block");
 	} else {
 		creative_ae9_verb_block_replay(chip, ae9_cap_stop,

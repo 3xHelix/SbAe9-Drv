@@ -3,6 +3,23 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.1 (2026-11-06)
+
+The mic gets the same treatment as the speakers. 🎙️
+
+- Recording at 96 kHz too (head unit's XLR and 3.5 mm input; Creative's
+  limit). The trick was the order: the codec takes its rate when it's
+  bound to the stream, so the recording's format now goes in before the
+  bind, as Windows does. Before that a 96 kHz recording got 48 kHz-rate
+  data and played back twice as fast.
+- 24- or 32-bit recording, as Windows offers ("Capture Bit Depth"). At
+  32-bit the card sends full 32-bit samples (the mic path runs through the
+  DSP); it sounds the same, the extra bits sit below the mic's noise floor.
+- "Aux" solved: Windows' Aux device is the head unit's 3.5 mm line-in,
+  which shares the XLR/TRS input, so it already worked.
+  `config/61-ae9-names.conf` names that input "AE-9 Mic / Line In" in the
+  desktop.
+
 ## 0.9.0 (2026-11-06)
 
 Now it can hear itself. 👂
