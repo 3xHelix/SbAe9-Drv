@@ -3,6 +3,23 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.6 (2026-11-06)
+
+A fix for 44.1/88.2 kHz, found with the dump script's new check. 🩹
+Pairs with [SbAe9-SBC v0.11.0](https://github.com/3xHelix/SbAe9-SBC), as 0.9.5.
+
+- **Fixed: 44.1 and 88.2 kHz went silent after a 384 kHz stream**, and stayed
+  silent (also after idle) until something played at 48, 96 or 192 kHz. The
+  384 kHz stream left the card's I2S on its 384 kHz clocks, where the
+  sample-rate converter these rates use won't start. A 44.1/88.2 kHz start
+  now sets the I2S to its 48 kHz clocks first, as Windows' driver does.
+  `src_reclock=0` goes back to the old behaviour.
+- `scripts/ae9-full-dump.sh` reads a few more card registers (the I2S check
+  registers Windows' driver uses, and some power registers), to compare
+  against the AE-9's usual values when something goes quiet.
+
+-- 3xHelix
+
 ## 0.9.5 (2026-11-06)
 
 Phantom power from the desktop, What U Hear at 96 kHz, and a big tidy-up. 🎙️

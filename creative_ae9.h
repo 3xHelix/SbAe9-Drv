@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.5"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.6"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
