@@ -1129,8 +1129,7 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 /*     0x13, "What U Hear In"), input stream 2 (BAR0+0xc0), tag 3. What */
 /*     the card plays, both with Direct Mode on and off (with SBX off it */
 /*     is the stream as sent: a 440 Hz test tone came back level-exact  */
-/*     on both channels). 48 kHz: the DSP's What U Hear connection is	  */
-/*     set to 48 kHz at boot.						  */
+/*     on both channels). 48 or 96 kHz (wuh_96k).			  */
 /* ------------------------------------------------------------------ */
 struct ae9_xcap {
 	const char	*name;
@@ -1147,6 +1146,21 @@ static const struct ae9_xcap ae9_xcaps[2] = {
 	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
 	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
 };
+#define AE9_XCAP_WUH	1
+
+/*
+ * What U Hear at 96 kHz: only the stream and ADC 0x0a format change, as
+ * the mic's 96 kHz recording. Tested 2026-11-06: a 440 Hz tone comes back
+ * at 440 Hz and the same level (-23.1 dBFS, L == R) with the card playing
+ * at 48 or 96 kHz. Also moving its DSP connection point (ca0132's
+ * MEM_CONNID_WUH = 0x0a, 48 kHz from Windows' boot table) to 96 kHz was
+ * wrong: ~810 Hz, 3 dB low. Leave it at 48 kHz.
+ */
+static bool wuh_96k = true;
+module_param(wuh_96k, bool, 0644);
+MODULE_PARM_DESC(wuh_96k, "What U Hear at 48 or 96 kHz (1 = yes, default; 0 = 48 kHz only)");
+
+
 
 /* PCM device n (1, 2) -> table index */
 static unsigned int ae9_xcap_idx(struct snd_pcm_substream *substream)
@@ -1186,6 +1200,10 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 	runtime->hw.rates = x->rates;
 	runtime->hw.rate_min = x->rate_min;
 	runtime->hw.rate_max = x->rate_max;
+	if (i == AE9_XCAP_WUH && wuh_96k) {
+		runtime->hw.rates |= SNDRV_PCM_RATE_96000;
+		runtime->hw.rate_max = 96000;
+	}
 	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
 	runtime->hw.period_bytes_min = 1024;
 	runtime->hw.period_bytes_max = CREATIVE_PCM_BUF_MAX / 2;

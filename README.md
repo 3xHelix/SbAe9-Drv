@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.4):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.5):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -33,8 +33,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.4 pairs with SbAe9-SBC v0.10.0 (its rate picker knows each
-> mode's rates); older SbC versions still work, with shorter rate lists.
+> Driver v0.9.5 pairs with SbAe9-SBC v0.11.0 (phantom power button, What U
+> Hear rate picker, rates per mode); older SbC versions still work, with
+> fewer controls.
 
 ## Hardware / Environment
 
@@ -160,6 +161,12 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   headphone jack) and "Head Unit 3.5mm Mic Plugged" (its 3.5 mm mic jack)
   show what's plugged in, read-only, for apps to show. The 1/4" headphone
   jack and the XLR/TRS jack don't report plugs.
+- Phantom power: "Head Unit Phantom Power" shows and switches the head
+  unit's 48 V phantom power for the XLR/TRS jack (its own button works too).
+  It always starts off, and switching it on is refused for 30 s after the
+  card starts or wakes, so a restored mixer state can't turn 48 V on by
+  itself. Only turn it on for mics that need it: 48 V can damage some gear
+  (ribbon mics, some line-level sources).
 - Auto switch: "Head Unit Auto Switch" (off by default) makes the head unit's
   3.5 mm headphone jack switch outputs: plug in = headphones, unplug = speakers,
   about 1.5 s after the plug settles. Off, plugs change nothing. The
@@ -228,8 +235,11 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     otherwise). With nothing sending, recording fails at once and the
     kernel log says "no signal on the optical input".
 - What U Hear (new): records what the card plays, as its own capture
-  device, `hw:AE9,2` ("AE-9 What U Hear"), 48 kHz, next to the XLR mic and
-  optical in (`arecord -D hw:AE9,2 -c 2 -r 48000 -f S32_LE out.wav`). It
+  device, `hw:AE9,2` ("AE-9 What U Hear"), 48 or 96 kHz (96 kHz since
+  0.9.5, `wuh_96k`), next to the XLR mic and optical in
+  (`arecord -D hw:AE9,2 -c 2 -r 96000 -f S32_LE out.wav`). The PipeWire
+  config below records at 48 kHz; change its `audio.rate` to 96000 for
+  96 kHz. It
   works in Direct Mode and through the DSP; with SBX off it's the stream
   exactly as sent (a test tone comes back level-exact on both channels).
   For PipeWire, copy `config/ae9-what-u-hear.conf` to
@@ -428,7 +438,7 @@ code path for comparison:
   pre-download init as Windows does it (815-verb cold table).
 - `fw_split`, `dl_windows`, `dl_reset_chunks` (default 1), `dl_bdl64`
   (default 1), `hs_immediate`, `scp_event`, `scp_win_read`, `chipio_nocache`,
-  `sentinel_clear=0`, `lineout_prerun=0`, `loop_start=0` —
+  `sentinel_clear=0` —
   firmware download, DSP start and the MASTERCONTROL boot handshake.
 - `overlay` — transfer the DSP overlay image during the handshake.
 - `surround` (default 1, writable at runtime) — 6-channel (5.1) playback and
@@ -444,6 +454,8 @@ code path for comparison:
   kHz, 1 = without 44.1/88.2 kHz, 0 = 48 kHz only. `dac_441` (1) sends
   Windows' DAC commands for 44.1/88.2 kHz (without them those rates play
   garbled or silent).
+- `wuh_96k` (1, writable at runtime) — What U Hear at 48 or 96 kHz
+  (0.9.5); 0 = 48 kHz only.
 - `dsp_96k` (1, writable at runtime) — 96 kHz with Direct Mode off, through
   the DSP (v0.9.4); 0 limits DSP mode to 48 kHz.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
@@ -457,9 +469,10 @@ code path for comparison:
 - `fw_verify` (default 0) — read the firmware back after download and count
   mismatches.
 - `ca0113_windows` — head-unit DAC commands with Windows' protocol/values.
-- `post_windows` — replay Windows' post-boot BAR2 activity (speaker mode),
-  Windows' head-unit poll, volume display, knob, and the ALSA controls
-  "Head Unit Playback Volume" / "Head Unit Playback Switch".
+- Head unit: the driver replays Windows' post-boot BAR2 activity (speaker
+  mode) and runs Windows' head-unit poll, volume display and knob, with the
+  ALSA controls "Head Unit Playback Volume" / "Head Unit Playback Switch"
+  (always on since 0.9.5; the old `post_windows=0` path is gone).
   `hu_master` (1) names the volume/mute "Master" for desktop sync;
   `warm_reset` (0) replays Windows' warm-DSP reset block before the
   download (1 = when the DSP reads dead, 2 = always; experimental);
@@ -498,7 +511,6 @@ Older parameters:
   off the card LEDs on this board).
 - `full_init` (default `0`) — replay captured codec init verbs (bitmask:
   1=cad1, 2=cad2, 3=both).
-- `enable_audio_path` (default `1`) — run DAC route + amp enable after ACM init.
 - `acm_first_delay_ms` / `acm_pass_gap_ms` / `acm_passes` / `acm_heartbeat_ms`
   (12 s / 4 s / 2 / 500 ms) — head-unit init and keepalive timing.
 

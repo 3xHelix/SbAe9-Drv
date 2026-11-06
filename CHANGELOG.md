@@ -3,6 +3,33 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.5 (2026-11-06)
+
+Phantom power from the desktop, What U Hear at 96 kHz, and a big tidy-up. 🎙️
+Pairs with [SbAe9-SBC v0.11.0](https://github.com/3xHelix/SbAe9-SBC), released
+alongside: its phantom power button (red when on, with a warning first) and
+a What U Hear rate picker (48/96 kHz).
+
+- **Phantom power can be switched from the PC.** "Head Unit Phantom Power"
+  shows and switches the head unit's 48 V phantom power for its XLR/TRS
+  jack; the head unit's own button works too. Windows' software can only
+  read it; the switch command was found on the card. It always starts off,
+  after boot and after waking, and "on" is refused for the first 30 s so a
+  restored mixer state can't turn 48 V on by itself. 48 V can damage some
+  gear (ribbon mics, some line-level sources): only turn it on for mics
+  that need it.
+- **What U Hear records at 48 or 96 kHz** (`hw:AE9,2`, `wuh_96k`, default
+  on), level-exact with the card playing at 48 or 96 kHz.
+- **Cleanup:** the old pre-Windows start-up path is gone (about 5,700
+  lines), with the module options only it used: `post_windows`,
+  `enable_audio_path`, `hu_boot_ms`, `loop_start`, `lineout_prerun`. A
+  leftover one in modprobe.d only logs "unknown parameter". Nothing changes
+  with the defaults.
+- Debug: `huframe <hex bytes>` in the debugfs `cmd` file sends one raw
+  head-unit frame and shows the reply.
+
+-- 3xHelix
+
 ## 0.9.4 (2026-11-06)
 
 More rates, more surround, and Direct Mode that switches cleanly. 🎚️
