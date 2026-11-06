@@ -3,6 +3,20 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.2 (2026-11-06)
+
+Tidy-ups, and a tool for anyone who hits a problem. 🧰
+
+- `scripts/ae9-full-dump.sh` ships with the driver: one command that saves
+  everything we can read about the card, for bug reports. It now also covers
+  the optical, What U Hear and extra capture streams.
+- Debug interface tidy-ups: `chipiow` is serialised like `chipior`, the
+  4-argument immediate-command `verb` is now `icwverb` (it could never run),
+  and `w0`/`w2` print the value written.
+- Waking from sleep with the knob light off: the light is now switched off
+  again by the head unit's regular poll, instead of a separate write that
+  could collide with it.
+
 ## 0.9.1 (2026-11-06)
 
 The mic gets the same treatment as the speakers. 🎙️

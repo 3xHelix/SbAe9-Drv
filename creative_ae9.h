@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.1"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.2"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +304,7 @@ struct creative_chip {
 	char			hu_text[9];	/* debugfs "hutext": held display text */
 	int			hu_switch_to;	/* pending output switch, -1 none */
 	unsigned int		hu_light;	/* knob light on */
+	int			hu_light_sent;	/* knob light as last sent, -1 unknown */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
 	bool			hu_sbx_press;	/* SBX button press to act on */
 	bool			hu_st07_valid;

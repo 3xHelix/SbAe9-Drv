@@ -2701,7 +2701,12 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 
 		if (sscanf(buf, "%7s %x %x", op, &a, &v) != 3)
 			return -EINVAL;
+		/* serialized with the driver's own ChipIO use, as chipior */
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		creative_dsp_chipio_addr_invalidate();
 		ret = creative_dsp_chipio_write(g_dbg_chip, a, v);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "chipiow[0x%x]=0x%x ret=%d\n", a, v, ret);
 		return len;
@@ -2739,8 +2744,12 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 
-	/* "verb <cad> <nid> <verbid> <payload>" — send one ICW verb */
-	if (!strncmp(buf, "verb", 4)) {
+	/* "icwverb <cad> <nid> <verbid> <payload>" — send one verb through the
+	 * immediate command interface (the one-argument "verb <hex>" above goes
+	 * through the CORB; this used to be "verb" too and could never run).
+	 * Once the command rings run, the immediate interface stays busy
+	 * (IRS 0x5): useful with corb_rings=0, otherwise it just times out. */
+	if (!strncmp(buf, "icwverb", 7)) {
 		unsigned int cad, nid, vid, pl;
 		u32 resp = 0;
 		int ret;
@@ -2750,7 +2759,7 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		ret = creative_ae9_icw_send_verb(g_dbg_chip,
 			creative_ae9_verb(cad, nid, vid, pl), &resp);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "verb cad=%x nid=%x v=%x p=%x -> ret=%d resp=0x%08x\n",
+			  "icwverb cad=%x nid=%x v=%x p=%x -> ret=%d resp=0x%08x\n",
 			  cad, nid, vid, pl, ret, resp);
 		return len;
 	}
@@ -2764,18 +2773,18 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 
 	if (!strcmp(op, "w2") && n == 3) {
 		creative_ext_writel(g_dbg_chip, off, val);
-		val = creative_ext_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "w2 0x%x <= 0x%x (rb 0x%x)\n", off, val, val);
+			  "w2 0x%x <= 0x%x (rb 0x%x)\n", off, val,
+			  creative_ext_readl(g_dbg_chip, off));
 	} else if (!strcmp(op, "r2")) {
 		val = creative_ext_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "r2 0x%x = 0x%x\n", off, val);
 	} else if (!strcmp(op, "w0") && n == 3) {
 		creative_hda_writel(g_dbg_chip, off, val);
-		val = creative_hda_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "w0 0x%x <= 0x%x (rb 0x%x)\n", off, val, val);
+			  "w0 0x%x <= 0x%x (rb 0x%x)\n", off, val,
+			  creative_hda_readl(g_dbg_chip, off));
 	} else if (!strcmp(op, "r0")) {
 		val = creative_hda_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
@@ -3256,6 +3265,7 @@ static void creative_ae9_hu_light(struct creative_chip *chip, unsigned int on)
 	u8 f[6] = { 0xf0, 0x22, 0x02, 0x02, !!on, 0xf7 }, resp[24];
 
 	chip->hu_light = !!on;
+	chip->hu_light_sent = !!on;
 	creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp));
 	dev_info(chip->dev, "head unit: knob light %s\n", on ? "on" : "off");
 }
@@ -3275,6 +3285,11 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		chip->hu_sbx_press = false;
 		creative_ae9_fx_sbx_toggle(chip);
 	}
+	/* knob light, when it isn't what the head unit last got (after a
+	 * resume): sent from here, the heartbeat, so its frames can't
+	 * interleave with the poll's */
+	if (chip->hu_light_sent != (int)chip->hu_light)
+		creative_ae9_hu_light(chip, chip->hu_light);
 	/* SBX LED: lit while the effects can run (Direct Mode off, SBX on) */
 	sbx_led = !chip->fx.direct && chip->fx.sbx;
 	if (sbx_led != chip->hu_sbx_led) {
@@ -3703,6 +3718,7 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_name_until = HU_SP_TICKS;
 	chip->hu_switch_to = -1;
 	chip->hu_light = 1;
+	chip->hu_light_sent = 1;	/* the head unit starts lit */
 	chip->hu_sbx_led = -1;
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
@@ -4795,8 +4811,9 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	chip->hu_dirty = 1;
 	if (want_hp)
 		chip->hu_switch_to = 1;
-	if (!chip->hu_light)
-		creative_ae9_hu_light(chip, 0);
+	/* the head unit wakes lit; if the light was off, the heartbeat turns
+	 * it off again (sending it from here raced the heartbeat's frames) */
+	chip->hu_light_sent = 1;
 	chip->hu_sbx_led = -1;		/* heartbeat sends it again */
 	creative_ae9_mic_boost_apply(chip);
 	if (chip->mic_level != 99)
