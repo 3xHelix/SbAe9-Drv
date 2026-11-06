@@ -1960,6 +1960,18 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 		const struct ae9_bar2_op *o = &ae9_cold_bar2_post[i];
 		u8 resp[32];
 
+		/* An ASMedia-bridge card went quiet in this step (bugzilla
+		 * 219552, round 3c): stop at the first all-ones read and say
+		 * which step, so the log shows the write that killed it. */
+		if (creative_ae9_gone(chip, "post-boot head-unit replay")) {
+			const struct ae9_bar2_op *p = i ? o - 1 : o;
+
+			dev_err(chip->dev,
+				"post_windows: card gone before step %zu of %zu; last step sent: %c 0x%x = 0x%x\n",
+				i + 1, ARRAY_SIZE(ae9_cold_bar2_post), p->type,
+				p->off, p->val);
+			return;
+		}
 		switch (o->type) {
 		case 'S':
 			if (creative_spi_frame_win(chip, o->data, o->len,
