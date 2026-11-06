@@ -71,6 +71,25 @@ for a in 0x189000 0x189004 0x189008 0x189024 0x189028 0x18b008 0x18a020 0x18a024
 	printf '%-9s %s\n' "$a" "$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')"
 done
 
+sec "ChipIO: I2S output check and power registers (names from Creative's Windows driver)"
+# Windows' I2S DAC check (for its I2S-DAC cards) wants 0x189030 = 0x82 and
+# 0x18902c = 3. A healthy AE-9 reads 0x81 / 0xf instead (2026-11-06, idle,
+# audio fine; 0x81 = the rate class the 0x725 request sets for 44.1-192 kHz),
+# so the notes compare against the AE-9's own values. 0x18b030 = PMR1 (bit 4
+# PDSNS, bit 3 SNSP); 0x18b0a4 bit 1 is set at codec start-up; 0x18b008 bit 3
+# is cleared at every stream start.
+for a in 0x189030 0x18902c 0x18b030 0x18b0a4 0x18b008; do
+	v=$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')
+	note=""
+	case $a in
+	0x189030) [ "$v" = "=0x81" ] && note="as usual (AE-9 0x81)" || note="<-- differs from the AE-9's usual 0x81" ;;
+	0x18902c) [ "$v" = "=0xf" ] && note="as usual (AE-9 0xf)" || note="<-- differs from the AE-9's usual 0xf" ;;
+	esac
+	printf '%-9s %-12s %s\n' "$a" "$v" "$note"
+done
+echo "--- BAR2 0x800 block (codec 2): 0x86c bit 0 enable, 0x89c bit 0 ack, 0x800 mode"
+for o in 0x800 0x804 0x86c 0x89c; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
+
 sec "ChipIO: DSP (DBGCNTL x4, fw flags, overlay check, DMA)"
 for a in 0x100e30 0x100e30 0x100e30 0x100e30 0x801c 0x40004 0x3f3b4 0x110f00 0x110f04 0x110f08 0x110ff0 0x110ff8; do
 	printf '%-9s %s\n' "$a" "$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')"

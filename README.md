@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.4):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.6):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -33,8 +33,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.4 pairs with SbAe9-SBC v0.10.0 (its rate picker knows each
-> mode's rates); older SbC versions still work, with shorter rate lists.
+> Driver v0.9.6 pairs with SbAe9-SBC v0.11.0 (phantom power button, What U
+> Hear rate picker, rates per mode); older SbC versions still work, with
+> fewer controls.
 
 ## Hardware / Environment
 
@@ -452,7 +453,8 @@ code path for comparison:
 - `pcm_rates` (2, writable at runtime) — playback rates: 2 = 44.1-384
   kHz, 1 = without 44.1/88.2 kHz, 0 = 48 kHz only. `dac_441` (1) sends
   Windows' DAC commands for 44.1/88.2 kHz (without them those rates play
-  garbled or silent).
+  garbled or silent). `src_reclock` (1) sets the I2S to its 48 kHz clocks before
+  44.1/88.2 kHz (0.9.6; without it they went silent after a 384 kHz stream).
 - `wuh_96k` (1, writable at runtime) — What U Hear at 48 or 96 kHz
   (0.9.5); 0 = 48 kHz only.
 - `dsp_96k` (1, writable at runtime) — 96 kHz with Direct Mode off, through

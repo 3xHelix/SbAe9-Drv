@@ -3,19 +3,49 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
-## Unreleased
+## 0.9.6 (2026-11-06)
 
-- "Head Unit Phantom Power": shows and switches the head unit's 48 V
-  phantom power (the head unit's button works too; Windows' software can
-  only read it). Always off at start-up and after waking; "on" is refused
-  for the first 30 s so a restored mixer state can't switch it on. The log
-  says "head unit: phantom power on/off".
-- Cleanup: the old pre-Windows start-up path is gone (about 5,700 lines),
-  with the module options that only it used: `post_windows`,
+A fix for 44.1/88.2 kHz, found with the dump script's new check. 🩹
+Pairs with [SbAe9-SBC v0.11.0](https://github.com/3xHelix/SbAe9-SBC), as 0.9.5.
+
+- **Fixed: 44.1 and 88.2 kHz went silent after a 384 kHz stream**, and stayed
+  silent (also after idle) until something played at 48, 96 or 192 kHz. The
+  384 kHz stream left the card's I2S on its 384 kHz clocks, where the
+  sample-rate converter these rates use won't start. A 44.1/88.2 kHz start
+  now sets the I2S to its 48 kHz clocks first, as Windows' driver does.
+  `src_reclock=0` goes back to the old behaviour.
+- `scripts/ae9-full-dump.sh` reads a few more card registers (the I2S check
+  registers Windows' driver uses, and some power registers), to compare
+  against the AE-9's usual values when something goes quiet.
+
+-- 3xHelix
+
+## 0.9.5 (2026-11-06)
+
+Phantom power from the desktop, What U Hear at 96 kHz, and a big tidy-up. 🎙️
+Pairs with [SbAe9-SBC v0.11.0](https://github.com/3xHelix/SbAe9-SBC), released
+alongside: its phantom power button (red when on, with a warning first) and
+a What U Hear rate picker (48/96 kHz).
+
+- **Phantom power can be switched from the PC.** "Head Unit Phantom Power"
+  shows and switches the head unit's 48 V phantom power for its XLR/TRS
+  jack; the head unit's own button works too. Windows' software can only
+  read it; the switch command was found on the card. It always starts off,
+  after boot and after waking, and "on" is refused for the first 30 s so a
+  restored mixer state can't turn 48 V on by itself. 48 V can damage some
+  gear (ribbon mics, some line-level sources): only turn it on for mics
+  that need it.
+- **What U Hear records at 48 or 96 kHz** (`hw:AE9,2`, `wuh_96k`, default
+  on), level-exact with the card playing at 48 or 96 kHz.
+- **Cleanup:** the old pre-Windows start-up path is gone (about 5,700
+  lines), with the module options only it used: `post_windows`,
   `enable_audio_path`, `hu_boot_ms`, `loop_start`, `lineout_prerun`. A
-  leftover option in modprobe.d just logs "unknown parameter".
-- What U Hear records at 48 or 96 kHz (`hw:AE9,2`, `wuh_96k`, default on),
-  checked level-exact with the card playing at 48 or 96 kHz.
+  leftover one in modprobe.d only logs "unknown parameter". Nothing changes
+  with the defaults.
+- Debug: `huframe <hex bytes>` in the debugfs `cmd` file sends one raw
+  head-unit frame and shows the reply.
+
+-- 3xHelix
 
 ## 0.9.4 (2026-11-06)
 

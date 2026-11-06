@@ -1465,6 +1465,13 @@ void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
  * (any CA0113 command or a resume clears dac_start_key). 0 = send them at
  * every start, as Windows does.
  */
+/* 44.1/88.2 kHz: clock the I2S as at 48 kHz before the converter (see
+ * creative_ae9_cold_pcm_replay); 0 = as before (silent after a 384 kHz
+ * stream). */
+static bool src_reclock = true;
+module_param(src_reclock, bool, 0644);
+MODULE_PARM_DESC(src_reclock, "44.1/88.2 kHz: set the I2S to its 48 kHz clocks before the sample-rate converter (1 = yes, default; 0 = as before)");
+
 /* 44.1/88.2 kHz: send Windows' extra DAC commands (see below). */
 static bool dac_441 = true;
 module_param(dac_441, bool, 0644);
@@ -1589,6 +1596,31 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 			 * write, and set up the converter there instead */
 			if (src && !skip && v == 0x115f0100 && i + 2 < nin &&
 			    in[i + 1] == 0x11571717 && in[i + 2] == 0x11571808) {
+				/*
+				 * Clock the I2S as at 48 kHz first: the block's
+				 * own ASI 8, PLL and I2S descriptor writes (up to
+				 * 0x189028), unpatched. After a 384 kHz stream the
+				 * I2S stayed on its 384 kHz clocks (0x1f103), and
+				 * the converter's enable (0x18a020 = 3) didn't take:
+				 * silent, until a 48 kHz-family stream re-clocked it
+				 * (2026-11-06). Windows' own I2S setup has a 44.1 kHz
+				 * entry with these 48 kHz values (0x1f100/0x8005).
+				 */
+				if (src_reclock) {
+					u32 a2 = 0;
+
+					for (k = i; k < nin; k++) {
+						u32 w = in[k];
+
+						if ((w & 0xffff0000) == 0x11500000)
+							a2 = (a2 & 0xffff0000) | (w & 0xffff);
+						else if ((w & 0xffff0000) == 0x11510000)
+							a2 = (a2 & 0xffff) | ((w & 0xffff) << 16);
+						t[n++] = w;
+						if (a2 == 0x189028 && (w & 0xffff0000) == 0x11540000)
+							break;
+					}
+				}
 				for (k = 0; k < 5; k++) {
 					n = ae9_chipio_w(t, n, k == 2 ? 0x18a024 :
 							 k == 3 ? 0x18a028 : 0x18a020,
