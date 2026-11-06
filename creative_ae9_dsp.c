@@ -63,6 +63,67 @@ module_param(scp_event, uint, 0444);
 MODULE_PARM_DESC(scp_event, "Read SCP replies only after the DSP announces them, as Windows does (1=on, default)");
 
 /*
+ * stream_rings_off=1: stop the command rings while a boot stream runs
+ * (firmware download, overlay transfer) and send commands through the
+ * immediate interface meanwhile; restart the rings after each. On an
+ * ASMedia-bridged card the rings running alongside any stream took the
+ * card off the bus (bugzilla 219552 round 2), each alone was fine.
+ */
+static unsigned int stream_rings_off;
+module_param(stream_rings_off, uint, 0444);
+MODULE_PARM_DESC(stream_rings_off, "Stop the command rings during the boot streams (firmware, overlay) (1=yes; 0=no, default; diagnostic)");
+
+/*
+ * fw_posbuf=1: turn on the DMA position buffer during the firmware
+ * download, so the card writes to memory while the stream reads. With
+ * the rings off this tells whether any card write during a stream (the
+ * RIRB is the card's other writer) takes an ASMedia bridge down.
+ */
+static unsigned int fw_posbuf;
+module_param(fw_posbuf, uint, 0444);
+MODULE_PARM_DESC(fw_posbuf, "DMA position buffer on during the firmware download (1=yes; 0=no, default; diagnostic)");
+
+/* stream_rings_off: park the rings before a stream; true when parked */
+static bool ae9_rings_park(struct creative_chip *chip, const char *what)
+{
+	unsigned int t;
+
+	if (!stream_rings_off || !chip->corb_buf || chip->card_gone)
+		return false;
+	creative_ae9_corb_free(chip);
+	/* wait for both ring engines to report stopped (RUN bits clear) */
+	for (t = 0; t < 100; t++) {
+		if (!(creative_hda_readb(chip, AZX_REG_CORBCTL) & 0x02) &&
+		    !(creative_hda_readb(chip, AZX_REG_RIRBCTL) & 0x02))
+			break;
+		udelay(10);
+	}
+	/* re-arm the immediate interface the way the bring-up does before
+	 * the rings first start: once the rings have run, it stays busy
+	 * (IRS=0x5) until this is done again (tested on the IDT card) */
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x5);
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x0);
+	creative_hda_writeb(chip, AZX_REG_IRS, 0x4);
+	chip->last_irs_ack = 0x6;
+	dev_info(chip->dev, "%s: command rings stopped for the stream (%u us; IRS now 0x%04x)\n",
+		 what, t * 10, creative_hda_readw(chip, AZX_REG_IRS));
+	return true;
+}
+
+static int ae9_rings_unpark(struct creative_chip *chip, const char *what)
+{
+	int ret;
+
+	if (chip->card_gone)
+		return -ENODEV;
+	ret = creative_ae9_corb_init(chip);
+	dev_info(chip->dev, "%s: command rings back after the stream: %d\n", what, ret);
+	if (creative_ae9_gone(chip, what))
+		return -ENODEV;
+	return ret;
+}
+
+/*
  * fw_verify=1: after the firmware download and before starting the DSP,
  * read samples of every segment back through ChipIO and compare them with
  * the image. Done while the DSP is still halted, so data memory hasn't
@@ -540,13 +601,20 @@ static int dspio_read_multiple(struct creative_chip *chip, unsigned int *buffer,
  */
 static void scp_drain_announced(struct creative_chip *chip);
 
+/* The DSP announces SCP replies through the RIRB: without running rings
+ * (corb_rings=0, or fw_rings_off=1 before the rings start) poll instead. */
+static bool scp_ev(struct creative_chip *chip)
+{
+	return scp_event && chip->corb_buf;
+}
+
 static void dspio_clear_response_queue(struct creative_chip *chip)
 {
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 	unsigned int dummy = 0;
 	int status = -1;
 
-	if (scp_event) {
+	if (scp_ev(chip)) {
 		scp_drain_announced(chip);
 		return;
 	}
@@ -673,6 +741,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 			      unsigned int len, void *reply,
 			      unsigned int *reply_len)
 {
+	if (chip->card_gone)
+		return -ENODEV;
 	struct scp_msg scp_send, scp_reply;
 	unsigned int data_size = len / sizeof(unsigned int);
 	unsigned int scp_send_size, i;
@@ -686,7 +756,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 		return -EINVAL;
 
 	/* Drain stale responses so the command queue isn't stuck FULL. */
-	if (scp_event)
+	if (scp_ev(chip))
 		scp_drain_announced(chip);
 	else
 		dspio_clear_response_queue(chip);
@@ -715,7 +785,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 	if (dir != SCP_GET)
 		return 0;
 
-	if (scp_event) {
+	if (scp_ev(chip)) {
 		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
 		unsigned int got;
 
@@ -728,6 +798,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 					mod_id, req);
 				return -EIO;
 			}
+			if (creative_ae9_gone(chip, "SCP reply wait"))
+				return -ENODEV;
 			dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
 			usleep_range(200, 400);
 		}
@@ -760,6 +832,8 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 		bool matched = false;
 
 		do {
+			if (creative_ae9_gone(chip, "SCP reply poll"))
+				break;
 			if (dspio_read(chip, &hdr) == 0) {
 				reads++;
 				last = hdr;
@@ -895,7 +969,26 @@ static void ovl_stream_stop(struct creative_chip *chip)
 	wmb();
 }
 
+static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out);
+
 static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
+{
+	bool parked;
+	int ret, u;
+
+	if (chip->card_gone)
+		return -ENODEV;
+	parked = ae9_rings_park(chip, "overlay");
+	ret = dsp_overlay_xfer_once(chip, chan_out);
+	if (parked) {
+		u = ae9_rings_unpark(chip, "overlay");
+		if (u == -ENODEV)
+			return u;
+	}
+	return ret;
+}
+
+static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 {
 	const struct firmware *fw;
 	const struct ae9_dsp_image_seg *seg;
@@ -916,8 +1009,8 @@ static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
 		release_firmware(fw);
 		return -EINVAL;
 	}
-	buf = dma_alloc_coherent(chip->dev, OVL_BUF_BYTES, &buf_dma, GFP_KERNEL);
-	bdl = dma_alloc_coherent(chip->dev, 16 * OVL_BDL_ENTRIES, &bdl_dma, GFP_KERNEL);
+	buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), &buf_dma, GFP_KERNEL);
+	bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), &bdl_dma, GFP_KERNEL);
 	if (!buf || !bdl) {
 		ret = -ENOMEM;
 		goto out;
@@ -1028,9 +1121,9 @@ unbind:
 	*chan_out = chan;
 out:
 	if (buf)
-		dma_free_coherent(chip->dev, OVL_BUF_BYTES, buf, buf_dma);
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
 	if (bdl)
-		dma_free_coherent(chip->dev, 16 * OVL_BDL_ENTRIES, bdl, bdl_dma);
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
 	release_firmware(fw);
 	(void)resp;
 	return ret;
@@ -1079,6 +1172,8 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 	u32 v, chan;
 
 	for (i = 0; i < ARRAY_SIZE(states); i++) {
+		if (chip->card_gone)
+			return -ENODEV;
 		if (i == 1) {
 			/* Between states 3 and 4: DMA channel alloc, overlay
 			 * transfer (overlay=1), channel free, then 0x0b = 1,
@@ -1368,6 +1463,8 @@ struct ae9_dma_engine {
 	size_t buf_size;
 	unsigned short hda_format;
 	unsigned char stream_tag;
+	void *posbuf;		/* fw_posbuf=1 */
+	dma_addr_t posbuf_dma;
 };
 
 /* Reset the download stream (read position back to 0) and reprogram it,
@@ -1401,14 +1498,14 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	__le32 *bdl;
 	u32 ctl;
 
-	dma->buf = dma_alloc_coherent(chip->dev, DSPLOAD_BUF_SIZE,
+	dma->buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE),
 				      &dma->buf_dma, GFP_KERNEL);
 	if (!dma->buf)
 		return -ENOMEM;
-	dma->bdl = dma_alloc_coherent(chip->dev, DSPLOAD_BDL_BYTES, &dma->bdl_dma,
+	dma->bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BDL_BYTES), &dma->bdl_dma,
 				      GFP_KERNEL);
 	if (!dma->bdl) {
-		dma_free_coherent(chip->dev, DSPLOAD_BUF_SIZE, dma->buf,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
 		dma->buf = NULL;
 		return -ENOMEM;
@@ -1457,6 +1554,16 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	writel(upper_32_bits(dma->bdl_dma),
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_BDLPU);
 	wmb();
+	if (fw_posbuf && !chip->posbuf) {
+		dma->posbuf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE),
+						 &dma->posbuf_dma, GFP_KERNEL);
+		if (dma->posbuf) {
+			writel(upper_32_bits(dma->posbuf_dma), chip->hda_regs + AZX_REG_DPUBASE);
+			writel(lower_32_bits(dma->posbuf_dma) | 1, chip->hda_regs + AZX_REG_DPLBASE);
+			dev_info(chip->dev, "fw_posbuf: DMA position buffer on at 0x%llx\n",
+				 (u64)dma->posbuf_dma);
+		}
+	}
 	return 0;
 }
 
@@ -1477,11 +1584,31 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 	writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
+	if (dma->posbuf) {
+		writel(0, chip->hda_regs + AZX_REG_DPLBASE);
+		writel(0, chip->hda_regs + AZX_REG_DPUBASE);
+		readl(chip->hda_regs + AZX_REG_DPLBASE);
+		{
+			/* which slot this controller uses for the download
+			 * stream isn't known: log the busiest one */
+			__le32 *pb = dma->posbuf;
+			unsigned int i, best = 0;
+
+			for (i = 0; i < 16; i += 2)
+				if (le32_to_cpu(pb[i]) > le32_to_cpu(pb[best]))
+					best = i;
+			dev_info(chip->dev, "fw_posbuf: slot %u position 0x%x after the download\n",
+				 best / 2, le32_to_cpu(pb[best]));
+		}
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE), dma->posbuf,
+				  dma->posbuf_dma);
+		dma->posbuf = NULL;
+	}
 	if (dma->buf)
-		dma_free_coherent(chip->dev, DSPLOAD_BUF_SIZE, dma->buf,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
 	if (dma->bdl)
-		dma_free_coherent(chip->dev, DSPLOAD_BDL_BYTES, dma->bdl,
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BDL_BYTES), dma->bdl,
 				  dma->bdl_dma);
 	dma->buf = dma->bdl = NULL;
 }
@@ -1639,6 +1766,8 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 			 chip_addx, run_size_words, lpib0, lpib1,
 			 readl(chip->hda_regs + DSPLOAD_STREAM_BASE +
 			       AZX_REG_SD_CTL));
+		if (creative_ae9_gone(chip, "firmware chunk start"))
+			return -ENODEV;
 
 		if (remainder_words != 0) {
 			unsigned int i;
@@ -1668,6 +1797,8 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		timeout = jiffies + msecs_to_jiffies(2000);
 		flicker = 0;
 		do {
+			if (creative_ae9_gone(chip, "firmware chunk"))
+				return -ENODEV;
 			if (!dsp_is_dma_active(chip, dma_chan)) {
 				if (!dsp_dma_active_again(chip, dma_chan))
 					break;
@@ -1851,6 +1982,7 @@ static int dspload_image(struct creative_chip *chip,
 {
 	unsigned int sample_rate = 48000;
 	unsigned short channels = DMA_TRANSFER_FRAME_SIZE_NWORDS;
+	bool parked;
 	int status;
 
 	while (channels > 16) {
@@ -1858,7 +1990,24 @@ static int dspload_image(struct creative_chip *chip,
 		channels /= 2;
 	}
 
+	parked = ae9_rings_park(chip, "firmware");
 	status = dspxfr_image(chip, fls, sample_rate, channels);
+	if (parked) {
+		int u = ae9_rings_unpark(chip, "firmware");
+
+		if (u == -ENODEV)
+			return u;
+	}
+	if (chip->rings_deferred && !chip->card_gone) {
+		/* fw_rings_off=1: the firmware stream has stopped; start the
+		 * command rings now, before the boot handshake */
+		int cret = creative_ae9_corb_init(chip);
+
+		chip->rings_deferred = false;
+		dev_info(chip->dev, "corb_init after the firmware stream: %d\n", cret);
+		if (creative_ae9_gone(chip, "CORB/RIRB start after the firmware"))
+			return -ENODEV;
+	}
 	if (status < 0)
 		return status;
 	dspload_post_setup(chip);

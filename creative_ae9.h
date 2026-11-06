@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.7"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.8"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -139,6 +139,13 @@ struct creative_chip {
 	struct snd_card		*card;
 
 	void __iomem		*hda_regs;	/* BAR0 */
+	bool			unsol_parked;	/* corb_free switched unsolicited responses off */
+	bool			card_gone;	/* dropped off the bus: registers and
+						 * config space read all-ones */
+	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
+	bool			rings_deferred;	/* start CORB/RIRB after the firmware
+						 * stream (fw_rings_off=1) */
+	size_t			dma_pad;	/* spare bytes after every DMA buffer */
 	void __iomem		*ext_regs;	/* BAR2 */
 
 	spinlock_t		lock;
@@ -333,6 +340,41 @@ struct creative_chip {
 	unsigned long		hu_next_full;
 };
 
+/*
+ * Has the card dropped off the bus? An ASMedia-bridge AE-9 (bugzilla
+ * 219552 #81) vanishes during bring-up: every register and even config
+ * space then read all-ones, and waiting on them spun the CPU until the
+ * machine froze. Checked where a timeout or an all-ones read suggests it;
+ * once set, every command path returns -ENODEV straight away.
+ */
+static inline bool creative_ae9_gone(struct creative_chip *chip, const char *where)
+{
+	u16 vid = 0;
+
+	if (chip->card_gone)
+		return true;
+	if (readl(chip->hda_regs + 0x08) != 0xffffffff)	/* GCTL */
+		return false;
+	pci_read_config_word(chip->pci, PCI_VENDOR_ID, &vid);
+	if (vid != 0xffff)
+		return false;
+	chip->card_gone = true;
+	dev_err(chip->dev, "card dropped off the bus (%s): registers and config space read all-ones; stopping\n",
+		where);
+	return true;
+}
+
+/*
+ * The ASMedia ASM1083 (rev 03) bridge reads ahead past the end of the
+ * buffer the card is reading; through the IOMMU that read lands on an
+ * unmapped page and faults (bugzilla 219552). Every DMA buffer gets
+ * chip->dma_pad spare bytes after its end so the read-ahead stays mapped.
+ */
+static inline size_t ae9_dma_size(struct creative_chip *chip, size_t n)
+{
+	return n + chip->dma_pad;
+}
+
 /* ------------------------------------------------------------------ */
 /* Function declarations						  */
 /* ------------------------------------------------------------------ */
@@ -414,10 +456,24 @@ void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
 /* MMIO accessor helpers (with mandated memory barriers)		  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * posted_flush: follow every MMIO write with a read, as Windows' driver
+ * does (every write is followed by a read of the same register). An
+ * ASMedia ASM1083 bridge wedges after a burst of ~14-18 back-to-back
+ * posted writes with no read in between (DarkNikGr's sb-ae9 investigation,
+ * 2026-09-03: one read between the bursts cured it). wmb() alone doesn't
+ * flush anything on PCIe. BAR0 (HDA) writes read the same register back;
+ * BAR2 writes read the card's ID register (0x4) instead, because reading
+ * back the head-unit UART data register (0xc00) would lose a byte.
+ */
+extern bool ae9_posted_flush;
+
 static inline void creative_hda_writel(struct creative_chip *chip,
 				       unsigned int reg, u32 val)
 {
 	writel(val, chip->hda_regs + reg);
+	if (ae9_posted_flush)
+		(void)readl(chip->hda_regs + reg);
 	wmb(); /* docs/history/Creative.md §2.2: barrier after every write */
 }
 
@@ -433,6 +489,8 @@ static inline void creative_ext_writel(struct creative_chip *chip,
 				       unsigned int reg, u32 val)
 {
 	writel(val, chip->ext_regs + reg);
+	if (ae9_posted_flush)
+		(void)readl(chip->ext_regs + 0x4);
 	wmb(); /* docs/history/Creative.md §2.2: barrier after every write */
 }
 
@@ -448,6 +506,8 @@ static inline void creative_ext_writeb(struct creative_chip *chip,
 				       unsigned int reg, u8 val)
 {
 	writeb(val, chip->ext_regs + reg);
+	if (ae9_posted_flush)
+		(void)readl(chip->ext_regs + 0x4);
 	wmb();
 }
 
@@ -463,6 +523,8 @@ static inline void creative_ext_writew(struct creative_chip *chip,
 				       unsigned int reg, u16 val)
 {
 	writew(val, chip->ext_regs + reg);
+	if (ae9_posted_flush)
+		(void)readl(chip->ext_regs + 0x4);
 	wmb();
 }
 
@@ -470,6 +532,8 @@ static inline void creative_hda_writeb(struct creative_chip *chip,
 				       unsigned int reg, u8 val)
 {
 	writeb(val, chip->hda_regs + reg);
+	if (ae9_posted_flush)
+		(void)readb(chip->hda_regs + reg);
 	wmb();
 }
 
@@ -485,6 +549,8 @@ static inline void creative_hda_writew(struct creative_chip *chip,
 				       unsigned int reg, u16 val)
 {
 	writew(val, chip->hda_regs + reg);
+	if (ae9_posted_flush)
+		(void)readw(chip->hda_regs + reg);
 	wmb();
 }
 
@@ -495,5 +561,38 @@ static inline u16 creative_hda_readw(struct creative_chip *chip,
 	rmb();
 	return val;
 }
+
+/*
+ * posted_flush for the driver's raw writel/writew/writeb calls (BAR0 stream
+ * and ring registers, BAR2 0x304): the same register read back after the
+ * write. Defined after the wrappers above, so they keep the plain writes.
+ */
+static inline void ae9_writel_flush(u32 v, void __iomem *a)
+{
+	writel(v, a);
+	if (ae9_posted_flush)
+		(void)readl(a);
+}
+
+static inline void ae9_writew_flush(u16 v, void __iomem *a)
+{
+	writew(v, a);
+	if (ae9_posted_flush)
+		(void)readw(a);
+}
+
+static inline void ae9_writeb_flush(u8 v, void __iomem *a)
+{
+	writeb(v, a);
+	if (ae9_posted_flush)
+		(void)readb(a);
+}
+
+#undef writel
+#undef writew
+#undef writeb
+#define writel(v, a)	ae9_writel_flush(v, a)
+#define writew(v, a)	ae9_writew_flush(v, a)
+#define writeb(v, a)	ae9_writeb_flush(v, a)
 
 #endif /* __CREATIVE_AE9_H */

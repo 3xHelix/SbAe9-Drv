@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.7):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.8):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -33,23 +33,25 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.7 pairs with SbAe9-SBC v0.11.0 (phantom power button, What U
-> Hear rate picker, rates per mode); older SbC versions still work, with
+> Driver v0.9.8 pairs with SbAe9-SBC v0.11.2 (phantom power button, What U
+> Hear rate picker, rates per mode incl. 176.4 kHz, ignores virtual PipeWire devices); older SbC versions still work, with
 > fewer controls.
 
 ## Hardware / Environment
 
 - Creative Sound Blaster AE-9 — PCI `1102:0010`, subsystem `0x0071`
-  (CA0132 Sound Core3D, behind an IDT Tsi381 PCIe-to-PCI bridge), with the
-  ACM head unit connected.
+  (CA0132 Sound Core3D, behind a PCIe-to-PCI bridge), with the ACM head unit
+  connected.
 - Developed/tested on Fedora 44 KDE, kernels `7.2.13`, `7.2.14` and `7.2.15`
   (`-200.fc44.x86_64`).
 - No `iommu=pt` needed: tested on an AMD system with the IOMMU in its
   default translated mode, with no IOMMU page faults from the card. (Drivers
   built on the kernel's ca0132 code report needing it; this one doesn't.)
-- Only tested on the IDT-bridge version of the card. AE-9s exist with an
-  IDT/Tundra Tsi381 (`10e3:8111`) or an ASMedia ASM1083/1085 (`1b21:1080`)
-  PCIe-to-PCI bridge. To see which one sits above your card:
+- Works with both versions of the card: AE-9s exist with an IDT/Tundra
+  Tsi381 (`10e3:8111`, the developer's card) or an ASMedia ASM1083/1085
+  (`1b21:1080`) PCIe-to-PCI bridge. The ASMedia version works since 0.9.8
+  (tested by Kaiba on a rev 03 bridge); the driver spots that bridge and
+  switches its workarounds on by itself. To see which one sits above your card:
   ```sh
   lspci -nn -s $(basename $(dirname $(readlink -f /sys/bus/pci/devices/$(lspci -D -d 1102:0010 | cut -d' ' -f1))))
   ```
@@ -525,7 +527,10 @@ This driver stands on other people's work:
   AE-9 MMIO init sequence and the head unit (ACM) init, adapted here.
 - **Creative's own CA0132 Linux build** ("0.73_kernel18", GPL), shared with
   the project: the AE-9 output, mic and speaker setup sequences.
-- **Kaiba**: testing on an ASMedia-bridge AE-9, round after round.
+- **Kaiba**: tested the ASMedia-bridge AE-9, round after round, until it
+  played (0.9.8).
+- **DarkNikGr** also found that the ASMedia bridge locks up after a burst
+  of register writes with no read in between: the key to the ASMedia fix.
 
 Everything Windows-side (timings, verb order, the head unit protocol) comes
 from our own VFIO captures of Creative's Windows driver; none of its code

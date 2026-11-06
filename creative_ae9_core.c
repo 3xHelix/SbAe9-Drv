@@ -108,9 +108,9 @@ MODULE_PARM_DESC(codec_probe_delay_ms, "Delay between controller reset and codec
  * bus-resets the card); after only a power-on reset, or a PM (D3hot) reset,
  * they report the generic 0x11020010.
  */
-static unsigned int bus_reset = 1;
-module_param(bus_reset, uint, 0444);
-MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM start does (1=on, default)");
+static int bus_reset = -1;
+module_param(bus_reset, int, 0444);
+MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM start does (1=on, 0=off, -1=auto: on, except behind an ASMedia bridge; default)");
 
 /*
  * win_reset2: Windows (cold capture) does 4 ICW reads after the first
@@ -326,6 +326,9 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	u16 irs;
 	unsigned int timeout;
 
+	if (chip->card_gone)
+		return -ENODEV;
+
 	/* Step 1: ACK previous response (or arm interface for first verb) */
 	creative_hda_writew(chip, AZX_REG_IRS, chip->last_irs_ack);
 	wmb();
@@ -344,6 +347,8 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	} while (--timeout);
 
 	if (!timeout) {
+		if (irs == 0xffff && creative_ae9_gone(chip, "ICW"))
+			return -ENODEV;
 		dev_err(chip->dev, "ICW ready timeout (verb=0x%08x, IRS=0x%04x)\n",
 			verb, irs);
 		return -ETIMEDOUT;
@@ -1955,6 +1960,18 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 		const struct ae9_bar2_op *o = &ae9_cold_bar2_post[i];
 		u8 resp[32];
 
+		/* An ASMedia-bridge card went quiet in this step (bugzilla
+		 * 219552, round 3c): stop at the first all-ones read and say
+		 * which step, so the log shows the write that killed it. */
+		if (creative_ae9_gone(chip, "post-boot head-unit replay")) {
+			const struct ae9_bar2_op *p = i ? o - 1 : o;
+
+			dev_err(chip->dev,
+				"post_windows: card gone before step %zu of %zu; last step sent: %c 0x%x = 0x%x\n",
+				i + 1, ARRAY_SIZE(ae9_cold_bar2_post), p->type,
+				p->off, p->val);
+			return;
+		}
 		switch (o->type) {
 		case 'S':
 			if (creative_spi_frame_win(chip, o->data, o->len,
@@ -3361,6 +3378,93 @@ static void creative_ae9_log_state(struct creative_chip *chip, const char *when)
 /* The secondary bus reset hits everything behind the bridge: only do it
  * when the card (any of its functions) is alone there, as on the AE-9's
  * own PCIe-to-PCI bridge. */
+/*
+ * The PCIe-to-PCI bridge above the card (IDT Tsi381 here, ASMedia
+ * ASM1083/1085 1b21:1080 on other AE-9s). An ASMedia card drops off the
+ * bus during bring-up (bugzilla 219552 #81, stock driver too, #56), so log
+ * the bridge's status at each step: a DMA or config cycle the card
+ * botched shows up as master/target abort or SERR on the secondary side.
+ * The error bits are write-1-to-clear and cleared after each read, so
+ * every line shows only what happened since the one before.
+ */
+static unsigned int bridge_log = 1;
+module_param(bridge_log, uint, 0644);
+MODULE_PARM_DESC(bridge_log, "Log the PCI bridge's status at each bring-up step (1=on, default)");
+
+/*
+ * corb_rings=0: never start the CORB/RIRB command rings; every command goes
+ * through the immediate command interface (slow, one at a time). For
+ * telling whether the card's first DMA reads (the rings) are what knocks
+ * an ASMedia card off the bus. Diagnostic only: much of the bring-up
+ * expects the rings.
+ */
+static unsigned int corb_rings = 1;
+module_param(corb_rings, uint, 0444);
+MODULE_PARM_DESC(corb_rings, "Start the CORB/RIRB command rings (1=yes, default; 0 = immediate commands only, diagnostic)");
+
+/*
+ * dma_pad: spare space after every DMA buffer, in KB. The ASMedia ASM1083
+ * reads ahead past the end of a buffer (bugzilla 219552: IOMMU faults one
+ * byte past the 256 KB firmware buffer). -1 = auto: 64 KB behind an
+ * ASMedia bridge, none otherwise.
+ */
+static int dma_pad = -1;
+
+/* posted_flush: -1 = auto (on behind an ASMedia bridge), 0 = off, 1 = on;
+ * see creative_ae9.h */
+bool ae9_posted_flush;
+static int posted_flush = -1;
+module_param(posted_flush, int, 0444);
+MODULE_PARM_DESC(posted_flush, "Read back after every register write, as Windows: -1 = auto (ASMedia bridge, default), 0 = off, 1 = on");
+module_param(dma_pad, int, 0444);
+MODULE_PARM_DESC(dma_pad, "Spare KB after every DMA buffer (-1=auto: 64 behind an ASMedia bridge, else 0; default)");
+
+/*
+ * fw_rings_off=1: keep the CORB/RIRB command rings off while the firmware
+ * streams to the DSP (commands go through the immediate interface), and
+ * start them once the stream has stopped, before the DSP boot handshake.
+ * On an ASMedia card the rings running alongside the firmware stream took
+ * the card off the bus (bugzilla 219552); the firmware alone got through.
+ */
+static unsigned int fw_rings_off;
+module_param(fw_rings_off, uint, 0444);
+MODULE_PARM_DESC(fw_rings_off, "Start the command rings only after the firmware download (1=yes; 0=no, default; diagnostic)");
+
+/* the rings start at the usual point of the bring-up (the default) */
+static bool ae9_rings_early(void)
+{
+	return corb_rings && !fw_rings_off;
+}
+
+static void creative_ae9_bridge_log(struct creative_chip *chip, const char *step)
+{
+	struct pci_dev *br = chip->pci->bus->self;
+	u16 st = 0, sec = 0, ctl = 0, cmd = 0;
+	const u16 errs = PCI_STATUS_DETECTED_PARITY | PCI_STATUS_SIG_SYSTEM_ERROR |
+			 PCI_STATUS_REC_MASTER_ABORT | PCI_STATUS_REC_TARGET_ABORT |
+			 PCI_STATUS_SIG_TARGET_ABORT | PCI_STATUS_PARITY;
+
+	if (!bridge_log || !br)
+		return;
+	pci_read_config_word(br, PCI_STATUS, &st);
+	pci_read_config_word(br, PCI_SEC_STATUS, &sec);
+	pci_read_config_word(br, PCI_BRIDGE_CONTROL, &ctl);
+	pci_read_config_word(chip->pci, PCI_COMMAND, &cmd);
+	dev_info(chip->dev,
+		 "bridge %s %04x:%04x %s: status 0x%04x, secondary 0x%04x%s%s%s%s%s, control 0x%04x; card command 0x%04x\n",
+		 pci_name(br), br->vendor, br->device, step, st, sec,
+		 sec & PCI_STATUS_REC_MASTER_ABORT ? " <MAbort" : "",
+		 sec & PCI_STATUS_REC_TARGET_ABORT ? " <TAbort" : "",
+		 sec & PCI_STATUS_SIG_TARGET_ABORT ? " >TAbort" : "",
+		 sec & PCI_STATUS_SIG_SYSTEM_ERROR ? " <SERR" : "",
+		 sec & (PCI_STATUS_DETECTED_PARITY | PCI_STATUS_PARITY) ? " parity" : "",
+		 ctl, cmd);
+	if (st & errs)
+		pci_write_config_word(br, PCI_STATUS, st & errs);
+	if (sec & errs)
+		pci_write_config_word(br, PCI_SEC_STATUS, sec & errs);
+}
+
 static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
 {
 	struct pci_dev *d;
@@ -3374,14 +3478,19 @@ static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
 static int creative_ae9_hw_bringup(struct creative_chip *chip)
 {
 	struct pci_dev *pdev = chip->pci;
+	bool do_reset = bus_reset > 0 || (bus_reset < 0 && !chip->asmedia);
 	int ret;
 
 	creative_ae9_log_state(chip, "before bring-up");
+	chip->card_gone = false;
+	creative_ae9_bridge_log(chip, "before bring-up");
+	if (bus_reset < 0 && chip->asmedia)
+		dev_info(&pdev->dev, "ASMedia bridge: skipping the secondary bus reset (it takes the bridge down at ring start; bus_reset=1 forces it)\n");
 
-	if (bus_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {
+	if (do_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {
 		dev_warn(&pdev->dev, "other devices behind %s: skipping the secondary bus reset\n",
 			 pci_name(pdev->bus->self));
-	} else if (bus_reset && pdev->bus->self) {
+	} else if (do_reset && pdev->bus->self) {
 		int rret;
 
 		/*
@@ -3428,17 +3537,26 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			 cfg40, after, pcicfg40_fix);
 	}
 
+	creative_ae9_bridge_log(chip, "after bus reset");
+	if (creative_ae9_gone(chip, "after the bus reset"))
+		return -ENODEV;
+
 	/* Windows' BAR2 init, before the controller reset as in its cold boot */
 	creative_ae9_bar2_init_windows(chip);
 
 	/* Reset HDA controller */
 	ret = creative_ae9_hw_reset(chip);
+	creative_ae9_bridge_log(chip, "after controller reset");
+	if (creative_ae9_gone(chip, "after the controller reset"))
+		return -ENODEV;
 	if (ret < 0)
 		return ret;
 
-	/* Enable unsolicited responses */
-	creative_hda_writel(chip, AZX_REG_GCTL,
-			    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
+	/* Enable unsolicited responses (only once the rings run, when
+	 * they start late: without a RIRB they jam the immediate interface) */
+	creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
+			    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
+	chip->unsol_parked = !ae9_rings_early();	/* late rings switch them on */
 	if (codec_probe_delay_ms)
 		msleep(codec_probe_delay_ms);
 
@@ -3515,17 +3633,30 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 
 		if (win_reset2) {
 			int rret = creative_ae9_hw_reset(chip);
-			int cret;
+			int cret = 0;
 
-			creative_hda_writel(chip, AZX_REG_GCTL,
-					    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
-			cret = creative_ae9_corb_init(chip);
+			creative_ae9_bridge_log(chip, "after second controller reset");
+			if (creative_ae9_gone(chip, "after the second controller reset"))
+				return -ENODEV;
+			creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
+					    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
+			chip->unsol_parked = !ae9_rings_early();	/* late rings switch them on */
+			chip->rings_deferred = corb_rings && fw_rings_off;
+			if (corb_rings && !fw_rings_off) {
+				cret = creative_ae9_corb_init(chip);
+				creative_ae9_bridge_log(chip, "after CORB/RIRB start");
+			}
 			dev_info(chip->dev,
-				 "win_reset2: second controller reset %d, corb_init %d\n",
-				 rret, cret);
+				 "win_reset2: second controller reset %d, corb_init %d%s\n",
+				 rret, cret, !corb_rings ? " (rings off: corb_rings=0)" :
+				 fw_rings_off ? " (rings after the firmware: fw_rings_off=1)" : "");
+			if (chip->card_gone)
+				return -ENODEV;
 		}
 
 		creative_ae9_replay_both(chip);
+		if (creative_ae9_gone(chip, "after the pre-download replay"))
+			return -ENODEV;
 
 		/* Check 0x801c after replay_init — in Windows capture the
 		 * audio loop starts during or right after init verbs via ICW.
@@ -3546,13 +3677,29 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		 * This allows standup/select_lineout to send ChipIO verbs
 		 * successfully via CORB rather than timing out via ICW.
 		 */
-		if (!win_reset2) {
+		if (!win_reset2 && corb_rings && fw_rings_off)
+			chip->rings_deferred = true;
+		if (!win_reset2 && corb_rings && !fw_rings_off) {
 			int cret = creative_ae9_corb_init(chip);
+
+			creative_ae9_bridge_log(chip, "after CORB/RIRB start");
 			dev_info(chip->dev, "early corb_init: %d\n", cret);
+			if (chip->card_gone)
+				return -ENODEV;
 		}
 
 		fret = creative_dsp_load_firmware(chip);
+		if (chip->rings_deferred && !chip->card_gone) {
+			/* the load failed before the stream finished */
+			int cret = creative_ae9_corb_init(chip);
+
+			chip->rings_deferred = false;
+			dev_info(chip->dev, "deferred corb_init (load failed early): %d\n", cret);
+		}
+		creative_ae9_bridge_log(chip, "after firmware download");
 		dev_info(chip->dev, "DSP firmware load: %d\n", fret);
+		if (creative_ae9_gone(chip, "during the firmware download"))
+			return -ENODEV;
 		if (fret == 0) {
 			creative_ae9_post_fw(chip);
 
@@ -3639,7 +3786,10 @@ static int creative_ae9_hw_bringup_retry(struct creative_chip *chip, const char 
 		dev_warn(chip->dev, "%s: bring-up attempt %u failed (dsp_done %u, handshake %s)\n",
 			 what, attempt, chip->dsp_done, chip->hs_ok ? "ok" : "failed");
 	}
-	if (load_fw && !(chip->codec_ok_mask & BIT(1)))
+	if (chip->card_gone)
+		dev_err(chip->dev, "%s: the card dropped off the bus; nothing more to try. Power off at the PSU before the next attempt (logs welcome: bugzilla 219552)\n",
+			what);
+	else if (load_fw && !(chip->codec_ok_mask & BIT(1)))
 		dev_err(chip->dev, "%s: codec 1 (DSP) never answered in %u attempts: power off at the PSU for ~20 s\n",
 			what, tries);
 	return ret;
@@ -3689,6 +3839,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 		dev_err(&pdev->dev, "No suitable DMA mask available\n");
 		return ret;
 	}
+	dev_info(&pdev->dev, "DMA: 30-bit mask, %s\n",
+		 device_iommu_mapped(&pdev->dev) ? "through the IOMMU" : "no IOMMU translation");
 
 	ret = pcim_iomap_regions(pdev, BIT(layout->hda_bar) | BIT(layout->ext_bar),
 				 CREATIVE_AE9_DRV_NAME);
@@ -3703,6 +3855,19 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 
 	chip->pci = pdev;
 	chip->dev = &pdev->dev;
+	if (pdev->bus->self && pdev->bus->self->vendor == PCI_VENDOR_ID_ASMEDIA &&
+	    pdev->bus->self->device == 0x1080)
+		chip->asmedia = true;
+	chip->dma_pad = (dma_pad < 0 ? (chip->asmedia ? 64 : 0) : dma_pad) * 1024;
+	ae9_posted_flush = posted_flush < 0 ? chip->asmedia : !!posted_flush;
+	if (ae9_posted_flush)
+		dev_info(&pdev->dev, "posted_flush: every register write is read back (%s)\n",
+			 posted_flush < 0 ? "ASMedia bridge" : "posted_flush=1");
+	if (chip->asmedia || chip->dma_pad)
+		dev_info(&pdev->dev, "bridge %s%s: %zu KB spare after each DMA buffer\n",
+			 pdev->bus->self ? pci_name(pdev->bus->self) : "-",
+			 chip->asmedia ? " (ASMedia ASM1083/1085)" : "",
+			 chip->dma_pad / 1024);
 	chip->hu_phantom_req = -1;	/* nothing to send */
 	chip->hda_regs = pcim_iomap_table(pdev)[layout->hda_bar];
 	chip->ext_regs = pcim_iomap_table(pdev)[layout->ext_bar];
@@ -3813,12 +3978,16 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	chip->card->sync_irq = pdev->irq;
 	dev_info(chip->dev, "IRQ %d registered\n", pdev->irq);
 
-	if (!chip->corb_buf) {
+	if (!chip->corb_buf && corb_rings && !chip->card_gone) {
 		ret = creative_ae9_corb_init(chip);
 		if (ret < 0) {
 			dev_err(chip->dev, "CORB init failed: %d\n", ret);
 			goto err_card;
 		}
+	}
+	if (chip->card_gone) {
+		ret = -ENODEV;
+		goto err_card;
 	}
 
 	ret = snd_card_register(chip->card);
@@ -3844,7 +4013,7 @@ err_card:
 err_hw:
 	/* works the bring-up scheduled (ACM/heartbeat) must not outlive chip */
 	creative_ae9_stop_works(chip);
-	if (chip->corb_buf)
+	if (chip->corb_buf && !chip->card_gone)
 		creative_ae9_win_shutdown(chip, "probe failure");
 	else
 		creative_ae9_corb_free(chip);

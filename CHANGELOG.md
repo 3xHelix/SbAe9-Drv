@@ -1,7 +1,33 @@
 # Changelog
 
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
-tested on one card (IDT bridge, `10e3:8111`).
+tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
+
+## 0.9.8 (2026-11-06)
+AE-9s behind an ASMedia bridge work. 🎉
+Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC).
+
+- **ASMedia-bridge cards play.** AE-9s come with one of two PCIe-to-PCI
+  bridges: IDT Tsi381 (`10e3:8111`) or ASMedia ASM1083/1085 (`1b21:1080`).
+  The ASMedia version used to drop off the bus during start-up. The bridge
+  locks up after a burst of register writes with no read in between, and
+  the driver wrote in such bursts. Behind an ASMedia bridge it now reads
+  every register back right after writing it, as Windows' driver does
+  (`posted_flush`, -1 = auto, the default). Also automatic behind ASMedia:
+  the command rings start in Windows' order (`ring_order`), every DMA
+  buffer gets 64 KB of spare room for the bridge's read-ahead (`dma_pad`),
+  and the bus reset at start-up is skipped (`bus_reset`). Tested on an
+  ASM1083 rev 03 card from a cold boot: start-up, playback, recording,
+  5.1 and optical. Thanks to Kaiba for testing round after round, and to
+  DarkNikGr for finding the write-burst lock-up.
+- If the card drops off the bus anyway, the driver now stops cleanly and
+  logs where, instead of hanging the machine.
+- IDT-bridge cards are unchanged: everything above stays off there.
+- Debug options for bridge trouble reports: `bridge_log=1` (bridge status
+  at each start-up step), `corb_rings`, `fw_rings_off`, `stream_rings_off`,
+  `ring_irq`, `fw_posbuf`. Not needed on any card tested so far.
+
+-- 3xHelix
 
 ## 0.9.7 (2026-11-06)
 
