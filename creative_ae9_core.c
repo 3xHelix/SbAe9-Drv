@@ -3537,6 +3537,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	 * they start late: without a RIRB they jam the immediate interface) */
 	creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
 			    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
+	chip->unsol_parked = !ae9_rings_early();	/* late rings switch them on */
 	if (codec_probe_delay_ms)
 		msleep(codec_probe_delay_ms);
 
@@ -3620,6 +3621,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 				return -ENODEV;
 			creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET |
 					    (ae9_rings_early() ? AZX_GCTL_UNSOL : 0));
+			chip->unsol_parked = !ae9_rings_early();	/* late rings switch them on */
 			chip->rings_deferred = corb_rings && fw_rings_off;
 			if (corb_rings && !fw_rings_off) {
 				cret = creative_ae9_corb_init(chip);

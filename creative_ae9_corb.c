@@ -177,10 +177,17 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	creative_hda_writeb(chip, AZX_REG_CORBCTL, ring_irq ? 0x01 : 0x00);
 	wmb();
 
-	/* rings running: unsolicited responses have somewhere to go (the
-	 * bring-up already has them on; this covers rings started late) */
-	creative_hda_writel(chip, AZX_REG_GCTL,
-			    creative_hda_readl(chip, AZX_REG_GCTL) | AZX_GCTL_UNSOL);
+	/* rings running: unsolicited responses have somewhere to go again.
+	 * Only when corb_free switched them off: at the first ring start the
+	 * bring-up already has them on, and the extra GCTL read and write
+	 * right after the RIRB DMA starts took an ASMedia-bridged card off
+	 * the bus (bugzilla 219552, round 3 test 1). No read: write the
+	 * value the bring-up uses. */
+	if (chip->unsol_parked) {
+		creative_hda_writel(chip, AZX_REG_GCTL,
+				    AZX_GCTL_RESET | AZX_GCTL_UNSOL);
+		chip->unsol_parked = false;
+	}
 
 	/* Do NOT reset CORBRP or RIRBWP.
 	 * Windows capture shows RIRBWP is already non-zero (from prior ICW
@@ -236,9 +243,11 @@ void creative_ae9_corb_free(struct creative_chip *chip)
 	/* no RIRB for unsolicited responses (the DSP's SCP reply
 	 * announcements) to land in: switch them off until the rings
 	 * start again, so they can't jam the immediate interface */
-	if (!chip->card_gone)
+	if (!chip->card_gone) {
 		creative_hda_writel(chip, AZX_REG_GCTL,
 				    creative_hda_readl(chip, AZX_REG_GCTL) & ~AZX_GCTL_UNSOL);
+		chip->unsol_parked = true;
+	}
 
 	/* park the (device-managed) buffers for the next corb_init; with
 	 * corb_buf NULL every verb path falls back to immediate commands */

@@ -139,6 +139,7 @@ struct creative_chip {
 	struct snd_card		*card;
 
 	void __iomem		*hda_regs;	/* BAR0 */
+	bool			unsol_parked;	/* corb_free switched unsolicited responses off */
 	bool			card_gone;	/* dropped off the bus: registers and
 						 * config space read all-ones */
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
