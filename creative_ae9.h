@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.2"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.3"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -319,6 +319,13 @@ struct creative_chip {
 	 * log. Logged only; output switching stays manual. */
 	bool			hu_status_valid;
 	u8			hu_status;
+	struct snd_kcontrol	*hu_plug_ctl[2];	/* phones, line in (read-only) */
+	/* opt-in auto switch on the 3.5 mm headphone plug: a plug change waits
+	 * until it has held still, then switches once */
+	bool			hu_auto_hp;
+	bool			hu_plug_pending;
+	unsigned long		hu_plug_at;
+	struct snd_kcontrol	*hu_auto_ctl;
 	bool			overlay_sent;	/* overlay transfer ran this bring-up */
 	unsigned long		hu_next_full;
 };

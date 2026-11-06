@@ -13,6 +13,7 @@
 # file. It holds no personal data beyond which apps are playing (PipeWire
 # stream names) and your kernel version: look it over before posting.
 # Needs the driver loaded (debugfs mounted, as on most distributions).
+# Each run also leaves an "ae9-full-dump: saved <file>" line in the kernel log.
 set -u
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 U=${SUDO_USER:-$USER}
@@ -102,4 +103,7 @@ sec "Driver log (last 60 lines, no head-unit chatter)"
 journalctl -k -b --no-pager | grep creative-ae9 | grep -vE "hu_debug|head unit: volume|dbg verb" | tail -60 | cut -c60-
 } > "$OUT" 2>&1
 chown "$U": "$OUT"
+# a line in the kernel log (dmesg / journalctl -k), so a later log shows
+# that a dump was taken, when, and where it went
+echo "<5>ae9-full-dump: saved $OUT (driver $(cat /sys/module/snd_hda_codec_creative_ae9/version 2>/dev/null) $(cat /sys/module/snd_hda_codec_creative_ae9/srcversion 2>/dev/null))" > /dev/kmsg 2>/dev/null
 echo "saved $OUT"

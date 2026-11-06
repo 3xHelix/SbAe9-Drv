@@ -7,24 +7,23 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.2):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.3):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
 > to 24-bit/192 kHz), in is its own recording device. What U Hear records
 > what the card plays.
 > The ACM head unit shows the volume; its knob sets the volume, a press
-> mutes, a medium hold switches between the RCA outputs and the head unit's
-> headphone jack, and a long hold toggles the knob light. The SBX button
+> mutes, a medium hold switches between the card's RCA outputs and the
+> head unit's headphone jacks, and a long hold toggles the knob light. The SBX button
 > turns SBX on and off (with Direct Mode off) and its light shows when the
 > effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
 > 48, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
-> the box in Direct Mode; 44.1/88.2 kHz playback and recording above
-> 48 kHz are not done yet. SBX effects and the EQ work through the card's
-> DSP, with Direct Mode off. 5.1 works on the card's front, rear and
-> center/sub jacks, at 48 or 96 kHz in Direct Mode and 48 kHz through the
+> the box in Direct Mode; 44.1/88.2 kHz playback is not done yet. SBX effects and the EQ work through the card's
+> DSP, with Direct Mode off. 5.1 works on the card's RCA, Rear and
+> C/Sub jacks, at 48 or 96 kHz in Direct Mode and 48 kHz through the
 > DSP.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
@@ -149,12 +148,21 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - Prefer a GUI? [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) gives
   every control below a Sound Blaster Command-style window (Python 3 +
   PySide6), and follows the knob and alsamixer live.
-- Output: the RCA jacks on the card (speaker mode, "-SP-") or the head
-  unit's headphone jack ("-HP-"). Starts on speakers; switch with a 1.5-3 s
+- Output: the card's RCA jacks (speaker mode, "-SP-") or the head unit's
+  headphone jacks, 3.5 mm and 1/4" ("-HP-"). Starts on speakers; switch with a 1.5-3 s
   knob hold or the "Head Unit Output" control. Each output remembers its own
   volume (both start at -36 dB).
 - Knob: turn = volume, press (< 1 s) = mute, hold 1.5-3 s = speakers /
   headphones, hold 3 s or more = knob light on/off.
+- Plugs: "Head Unit 3.5mm Phones Plugged" (the head unit's 3.5 mm
+  headphone jack) and "Head Unit 3.5mm Mic Plugged" (its 3.5 mm mic jack)
+  show what's plugged in, read-only, for apps to show. The 1/4" headphone
+  jack and the XLR/TRS jack don't report plugs.
+- Auto switch: "Head Unit Auto Switch" (off by default) makes the head unit's
+  3.5 mm headphone jack switch outputs: plug in = headphones, unplug = speakers,
+  about 1.5 s after the plug settles. Off, plugs change nothing. The
+  1/4" headphone jack isn't reported, so it can't auto switch. To start with it
+  on: options snd-hda-codec-creative-ae9 hu_auto_switch=1
 - SBX button (head unit): turns SBX on/off, same as "SBX Switch", only
   with Direct Mode off (with Direct Mode on it does nothing). Its light is
   on while the effects are running: Direct Mode off and SBX on.
@@ -176,22 +184,22 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   PipeWire resamples those files when they're left out. `pcm_rates=0`
   limits the card to 48 kHz.
 - Recording: the head unit's input, at 48 or 96 kHz (`arecord -D hw:AE9 -c 2
-  -r 96000 -f S32_LE`, or the AE-9 input in PipeWire/Audacity). The XLR/TRS
-  combo and the head unit's 3.5 mm line-in share it (Windows lists them as
+  -r 96000 -f S32_LE`, or the AE-9 input in PipeWire/Audacity). The head unit's
+  XLR/TRS jack and its 3.5 mm mic jack share it (Windows lists them as
   Microphone and Aux; the mic's own mute switch affects both). "Capture Bit
   Depth" picks 24-bit (default) or 32-bit samples, as Windows' recording
   format choice (`amixer -c AE9 cset name='Capture Bit Depth' 32-bit`; it
   takes effect at the next recording start). For a clearer
   desktop name, copy `config/61-ae9-names.conf` to
   `~/.config/wireplumber/wireplumber.conf.d/` and run
-  `systemctl --user restart wireplumber`: the source shows as "AE-9 Mic /
-  Line In" (node names stay the same). "XLR Gain" sets
+  `systemctl --user restart wireplumber`: the source shows as "AE-9 Head Unit
+  Mic / Aux" (node names stay the same). "Mic Gain" (was "XLR Gain") sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
-  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'XLR Gain' 0|1|2`. "Capture"
+  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'Mic Gain' 0|1|2`. "Capture"
   is the mic level, -89 to +9 dB in 1 dB steps with mute at 0 (default +9 dB,
   what Windows' recording setup uses), set the way Windows' Recording ->
   Levels slider does it; PipeWire uses it as the mic's hardware volume, so
-  the desktop microphone slider moves it (100% = +9 dB). XLR Gain stays
+  the desktop microphone slider moves it (100% = +9 dB). Mic Gain stays
   separate. Phantom power is the 48V button on the head unit's front panel;
   the driver doesn't need to do anything.
 - DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
@@ -228,8 +236,8 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   card's own output.
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
-  card's RCA jacks, center and LFE out of the Center/Sub jack, rear L/R
-  out of the Rear jack. Works in Direct Mode (straight to the DACs, 48 or
+  card's RCA jacks, center and LFE out of its 3.5 mm C/Sub jack, rear L/R
+  out of its 3.5 mm Rear jack. Works in Direct Mode (straight to the DACs, 48 or
   96 kHz; 192/384 kHz stay stereo) and with Direct Mode off (through the
   DSP, 48 kHz). With Direct Mode off, "Speaker
   Config" tells the DSP your layout: 2.0/2.1 fold the six channels down
@@ -401,7 +409,7 @@ the apps that are playing; look it over before posting.
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 | `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
 | `config/ae9-what-u-hear.conf` | Optional PipeWire source for What U Hear (see "What U Hear") |
-| `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Mic / Line In" |
+| `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Head Unit Mic / Aux" |
 
 ## Module parameters
 

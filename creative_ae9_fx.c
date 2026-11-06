@@ -115,7 +115,7 @@ static const char * const sv_mode_names[] = { "Normal", "Loud", "Night" };
  * setting on 2.1), and 8.0 in Direct Mode; ca0132's table is the same
  * (2.0 -> 1.0, 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0; capture
  * 6 sends exactly these). 4.0 and up need 6-channel streams to reach the
- * rear and center/sub jacks, so they're offered only with surround=1.
+ * card's Rear and C/Sub jacks, so they're offered only with surround=1.
  */
 static const char * const spk_names[] = { "2.0", "2.1", "4.0", "4.1", "5.1" };
 static const u8 spk_cfgs[] = { 1, 2, 5, 6, 8 };	/* MASTERCONTROL 0x04 value */

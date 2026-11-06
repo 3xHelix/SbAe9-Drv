@@ -3,6 +3,30 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.3 (2026-11-06)
+
+The head unit learns what's plugged into it. 🎧
+
+- Plug controls: "Head Unit 3.5mm Phones Plugged" (the head unit's 3.5 mm
+  headphone jack) and "Head Unit 3.5mm Mic Plugged" (its 3.5 mm mic jack),
+  read-only, with change events so apps can follow them live. The 1/4"
+  headphone jack and the XLR/TRS jack don't report plugs.
+- Auto headphone switch, opt-in: "Head Unit Auto Switch" (off by default,
+  `hu_auto_switch=1` to start on). Plug into the head unit's 3.5 mm
+  headphone jack = headphones, unplug = speakers, once the plug has held
+  still about 1.5 s, so a wiggly plug can't flap. It acts once per plug
+  change: a knob switch afterwards stays. Off, plugs only log, as before.
+- **Renamed: "XLR Gain" is now "Mic Gain"** (`Mic Gain Capture Volume`). It
+  boosts both head unit jacks, XLR/TRS and 3.5 mm mic (checked: +20 dB on
+  each). Scripts using `sset 'XLR Gain'` need the new name; a saved setting
+  starts back at the default +10 dB.
+- Names say where each jack lives (head unit vs card): the optional desktop
+  name in `config/61-ae9-names.conf` is now "AE-9 Head Unit Mic / Aux",
+  the log says "3.5 mm mic plug", and the docs name the card's RCA, Rear and
+  C/Sub jacks and the head unit's 3.5 mm and 1/4" headphone jacks.
+- `scripts/ae9-full-dump.sh` leaves an "ae9-full-dump: saved <file>" line
+  in the kernel log, so a later log shows a dump was taken and where it went.
+
 ## 0.9.2 (2026-11-06)
 
 Tidy-ups, and a tool for anyone who hits a problem. 🧰

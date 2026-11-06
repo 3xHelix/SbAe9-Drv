@@ -831,7 +831,7 @@ static size_t ae9_chipio_w(u32 *t, size_t n, u32 addr, u32 data)
  * 5.1: the other DAC pairs. Windows' Direct Mode with 5.1 speakers
  * (capture 6, 23:39:16) writes 0x190060..74 = HDA 00..05 -> 40, 41, 50,
  * 51, 60, 61, in its channel order FL FR FC LFE BL BR: 0x50/0x51 = the
- * Center/Sub jack, 0x60/0x61 = the Rear jack. With a 6-channel stream in
+ * card's C/Sub jack, 0x60/0x61 = the card's Rear jack. With a 6-channel stream in
  * DSP mode the 8051 sends DSP outputs c2..c7 into SRCs that lead nowhere
  * (2026-11-04 dump), so like the front pair they're pointed at these
  * ports by hand, at 0x190068..74 as Windows does. surround_ports = the
@@ -2968,6 +2968,12 @@ static unsigned int hu_sbx_mode = 1;
 module_param(hu_sbx_mode, uint, 0644);
 MODULE_PARM_DESC(hu_sbx_mode, "post_windows: send the output-mode frame before each SBX light change, as Windows (1=on, default)");
 
+static bool hu_auto_switch;
+module_param(hu_auto_switch, bool, 0444);
+MODULE_PARM_DESC(hu_auto_switch, "Start with \"Head Unit Auto Switch\" on: plugging into the head unit's 3.5 mm headphone jack switches to headphones, unplugging back to speakers (default off: plugs only log)");
+
+#define HU_PLUG_SETTLE_MS	1500	/* plug must hold still this long */
+
 /* Log raw head-unit button bits (83 01 02 byte changes, b1 press reports). */
 static unsigned int hu_debug;
 module_param(hu_debug, uint, 0644);
@@ -3035,9 +3041,10 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
  * card 2026-11-03): bit 5 = 3.5 mm headphone jack, bit 4 = 3.5 mm mic jack.
  * Bit 3 = SBX button, 1 while held; bit 1 = SBX light, 1 while lit (our
  * f0 22 02 01 <on> echoed back) (2026-11-04).
- * The 6.3 mm headphone jack, the XLR/TRS combo jack (a TRS plug set bit 4
- * once in 4 tries) and XLR plugs are effectively not reported. Plug changes
- * are only logged; the driver never switches output on them. Returns the
+ * The 1/4" (6.3 mm) headphone jack and the XLR/TRS jack are not reported
+ * (Joe, 2026-11-06: bit 4 follows the 3.5 mm jack only). Plug changes
+ * are logged; the output only follows the 3.5 mm headphone plug with
+ * "Head Unit Auto Switch" on (off by default). Returns the
  * signed step count. */
 static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 				 int n, int *press_ms)
@@ -3057,8 +3064,21 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 			dev_info(chip->dev, "head unit: 3.5 mm headphone plug %s\n",
 				 (st & 0x20) ? "out" : "in");
 		if (chg & 0x10)
-			dev_info(chip->dev, "head unit: mic/line plug %s\n",
+			dev_info(chip->dev, "head unit: 3.5 mm mic plug %s\n",
 				 (st & 0x10) ? "out" : "in");
+		/* headphone plug change: the auto switch (when on) acts on it
+		 * once it has held still. Not on the first read at bring-up. */
+		if ((chg & 0x20) && chip->hu_status_valid) {
+			chip->hu_plug_pending = true;
+			chip->hu_plug_at = jiffies;
+		}
+		/* tell the plug controls' readers */
+		if ((chg & 0x20) && chip->hu_plug_ctl[0])
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &chip->hu_plug_ctl[0]->id);
+		if ((chg & 0x10) && chip->hu_plug_ctl[1])
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &chip->hu_plug_ctl[1]->id);
 		/* bit 6 (headphone amp) follows every output switch: not logged */
 		if (chg & ~0x7a)
 			dev_info(chip->dev, "head unit: status 0x%02x (other bits changed: 0x%02x)\n",
@@ -3306,6 +3326,20 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		}
 	}
 
+	/* auto switch: once per plug change, after it settles; a knob or
+	 * control switch made afterwards stands until the next plug change */
+	if (chip->hu_plug_pending &&
+	    time_after_eq(jiffies, chip->hu_plug_at + msecs_to_jiffies(HU_PLUG_SETTLE_MS))) {
+		int want = !(chip->hu_status & 0x20);
+
+		chip->hu_plug_pending = false;
+		if (chip->hu_auto_hp && chip->hu_switch_to < 0 &&
+		    want != (int)chip->hu_output) {
+			dev_info(chip->dev, "head unit: auto switch to %s (3.5 mm headphone plug %s)\n",
+				 want ? "headphones" : "speakers", want ? "in" : "out");
+			chip->hu_switch_to = want;
+		}
+	}
 	if (chip->hu_switch_to >= 0) {
 		int to = chip->hu_switch_to;
 
@@ -3465,7 +3499,9 @@ static const struct snd_kcontrol_new hu_controls[] = {
 	},
 };
 
-/* "XLR Gain Capture Volume": codec 1 node 0x12 (the XLR mic pin) input
+/* "Mic Gain Capture Volume" (was "XLR Gain"): codec 1 node 0x12 input
+ * (the head unit's input pin: XLR/TRS jack and 3.5 mm mic jack, both
+ * boosted, checked 2026-11-06)
  * amp, 0/1/2 = 0/+10/+20 dB, both channels, exactly as Windows sets it.
  * Not called "Mic Boost" on purpose: PipeWire's mixer paths know that name
  * and would tie it to the mic slider. With this name PipeWire leaves it
@@ -3513,7 +3549,7 @@ static int mic_boost_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 
 static const struct snd_kcontrol_new mic_boost_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-	.name = "XLR Gain Capture Volume",
+	.name = "Mic Gain Capture Volume",
 	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_TLV_READ,
 	.info = mic_boost_info,
 	.get = mic_boost_get,
@@ -3710,8 +3746,63 @@ static const struct snd_kcontrol_new hu_out_control = {
 	.put = hu_out_put,
 };
 
+/* "Head Unit 3.5mm Phones Plugged" (head unit's 3.5 mm headphone jack,
+ * status bit 5) and "Head Unit 3.5mm Mic Plugged" (head unit's 3.5 mm mic
+ * jack, bit 4; not the XLR/TRS jack): read-only, for apps to show. Named
+ * without "Jack" on purpose: PipeWire switches outputs on "... Jack"
+ * controls; switching is left to "Head Unit Auto Switch". */
+static int hu_plug_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->hu_status_valid &&
+				     !(chip->hu_status & kc->private_value);
+	return 0;
+}
+
+static const struct snd_kcontrol_new hu_plug_controls[2] = {
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Head Unit 3.5mm Phones Plugged",
+	  .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	  .info = snd_ctl_boolean_mono_info, .get = hu_plug_get, .private_value = 0x20 },
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Head Unit 3.5mm Mic Plugged",
+	  .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	  .info = snd_ctl_boolean_mono_info, .get = hu_plug_get, .private_value = 0x10 },
+};
+
+/* "Head Unit Auto Switch": off (default) = plugs only log; on = the 3.5 mm
+ * headphone plug switches headphones in and out. */
+static int hu_auto_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->hu_auto_hp;
+	return 0;
+}
+
+static int hu_auto_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->hu_auto_hp)
+		return 0;
+	chip->hu_auto_hp = on;
+	dev_info(chip->dev, "head unit: auto switch %s\n", on ? "on" : "off");
+	return 1;
+}
+
+static const struct snd_kcontrol_new hu_auto_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Head Unit Auto Switch",
+	.info = snd_ctl_boolean_mono_info,
+	.get = hu_auto_get,
+	.put = hu_auto_put,
+};
+
 static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 {
+	int i;
+
 	chip->hu_att = HU_ATT_DEFAULT;
 	chip->hu_att_out[0] = chip->hu_att_out[1] = HU_ATT_DEFAULT;
 	chip->hu_output = 0;		/* the boot replay selects speakers */
@@ -3735,6 +3826,15 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 		chip->hu_vol_ctl = NULL;
 	if (snd_ctl_add(chip->card, chip->hu_mute_ctl) < 0)
 		chip->hu_mute_ctl = NULL;
+	chip->hu_auto_hp = hu_auto_switch;
+	chip->hu_auto_ctl = snd_ctl_new1(&hu_auto_control, chip);
+	if (snd_ctl_add(chip->card, chip->hu_auto_ctl) < 0)
+		chip->hu_auto_ctl = NULL;
+	for (i = 0; i < 2; i++) {
+		chip->hu_plug_ctl[i] = snd_ctl_new1(&hu_plug_controls[i], chip);
+		if (snd_ctl_add(chip->card, chip->hu_plug_ctl[i]) < 0)
+			chip->hu_plug_ctl[i] = NULL;
+	}
 }
 
 static void creative_ae9_hb_work(struct work_struct *work)

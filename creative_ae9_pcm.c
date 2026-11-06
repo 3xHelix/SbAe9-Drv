@@ -283,7 +283,7 @@ module_param(pcm_rates, uint, 0644);
 MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz (default), 2 = also 44.1/88.2 kHz (experimental)");
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
- * -> front RCA, Center/Sub jack, Rear jack; checked by ear 2026-11-04) and
+ * -> card's RCA, C/Sub jack, Rear jack; checked by ear 2026-11-04) and
  * the 4.0/4.1/5.1 speaker configs. PipeWire offers it as a profile with
  * config/creative-ae9.conf. Takes effect at the next stream open.
  */
@@ -835,7 +835,7 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 
 /* ------------------------------------------------------------------ */
 /* Capture: input stream 0 (BAR0+0x80), tag 1, from codec 1 node 0x07	  */
-/* (the head unit's input: the XLR/TRS combo and the 3.5 mm line-in	  */
+/* (the head unit's input: its XLR/TRS jack and its 3.5 mm mic jack	  */
 /* share it; Windows lists them as Microphone and Aux), as in the	  */
 /* Windows recording capture. 48 or 96 kHz (Creative: mic up to 96 kHz); */
 /* Windows' 96 kHz recording is the stream format 0x831 and the same	  */
