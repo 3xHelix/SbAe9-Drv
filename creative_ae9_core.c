@@ -3397,6 +3397,13 @@ MODULE_PARM_DESC(corb_rings, "Start the CORB/RIRB command rings (1=yes, default;
  * ASMedia bridge, none otherwise.
  */
 static int dma_pad = -1;
+
+/* posted_flush: -1 = auto (on behind an ASMedia bridge), 0 = off, 1 = on;
+ * see creative_ae9.h */
+bool ae9_posted_flush;
+static int posted_flush = -1;
+module_param(posted_flush, int, 0444);
+MODULE_PARM_DESC(posted_flush, "Read back after every register write, as Windows: -1 = auto (ASMedia bridge, default), 0 = off, 1 = on");
 module_param(dma_pad, int, 0444);
 MODULE_PARM_DESC(dma_pad, "Spare KB after every DMA buffer (-1=auto: 64 behind an ASMedia bridge, else 0; default)");
 
@@ -3840,6 +3847,10 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	    pdev->bus->self->device == 0x1080)
 		chip->asmedia = true;
 	chip->dma_pad = (dma_pad < 0 ? (chip->asmedia ? 64 : 0) : dma_pad) * 1024;
+	ae9_posted_flush = posted_flush < 0 ? chip->asmedia : !!posted_flush;
+	if (ae9_posted_flush)
+		dev_info(&pdev->dev, "posted_flush: every register write is read back (%s)\n",
+			 posted_flush < 0 ? "ASMedia bridge" : "posted_flush=1");
 	if (chip->asmedia || chip->dma_pad)
 		dev_info(&pdev->dev, "bridge %s%s: %zu KB spare after each DMA buffer\n",
 			 pdev->bus->self ? pci_name(pdev->bus->self) : "-",
