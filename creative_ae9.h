@@ -56,7 +56,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.8.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -198,11 +198,15 @@ struct creative_chip {
 	bool			spdif_out;	/* "Optical Out Playback Switch" */
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
-	struct snd_pcm_substream *opt_substream;	/* optical in capture */
-	void			*opt_bdl_raw;
-	void			*opt_bdl;
-	dma_addr_t		opt_bdl_dma;
-	size_t			opt_bdl_size;
+	/* extra capture devices (creative_ae9_pcm.c): [0] optical in (PCM
+	 * device 1), [1] What U Hear (device 2) */
+	struct ae9_xcap_state {
+		struct snd_pcm_substream *substream;
+		void		*bdl_raw;
+		void		*bdl;
+		dma_addr_t	bdl_dma;
+		size_t		bdl_size;
+	} xcap[2];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
 	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
@@ -392,7 +396,7 @@ u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
 void creative_ae9_cap_irq(struct creative_chip *chip);
-void creative_ae9_opt_irq(struct creative_chip *chip);
+void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
 extern unsigned int ae9_sentinel_clear;
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);

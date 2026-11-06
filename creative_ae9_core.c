@@ -4538,14 +4538,16 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 		}
 	}
 
-	/* input stream 0: capture (XLR); input stream 1: optical in */
+	/* input streams: 0 capture (XLR), 1 optical in, 2 What U Hear */
 	if (intsts & 0x1)
 		creative_ae9_cap_irq(chip);
 	if (intsts & 0x2)
-		creative_ae9_opt_irq(chip);
+		creative_ae9_xcap_irq(chip, 0);
+	if (intsts & 0x4)
+		creative_ae9_xcap_irq(chip, 1);
 
 	/* Acknowledge stream interrupts and notify ALSA of period completion */
-	if (intsts & AZX_INT_ALL_STREAM & ~0x3) {
+	if (intsts & AZX_INT_ALL_STREAM & ~0x7) {
 		u8 sd_sts = readb(chip->hda_regs +
 				  chip->playback_stream_base + AZX_REG_SD_STS);
 		if (sd_sts & SD_INT_COMPLETE) {

@@ -3,6 +3,18 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## 0.9.0 (2026-11-06)
+
+Now it can hear itself. 👂
+
+- What U Hear: a new recording device, `hw:AE9,2`, that records what the
+  card plays, in Direct Mode and through the DSP. A test tone comes back
+  level-exact, both channels identical. `config/ae9-what-u-hear.conf`
+  adds it to PipeWire as "AE-9 What U Hear". 48 kHz for now. Another
+  pointer from DarkNikGr's notes: it's the loopback input the kernel's
+  ca0132 driver already knows, on a node Windows switches on at boot.
+- Under the hood: optical in and What U Hear share one capture setup.
+
 ## 0.8.0 (2026-11-05)
 
 The optical jacks wake up. 🔦
