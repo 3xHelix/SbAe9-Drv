@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 # Give the AE-9 its own PipeWire profile set (stereo + 5.1) instead of the
 # stereo fallback. Install to /etc/udev/rules.d/ next to the profile set
 # (config/creative-ae9.conf). Same match as PipeWire's own card rules.

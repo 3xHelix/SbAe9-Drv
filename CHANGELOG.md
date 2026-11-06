@@ -3,6 +3,115 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on one card (IDT bridge, `10e3:8111`).
 
+## Unreleased
+
+- "Head Unit Phantom Power": shows and switches the head unit's 48 V
+  phantom power (the head unit's button works too; Windows' software can
+  only read it). Always off at start-up and after waking; "on" is refused
+  for the first 30 s so a restored mixer state can't switch it on. The log
+  says "head unit: phantom power on/off".
+- Cleanup: the old pre-Windows start-up path is gone (about 5,700 lines),
+  with the module options that only it used: `post_windows`,
+  `enable_audio_path`, `hu_boot_ms`, `loop_start`, `lineout_prerun`. A
+  leftover option in modprobe.d just logs "unknown parameter".
+- What U Hear records at 48 or 96 kHz (`hw:AE9,2`, `wuh_96k`, default on),
+  checked level-exact with the card playing at 48 or 96 kHz.
+
+## 0.9.4 (2026-11-06)
+
+More rates, more surround, and Direct Mode that switches cleanly. 🎚️
+All found by reading a fresh Windows capture overnight, then tested on the
+card. Pairs with [SbAe9-SBC v0.10.0](https://github.com/3xHelix/SbAe9-SBC),
+released alongside: its rate picker offers each mode's rates.
+
+- **44.1 and 88.2 kHz playback works, on by default** (stereo). The DAC
+  needed three commands Windows sends only for that family; without them
+  these rates played garbled or silent. `pcm_rates=2` is the new default
+  (1 = without 44.1/88.2, 0 = 48 kHz only); `dac_441` (1) sends the
+  commands. Add 44100 and 88200 to PipeWire's `clock.allowed-rates` and
+  44.1 kHz music plays at its own rate.
+- **5.1 at 192 kHz** in Direct Mode, all six jacks right. The router
+  layout is Windows' own (our 96 kHz one, extended). `surround_192k` (1);
+  384 kHz stays stereo, as on Windows. 5.1 opens at 48, 96 or 192 kHz.
+- **96 kHz through the DSP** (Direct Mode off), stereo and 5.1, with SBX.
+  `dsp_96k` (1; 0 = 48 kHz only, as before).
+- **Direct Mode on while playing:** the stream now restarts by itself and
+  plays on, direct. Before, it went silent until you paused and played.
+- **Fixed: a left/right echo in DSP mode** after a 5.1 (or 96 kHz+) stream
+  in Direct Mode. Leftover direct routes played one channel twice; DSP mode
+  now switches them off. The same leftovers caused the old 96 kHz echo.
+- `scripts/ae9-surround-test.sh` takes `RATE=96000` or `RATE=192000` with
+  `--direct`.
+
+-- 3xHelix
+
+## 0.9.3 (2026-11-06)
+
+The head unit learns what's plugged into it. 🎧
+
+- Plug controls: "Head Unit 3.5mm Phones Plugged" (the head unit's 3.5 mm
+  headphone jack) and "Head Unit 3.5mm Mic Plugged" (its 3.5 mm mic jack),
+  read-only, with change events so apps can follow them live. The 1/4"
+  headphone jack and the XLR/TRS jack don't report plugs.
+- Auto headphone switch, opt-in: "Head Unit Auto Switch" (off by default,
+  `hu_auto_switch=1` to start on). Plug into the head unit's 3.5 mm
+  headphone jack = headphones, unplug = speakers, once the plug has held
+  still about 1.5 s, so a wiggly plug can't flap. It acts once per plug
+  change: a knob switch afterwards stays. Off, plugs only log, as before.
+- **Renamed: "XLR Gain" is now "Mic Gain"** (`Mic Gain Capture Volume`). It
+  boosts both head unit jacks, XLR/TRS and 3.5 mm mic (checked: +20 dB on
+  each). Scripts using `sset 'XLR Gain'` need the new name; a saved setting
+  starts back at the default +10 dB.
+- Names say where each jack lives (head unit vs card): the optional desktop
+  name in `config/61-ae9-names.conf` is now "AE-9 Head Unit Mic / Aux",
+  the log says "3.5 mm mic plug", and the docs name the card's RCA, Rear and
+  C/Sub jacks and the head unit's 3.5 mm and 1/4" headphone jacks.
+- `scripts/ae9-full-dump.sh` leaves an "ae9-full-dump: saved <file>" line
+  in the kernel log, so a later log shows a dump was taken and where it went.
+
+## 0.9.2 (2026-11-06)
+
+Tidy-ups, and a tool for anyone who hits a problem. 🧰
+
+- `scripts/ae9-full-dump.sh` ships with the driver: one command that saves
+  everything we can read about the card, for bug reports. It now also covers
+  the optical, What U Hear and extra capture streams.
+- Debug interface tidy-ups: `chipiow` is serialised like `chipior`, the
+  4-argument immediate-command `verb` is now `icwverb` (it could never run),
+  and `w0`/`w2` print the value written.
+- Waking from sleep with the knob light off: the light is now switched off
+  again by the head unit's regular poll, instead of a separate write that
+  could collide with it.
+
+## 0.9.1 (2026-11-06)
+
+The mic gets the same treatment as the speakers. 🎙️
+
+- Recording at 96 kHz too (head unit's XLR and 3.5 mm input; Creative's
+  limit). The trick was the order: the codec takes its rate when it's
+  bound to the stream, so the recording's format now goes in before the
+  bind, as Windows does. Before that a 96 kHz recording got 48 kHz-rate
+  data and played back twice as fast.
+- 24- or 32-bit recording, as Windows offers ("Capture Bit Depth"). At
+  32-bit the card sends full 32-bit samples (the mic path runs through the
+  DSP); it sounds the same, the extra bits sit below the mic's noise floor.
+- "Aux" solved: Windows' Aux device is the head unit's 3.5 mm line-in,
+  which shares the XLR/TRS input, so it already worked.
+  `config/61-ae9-names.conf` names that input "AE-9 Mic / Line In" in the
+  desktop.
+
+## 0.9.0 (2026-11-06)
+
+Now it can hear itself. 👂
+
+- What U Hear: a new recording device, `hw:AE9,2`, that records what the
+  card plays, in Direct Mode and through the DSP. A test tone comes back
+  level-exact, both channels identical. `config/ae9-what-u-hear.conf`
+  adds it to PipeWire as "AE-9 What U Hear". 48 kHz for now. Another
+  pointer from DarkNikGr's notes: it's the loopback input the kernel's
+  ca0132 driver already knows, on a node Windows switches on at boot.
+- Under the hood: optical in and What U Hear share one capture setup.
+
 ## 0.8.0 (2026-11-05)
 
 The optical jacks wake up. 🔦
@@ -88,7 +197,7 @@ Upgrading from 0.6.8: rebuild, replace the module (`sudo depmod -a`),
 reboot (PSU off is the safest start). Drop `surround_96k=1` from your
 options file if you added it; it's the default now.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.8 (2026-11-04)
 
@@ -140,7 +249,7 @@ Upgrading from 0.6.7: rebuild, replace the module (`sudo depmod -a`),
 reboot (PSU off is the safest start). You can drop `pcm_rates=1` and
 `pcm_bits=32` from your options file; use the control instead.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.7 (2026-11-04)
 
@@ -212,7 +321,7 @@ Upgrading from 0.6.6: rebuild, replace the module (`sudo depmod -a`),
 install the two PipeWire files (setup step 4), reboot. First boot: a PSU
 power-off is the safest start.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.6 (2026-11-04)
 
@@ -236,7 +345,7 @@ Upgrading from 0.6.5: `sudo dnf install dkms kernel-devel` if you don't
 have them, then `sudo scripts/dkms-install.sh` and reboot. That's the last
 time you copy a .ko by hand.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.5 (2026-11-04)
 
@@ -289,7 +398,7 @@ control panel.
 Upgrading from 0.6.4: rebuild, replace the module, `sudo depmod -a`,
 reboot.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.4 (2026-11-04)
 
@@ -338,7 +447,7 @@ between. 99% on the money, and now that last 1% too.
 Upgrading from 0.6.3: rebuild, replace the module, `sudo depmod -a`,
 reboot. Muscle memory heads up: knob light is 3 s now.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.3 (2026-11-04)
 
@@ -399,7 +508,7 @@ Upgrading from 0.6.2: rebuild for your kernel, replace the module,
 DSP mode ever comes up silent after a reboot, power off at the PSU for
 20 seconds. A warm reboot keeps the card's bad mood.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.2 (2026-11-04)
 
@@ -436,7 +545,7 @@ Upgrading from 0.6.1: replace the module, `sudo depmod -a`, reboot. If
 DSP mode ever sounds wrong after an update, power off at the PSU once;
 a warm reboot keeps the card's old state.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.1 (2026-11-04)
 
@@ -522,7 +631,7 @@ Direct Mode as in 0.5.0 (48/96/192 kHz, recording, sleep).
 
 Upgrading from 0.5.0: replace the module, `sudo depmod -a`, reboot.
 
-If you've got an AE-9 and Linux, try it and tell me what breaks. -- Joe
+If you've got an AE-9 and Linux, try it and tell me what breaks. -- 3xHelix
 
 ## 0.5.0 (2026-11-03)
 

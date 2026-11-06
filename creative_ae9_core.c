@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
+// and from s3boun3t/ae9_build (driver/ca0132/ca0132.c, GPL-2.0-or-later):
+//   the AE-9 init sequence (ca0132_mmio_init_ae9, ae9_acm_init).
 //
 // Creative Sound Blaster AE-9 / X-Fi (CA0132) HDA controller driver
 //
@@ -29,7 +35,7 @@
 #include "creative_ae9_switch_ops.h"
 #include "creative_ae9_warm_verbs.h"
 
-MODULE_AUTHOR("openco de");
+MODULE_AUTHOR("3xHelix");
 MODULE_DESCRIPTION(CREATIVE_AE9_DRV_DESC);
 MODULE_LICENSE("GPL");
 MODULE_VERSION(CREATIVE_AE9_DRV_VERSION);
@@ -117,11 +123,6 @@ static unsigned int acm_heartbeat_ms = 500;
 module_param(acm_heartbeat_ms, uint, 0444);
 MODULE_PARM_DESC(acm_heartbeat_ms, "Head-unit heartbeat poll interval (ms, 0=off)");
 
-/* Engage the analog output path (DAC route + amp enable) after ACM init. */
-static unsigned int enable_audio_path = 1;
-module_param(enable_audio_path, uint, 0444);
-MODULE_PARM_DESC(enable_audio_path, "Run DAC route + amp enable after ACM init (1=on)");
-
 /*
  * PCI config register 0x40 on the Creative controller reads 0x8080 after a
  * cold power-on; the Windows driver leaves it at 0x0080 (bit 15 cleared).
@@ -141,10 +142,6 @@ MODULE_PARM_DESC(pcicfg40_fix, "PCI config reg 0x40 bit 15: 1=clear at probe, 2=
 static unsigned int codec2_first = 1;
 module_param(codec2_first, uint, 0444);
 MODULE_PARM_DESC(codec2_first, "Replay codec 2 init verbs before codec 1, as Windows does (1=on, default)");
-
-static unsigned int hu_boot_ms;
-module_param(hu_boot_ms, uint, 0444);
-MODULE_PARM_DESC(hu_boot_ms, "GPIO5 on + wait this many ms before audio_loop_start probes (0=off)");
 
 /*
  * fw_split: ae9_initseq_codec1 is Windows' codec-1 boot stream, including
@@ -210,21 +207,12 @@ MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM s
  * other pre-download verb through the CORB. With win_reset2=1 we do the
  * same before the pre-download replay.
  */
+/* seconds after a bring-up during which phantom power "on" is refused */
+#define AE9_PHANTOM_HOLD_S	30
+
 static unsigned int win_reset2 = 1;
 module_param(win_reset2, uint, 0444);
 MODULE_PARM_DESC(win_reset2, "Second controller reset + CORB start before the pre-download replay, as Windows does (1=on, default)");
-
-/*
- * post_windows=1: after the boot handshake + tail, skip our own post-boot
- * setup (standup, DAC enable, CA0113 handshake, amp/route, ACM work's
- * second reset / HP output preset) and replay Windows' BAR2 activity from
- * the same point of the cold capture instead (CA0113 commands, head-unit
- * SPI frames incl. the "-SP-" speaker label, GPIO writes). The heartbeat
- * stays.
- */
-static unsigned int post_windows = 1;
-module_param(post_windows, uint, 0444);
-MODULE_PARM_DESC(post_windows, "Replay Windows' post-boot BAR2 activity instead of our setup (1=on, default)");
 
 /* bring-up attempts if the DSP misses its handshake (probe and resume),
  * and the wait before each resume attempt / between retries */
@@ -234,10 +222,6 @@ MODULE_PARM_DESC(resume_delay_ms, "Wait before each resume bring-up attempt and 
 static unsigned int resume_tries = 3;
 module_param(resume_tries, uint, 0644);
 MODULE_PARM_DESC(resume_tries, "Bring-up attempts (probe and resume) if the DSP doesn't answer");
-
-static unsigned int loop_start;
-module_param(loop_start, uint, 0444);
-MODULE_PARM_DESC(loop_start, "Run the post-firmware audio_loop_start SPI probes (0=skip, default; saves ~80s when they time out)");
 
 /*
  * verb_log: record every verb sent and every response read (ICW and CORB)
@@ -836,7 +820,7 @@ static size_t ae9_chipio_w(u32 *t, size_t n, u32 addr, u32 data)
  * 5.1: the other DAC pairs. Windows' Direct Mode with 5.1 speakers
  * (capture 6, 23:39:16) writes 0x190060..74 = HDA 00..05 -> 40, 41, 50,
  * 51, 60, 61, in its channel order FL FR FC LFE BL BR: 0x50/0x51 = the
- * Center/Sub jack, 0x60/0x61 = the Rear jack. With a 6-channel stream in
+ * card's C/Sub jack, 0x60/0x61 = the card's Rear jack. With a 6-channel stream in
  * DSP mode the 8051 sends DSP outputs c2..c7 into SRCs that lead nowhere
  * (2026-11-04 dump), so like the front pair they're pointed at these
  * ports by hand, at 0x190068..74 as Windows does. surround_ports = the
@@ -1102,6 +1086,13 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 			else if (dst == 0xe1 && er < 0)
 				er = src;
 		}
+		/*
+		 * DSP inputs: at 48 kHz HDA -> SRC -> DSP (00 -> 91 -> c0 ...);
+		 * at 96 kHz, the DSP's own rate, the 8051 wires HDA slots
+		 * straight in (00..0b -> c0..cb, state 3; 2026-11-06 dumps).
+		 */
+		if ((dst & 0xe0) == 0xc0 && src < 0x20)
+			inputs++;
 		if ((dst & 0xe0) == 0xc0 && src >= 0x80 && src < 0xc0) {
 			inputs++;
 			if (src == 0x90)
@@ -1137,6 +1128,35 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 			ins++;
 			inputs++;
 		}
+	}
+	/*
+	 * Stale direct bypasses: in DSP mode host audio reaches the DACs only
+	 * through the DSP, so an HDA slot wired straight to a DAC port is
+	 * left over from an earlier Direct Mode stream (5.1, or above
+	 * 48 kHz). Nothing removed them: 0x190068 = HDA 01 -> 0x41 played
+	 * the right channel direct and through the DSP, a left/right echo
+	 * (2026-11-06, 48 kHz stereo after a 5.1 direct stream). Switch them
+	 * off; the 5.1 ports below are rewritten after this.
+	 */
+	{
+		unsigned int stale = 0;
+
+		for (i = 0; i < n; i++) {
+			u32 a = 0x190000 + 4 * i;
+			u8 sv = e[i] & 0xff, dv = (e[i] >> 8) & 0xff;
+
+			if (a == AE9_RT_FRONT_L || a == AE9_RT_FRONT_R ||
+			    !((e[i] >> 16) & 3) || sv >= 0x20 ||
+			    dv < 0x40 || dv >= 0x80)
+				continue;
+			ae9_rt_write_checked(chip, a, e[i] & 0xffff,
+					     &unsteady, &retried, &failed);
+			e[i] &= 0xffff;
+			stale++;
+		}
+		if (stale)
+			dev_info(chip->dev, "SBX: router: switched off %u stale direct bypass%s (HDA -> DAC)\n",
+				 stale, stale == 1 ? "" : "es");
 	}
 	ae9_rt_write_checked(chip, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
 			     &unsteady, &retried, &failed);
@@ -1445,6 +1465,11 @@ void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
  * (any CA0113 command or a resume clears dac_start_key). 0 = send them at
  * every start, as Windows does.
  */
+/* 44.1/88.2 kHz: send Windows' extra DAC commands (see below). */
+static bool dac_441 = true;
+module_param(dac_441, bool, 0644);
+MODULE_PARM_DESC(dac_441, "44.1/88.2 kHz: send Windows' DAC commands 48/01 = 0xc1, 48/0b = 0x00, 0x20 (1 = yes, default; 0 = as before)");
+
 static bool dac_start_skip = true;
 module_param(dac_start_skip, bool, 0644);
 MODULE_PARM_DESC(dac_start_skip, "Skip the DAC start commands when rate and output are unchanged (1 = yes, default; 0 = every start, as Windows)");
@@ -1476,38 +1501,69 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
 			ae9_pcm_rates[r].rate);
 	} else if (start && !atomic && ae9_ca0113_windows) {
-		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm)][3];
+		/* the captured 12, plus two for the 44.1 kHz family */
+		u8 cmds[ARRAY_SIZE(ae9_cold_ca0113_pcm) + 2][3];
+		bool fam441 = ae9_pcm_rates[r].route == AE9_ROUTE_SRC && dac_441;
+		size_t n = 0;
 
-		memcpy(cmds, ae9_cold_ca0113_pcm, sizeof(cmds));
-		for (i = 0; i < ARRAY_SIZE(cmds); i++) {
-			if (cmds[i][0] == 0x48 && cmds[i][1] == 0x1d)
-				cmds[i][2] = hp ? 0x80 : 0x40;
-			else if (cmds[i][0] == 0x48 && cmds[i][1] == 0x19)
-				cmds[i][2] = hp ? 0x01 : 0x00;
-			else if (cmds[i][0] == 0x48 && cmds[i][1] == 0x0a)
-				cmds[i][2] = ae9_pcm_rates[r].dac0a;
+		for (i = 0; i < ARRAY_SIZE(ae9_cold_ca0113_pcm); i++) {
+			u8 *c = cmds[n];
+
+			memcpy(c, ae9_cold_ca0113_pcm[i], 3);
+			if (c[0] == 0x48 && c[1] == 0x1d)
+				c[2] = hp ? 0x80 : 0x40;
+			else if (c[0] == 0x48 && c[1] == 0x19)
+				c[2] = hp ? 0x01 : 0x00;
+			else if (c[0] == 0x48 && c[1] == 0x01 && fam441)
+				c[2] = 0xc1;
+			else if (c[0] == 0x48 && c[1] == 0x0a) {
+				/*
+				 * 44.1/88.2 kHz: Windows sends 48/01 = 0xc1
+				 * (0xc0 for the 48 kHz family) and 48/0b =
+				 * 0x00 then 0x20 before 48/0a, at every such
+				 * start (all captures; 2026-11-05 01:59:56
+				 * and 02:00:18). Without them our 44.1 kHz
+				 * played garbled or silent.
+				 */
+				if (fam441) {
+					static const u8 b0[3] = { 0x48, 0x0b, 0x00 };
+					static const u8 b20[3] = { 0x48, 0x0b, 0x20 };
+
+					memcpy(cmds[n++], b0, 3);
+					memcpy(cmds[n++], b20, 3);
+					c = cmds[n];
+					memcpy(c, ae9_cold_ca0113_pcm[i], 3);
+				}
+				c[2] = ae9_pcm_rates[r].dac0a;
+			}
+			n++;
 		}
-		creative_dsp_ca0113_replay(chip, cmds, ARRAY_SIZE(cmds),
-					   "playback-start commands");
+		creative_dsp_ca0113_replay(chip, cmds, n,
+					   fam441 ? "playback-start commands (44.1 kHz family)" :
+						    "playback-start commands");
 		chip->dac_start_key = (r + 1) | hp << 8;
 	}
 	if (start) {
 		bool src = ae9_pcm_rates[r].route == AE9_ROUTE_SRC;
 		/*
-		 * A 6-channel stream (5.1) in Direct Mode, at up to 96 kHz. Not
+		 * A 6-channel stream (5.1) in Direct Mode, at up to 192 kHz. Not
 		 * for the DSP-mode lead-in (Direct Mode off, switch pending): a
 		 * lead-in started this way left the DSP with only the front pair
 		 * after the switch (2026-11-04, try 1); started as before
 		 * (stereo setup, front only for those 3 s) it was fine.
 		 */
-		/* ports <= 4: 48 and 96 kHz (this said <= 2 until 2026-11-05, so
-		 * 5.1 at 96 kHz got the stereo setup: front slots only, the
-		 * other channels went wherever the router pointed last) */
-		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 4 &&
+		/* ports <= 8: 48, 96 and 192 kHz (this said <= 2 until
+		 * 2026-11-05, so 5.1 at 96 kHz got the stereo setup: front
+		 * slots only, the other channels went wherever the router
+		 * pointed last) */
+		bool six = (format & 0xf) == 5 && ae9_pcm_rates[r].ports <= 8 &&
 			   chip->fx.direct;
 		const u32 *in = ae9_cold_pcm_start;
 		size_t nin = ARRAY_SIZE(ae9_cold_pcm_start);
-		u32 *t = kmalloc_array(nin + 16 * 4, sizeof(u32),
+		/* room for the added writes: 5.1 at 192 kHz is 4 x 7 words
+		 * for slots 2..5 plus 18 x 4 for slots 6..23 = 100 words;
+		 * stereo 384 kHz 14 x 4 = 56; the converter 26 */
+		u32 *t = kmalloc_array(nin + 32 * 4, sizeof(u32),
 				       atomic ? GFP_ATOMIC : GFP_KERNEL);
 		u32 addr = 0, data;
 		size_t n = 0, k;
@@ -1587,9 +1643,9 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 				 * DAC pair's input + 2s. Without these, 5.1 at
 				 * 96 kHz sent every second sample to whatever the
 				 * slot held last (front inputs left by a 384 kHz
-				 * stream): tinny, stuttering (2026-11-05). Our
-				 * guess from the stereo layout; no Windows capture
-				 * of 5.1 above 48 kHz.
+				 * stream): tinny, stuttering (2026-11-05). Same as
+				 * Windows, slot for slot: 12 slots at 96 kHz, 24 at
+				 * 192 kHz (capture 2026-11-05, 02:01:48 / 02:02:20).
 				 */
 				for (k = 6; k < 3 * ae9_pcm_rates[r].ports; k++)
 					n = ae9_chipio_w(t, n, 0x190060 + 4 * k,
@@ -1662,11 +1718,22 @@ void creative_ae9_cap_replay(struct creative_chip *chip, bool start)
 	if (!chip->corb_buf)
 		return;
 	if (start) {
+		/* Windows' start block sets node 0x07 to its 48 kHz format
+		 * (0x10720031) and then binds it (0x10770610). The codec takes
+		 * the rate at the bind, so the recording's own format goes in
+		 * that slot, before the bind: changing it after left a 96 kHz
+		 * recording getting 48 kHz-rate data (2026-11-06). */
+		u32 start_blk[ARRAY_SIZE(ae9_cap_start)];
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(ae9_cap_start); i++)
+			start_blk[i] = ae9_cap_start[i] == 0x10720031 && chip->cap_format ?
+				       0x10720000 | chip->cap_format : ae9_cap_start[i];
 		creative_ae9_verb_block_replay(chip, ae9_cap_level,
 					       ARRAY_SIZE(ae9_cap_level), false,
 					       "capture: level block");
-		creative_ae9_verb_block_replay(chip, ae9_cap_start,
-					       ARRAY_SIZE(ae9_cap_start), false,
+		creative_ae9_verb_block_replay(chip, start_blk,
+					       ARRAY_SIZE(start_blk), false,
 					       "capture: record start block");
 	} else {
 		creative_ae9_verb_block_replay(chip, ae9_cap_stop,
@@ -1939,12 +2006,13 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	}
 	kfree(retry);
 
-	if (post_windows)
-		creative_ae9_bar2_post_replay(chip);
-	else if (ae9_ca0113_windows)
-		creative_dsp_ca0113_replay(chip, ae9_cold_ca0113_boot,
-					   ARRAY_SIZE(ae9_cold_ca0113_boot),
-					   "boot commands");
+	/* Windows' post-boot BAR2 activity: CA0113 commands, head-unit SPI
+	 * frames (incl. the "-SP-" speaker label), GPIO writes */
+	creative_ae9_bar2_post_replay(chip);
+	/* the replay switched phantom power off (f0 05 03 02 01 00); hold
+	 * "on" requests off for a while, see hu_phantom_put */
+	chip->hu_phantom_req = -1;
+	chip->hu_phantom_hold = jiffies + AE9_PHANTOM_HOLD_S * HZ;
 	chip->rt_ff_logged = false;
 }
 
@@ -1987,54 +2055,6 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 		 frames, noreply, cmds, writes);
 }
 
-static unsigned int creative_ae9_corb_replay(struct creative_chip *chip,
-					     unsigned int cad,
-					     const struct ae9_initverb *seq,
-					     size_t count)
-{
-	unsigned int errs = 0;
-	size_t i;
-
-	for (i = 0; i < count; i++) {
-		u32 resp = 0;
-		u32 verb = creative_ae9_verb(cad, seq[i].nid, seq[i].verb,
-					     seq[i].payload);
-		if (creative_ae9_corb_send_verb_sync(chip, verb, &resp) < 0)
-			errs++;
-		udelay(40);
-	}
-	return errs;
-}
-
-/* Public wrapper — replay all init verbs for both codecs via CORB.
- * Used by the self-reset path after hw_reset + corb_init: at that
- * point CORB is already running so ICW (creative_ae9_replay_init) is
- * blocked (IRS stuck at 0x0005). Send via corb_send_verb_sync instead. */
-void creative_ae9_replay_init_all(struct creative_chip *chip)
-{
-	unsigned int errs = 0;
-
-	if (cold_prefw && creative_ae9_fw_split_ok(chip)) {
-		dev_info(chip->dev, "self-reset: replaying cold pre-download verbs via CORB\n");
-		creative_ae9_replay_cold(chip);
-		return;
-	}
-
-	dev_info(chip->dev, "self-reset: replaying init verbs via CORB%s\n",
-		 codec2_first ? " (codec 2 first)" : "");
-
-	if (codec2_first)
-		errs += creative_ae9_corb_replay(chip, 2, ae9_initseq_codec2,
-						 ARRAY_SIZE(ae9_initseq_codec2));
-	errs += creative_ae9_corb_replay(chip, 1, ae9_initseq_codec1,
-					 creative_ae9_codec1_prefw_count(chip));
-	if (!codec2_first)
-		errs += creative_ae9_corb_replay(chip, 2, ae9_initseq_codec2,
-						 ARRAY_SIZE(ae9_initseq_codec2));
-	dev_info(chip->dev, "self-reset: init verb replay done (%u errors)\n",
-		 errs);
-}
-
 /* ------------------------------------------------------------------ */
 /* BAR2 extended register initialization				  */
 /*								  */
@@ -2056,25 +2076,6 @@ void creative_ae9_replay_init_all(struct creative_chip *chip)
 #define CREATIVE_BAR2_NUM_STREAMS	4
 #define CREATIVE_BAR2_STREAM_STRIDE	0x40
 #define CREATIVE_DSP_WAIT_MS		50
-
-/* AE-5/AE-7 initialization arrays from kernel patch_ca0132.c */
-static const unsigned int ca0113_mmio_init_address_ae5[] = {
-	0x400, 0x42c, 0x46c, 0x4ac, 0x4ec, 0x43c, 0x47c, 0x4bc, 0x4fc, 0x408,
-	0x100, 0x410, 0x40c, 0x100, 0x100, 0x830, 0x86c, 0x800, 0x86c, 0x800,
-	0x804, 0x20c, 0x01c, 0xc0c, 0xc00, 0xc04, 0xc0c, 0xc0c, 0xc0c, 0xc0c,
-	0xc08, 0xc08, 0xc08, 0xc08, 0xc08, 0xc04, 0x01c
-};
-
-static const unsigned int ca0113_mmio_init_data_ae5[] = {
-	0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-	0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
-	0x00000600, 0x00000014, 0x00000001, 0x0000060f, 0x0000070f,
-	0x00000aff, 0x00000000, 0x0000006b, 0x00000001, 0x0000006b,
-	0x00000057, 0x00800000, 0x00880680, 0x00000080, 0x00000030,
-	0x00000000, 0x00000000, 0x00000003, 0x00000003, 0x00000003,
-	0x00000001, 0x000000f1, 0x00000001, 0x000000c7, 0x000000c1,
-	0x00000080, 0x00880680
-};
 
 /* Windows' BAR2 init writes, in capture order (cold-boot trace lines 1-114) */
 static const struct { u16 reg; u32 val; } ae9_bar2_init_windows[] = {
@@ -2271,156 +2272,6 @@ void creative_ae9_hw_init(struct creative_chip *chip)
 static struct creative_chip *g_dbg_chip;
 static char g_dbg_result[128];
 
-/* ------------------------------------------------------------------ */
-/* Manual PCM stream test driven from debugfs (no ALSA, no auto-open).  */
-/* Lets us bring up the DMA stream step-by-step; a hang pinpoints the   */
-/* exact operation. Uses stream descriptor index 4 (BAR0+0x100),	  */
-/* stream tag 1.							  */
-/*									  */
-/* KEY: node 0x15 (WIDGET_CHIP_CTRL) is the REAL DSP audio input —	  */
-/* it has FIFO=0x4500. Node 0x02 has FIFO=0 (dummy/proxy). The 0x0071	  */
-/* capture binds node 0x15 with format 0x47 (8ch/24bit) to the stream.	  */
-/* Without this, samples never enter the DSP processing pipeline.	  */
-/* ------------------------------------------------------------------ */
-#define PT_BASE		0x100	/* stream descriptor index 4 */
-#define PT_TAG		1
-#define PT_DSP_NID	0x15	/* real DSP audio input (FIFO=0x4500) */
-#define PT_DAC_NID	0x02	/* kept for secondary binding */
-#define PT_BUF_SZ	0x18000	/* 96 KB ring */
-/* Cold-boot VM capture with confirmed working audio:
- * MMIO shows SD_FMT=0x0041, nid=0x15 SET_FMT=0x0041 (playback),
- * nid=0x02 SET_FMT=0x0035 (DAC output, different from bus format).
- */
-#define PT_FMT		0x0041	/* stream bus format — matches Windows SD_FMT */
-#define PT_DSP_FMT	0x0041	/* DSP input (nid=0x15) — same as bus format */
-#define PT_DAC_FMT	0x0035	/* DAC output (nid=0x02) — DSP-converted */
-#define PT_CHANS	6
-
-static void *pt_buf, *pt_bdl;
-static dma_addr_t pt_buf_dma, pt_bdl_dma;
-
-static int creative_pcmtest_setup(struct creative_chip *chip)
-{
-	__le32 *bdl;
-	s32 *samples;
-	unsigned int frames, f, c;
-	int phase = 0;
-	u32 ctl, resp;
-
-	if (!pt_buf) {
-		pt_buf = dma_alloc_coherent(chip->dev, PT_BUF_SZ,
-					    &pt_buf_dma, GFP_KERNEL);
-		if (!pt_buf)
-			return -ENOMEM;
-	}
-	if (!pt_bdl) {
-		pt_bdl = dma_alloc_coherent(chip->dev, 256,
-					    &pt_bdl_dma, GFP_KERNEL);
-		if (!pt_bdl)
-			return -ENOMEM;
-	}
-
-	/* Fill buffer with a ~440Hz square wave, 6ch / 24-bit-in-32 @ 48kHz.
-	 * Put the tone on all 6 channels so whichever the DSP routes is audible.
-	 */
-	samples = pt_buf;
-	frames = PT_BUF_SZ / (PT_CHANS * 4);
-	for (f = 0; f < frames; f++) {
-		s32 v = (phase < 55) ? (0x400000) : -(0x400000); /* ~24-bit */
-		for (c = 0; c < PT_CHANS; c++)
-			samples[f * PT_CHANS + c] = v << 8; /* 24-bit in MSBs */
-		if (++phase >= 109)
-			phase = 0;
-	}
-
-	/* BDL: single entry covering the whole buffer, IOC off */
-	bdl = pt_bdl;
-	bdl[0] = cpu_to_le32(lower_32_bits(pt_buf_dma));
-	bdl[1] = cpu_to_le32(upper_32_bits(pt_buf_dma));
-	bdl[2] = cpu_to_le32(PT_BUF_SZ);
-	bdl[3] = cpu_to_le32(0);
-	wmb();
-
-	/* Reset stream descriptor */
-	ctl = readl(chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	ctl &= ~SD_CTL_DMA_START;
-	writel((ctl | SD_CTL_STREAM_RESET) & SD_CTL_WMASK, chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	wmb();
-	udelay(50);
-	writel((ctl & ~SD_CTL_STREAM_RESET) & SD_CTL_WMASK, chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	wmb();
-	udelay(50);
-
-	/* Stream tag in SD_CTL bits 23:20, no interrupt-enable bits.
-	 * NOTE: SD_LVI (0x0c) and SD_FORMAT (0x12) are 16-bit registers;
-	 * SD_FORMAT lives at the unaligned offset 0x112 — a 32-bit access
-	 * there wedges the device (master-abort), so use 16-bit writes.
-	 */
-	ctl = (PT_TAG & 0xf) << 20;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	writel(PT_BUF_SZ, chip->hda_regs + PT_BASE + AZX_REG_SD_CBL);
-	writew(0, chip->hda_regs + PT_BASE + AZX_REG_SD_LVI);
-	writew(PT_FMT, chip->hda_regs + PT_BASE + AZX_REG_SD_FORMAT);
-	writel(lower_32_bits(pt_bdl_dma), chip->hda_regs + PT_BASE + AZX_REG_SD_BDLPL);
-	writel(upper_32_bits(pt_bdl_dma), chip->hda_regs + PT_BASE + AZX_REG_SD_BDLPU);
-	wmb();
-
-	/* SET_STREAM_FORMAT on node 0x15 (real DSP input) and node 0x02 (DAC).
-	 * Stream bus format = 0x41 (48kHz/PCM), DAC format = 0x35 (6ch/24bit).
-	 * Both must match what Windows binds for audio to flow.
-	 */
-	creative_ae9_corb_send_verb_sync(chip,
-		(1 << 28) | (PT_DSP_NID << 20) | (0x2 << 16) | PT_DSP_FMT,
-		&resp);
-	creative_ae9_corb_send_verb_sync(chip,
-		(1 << 28) | (PT_DAC_NID << 20) | (0x2 << 16) | PT_DAC_FMT,
-		&resp);
-
-	scnprintf(g_dbg_result, sizeof(g_dbg_result),
-		  "pcmtest setup ok: buf=0x%llx bdl=0x%llx fmt=0x%x\n",
-		  (u64)pt_buf_dma, (u64)pt_bdl_dma, PT_FMT);
-	return 0;
-}
-
-static void creative_pcmtest_go(struct creative_chip *chip)
-{
-	u32 ctl;
-
-	/*
-	 * Cold-boot VM capture with CONFIRMED WORKING audio on head-unit HP.
-	 * Uses creative_dsp_pcm_start() which has the exact sequence from
-	 * the CORB capture of real working audio.
-	 */
-	creative_dsp_pcm_start(chip, PT_TAG);
-
-	/* Start DMA */
-	ctl = readl(chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	writel((ctl | SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	wmb();
-	scnprintf(g_dbg_result, sizeof(g_dbg_result), "pcmtest go (RUN set)\n");
-}
-
-static void creative_pcmtest_stop(struct creative_chip *chip)
-{
-	u32 ctl, resp;
-
-	ctl = readl(chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	writel((ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	wmb();
-	/* Unbind DAC node */
-	creative_ae9_corb_send_verb_sync(chip,
-		(1 << 28) | (PT_DAC_NID << 20) | (0x706 << 8) | 0, &resp);
-	scnprintf(g_dbg_result, sizeof(g_dbg_result), "pcmtest stopped\n");
-}
-
-static void creative_pcmtest_pos(struct creative_chip *chip)
-{
-	u32 lpib = readl(chip->hda_regs + PT_BASE + AZX_REG_SD_LPIB);
-	u32 ctl = readl(chip->hda_regs + PT_BASE + AZX_REG_SD_CTL);
-	scnprintf(g_dbg_result, sizeof(g_dbg_result),
-		  "pcmtest pos: LPIB=0x%x SD_CTL=0x%x\n", lpib, ctl);
-}
-
 static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 				  size_t len, loff_t *ppos)
 {
@@ -2473,90 +2324,36 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 
-	/* PCM manual test commands (no ALSA / no auto-open) */
-	if (!strncmp(buf, "pcmtest", 7)) {
-		int ret = creative_pcmtest_setup(g_dbg_chip);
-		if (ret < 0)
-			return ret;
-		return len;
-	}
-	if (!strncmp(buf, "pcmgo", 5)) {
-		creative_pcmtest_go(g_dbg_chip);
-		return len;
-	}
-	if (!strncmp(buf, "pcmstop", 7)) {
-		creative_pcmtest_stop(g_dbg_chip);
-		return len;
-	}
-	if (!strncmp(buf, "pcmpos", 6)) {
-		creative_pcmtest_pos(g_dbg_chip);
-		return len;
-	}
-
-	/* "replay1" / "replay2" — re-run captured codec init verb sequence
-	 * (used to apply DSP routing config AFTER the firmware is running).
-	 */
-	if (!strncmp(buf, "replay1", 7)) {
-		creative_ae9_replay_init(g_dbg_chip, 1, ae9_initseq_codec1,
-					 ARRAY_SIZE(ae9_initseq_codec1));
-		scnprintf(g_dbg_result, sizeof(g_dbg_result), "replay1 done\n");
-		return len;
-	}
-	if (!strncmp(buf, "replay2", 7)) {
-		creative_ae9_replay_init(g_dbg_chip, 2, ae9_initseq_codec2,
-					 ARRAY_SIZE(ae9_initseq_codec2));
-		scnprintf(g_dbg_result, sizeof(g_dbg_result), "replay2 done\n");
-		return len;
-	}
-
-	/* "acm" — head-unit display I2C init (DSP I2C ctrl + 29 ACM tx) */
-	if (!strncmp(buf, "acm", 3)) {
-		writeb(0x3f, g_dbg_chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
-		wmb();
-		creative_i2c_dsp_init(g_dbg_chip);
-		creative_i2c_init(g_dbg_chip);
-		scnprintf(g_dbg_result, sizeof(g_dbg_result), "acm init done\n");
-		return len;
-	}
-	/* "dspae9" — full AE-9 post-firmware DSP audio-router standup */
-	if (!strncmp(buf, "dspae9", 6)) {
-		int ret = creative_dsp_ae9_standup(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dspae9 ret=%d\n", ret);
-		return len;
-	}
-	/* "dspstreams" — start DSP internal audio router streams */
-	if (!strncmp(buf, "dspstreams", 10)) {
-		int ret = creative_dsp_start_audio_streams(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dspstreams ret=%d\n", ret);
-		return len;
-	}
-	/* "dspout" — route DSP audio to rear line-out */
-	if (!strncmp(buf, "dspout", 6)) {
-		int ret = creative_dsp_select_lineout(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dspout ret=%d\n", ret);
-		return len;
-	}
-	/* "dacroute" — replay capture's playback-time head-unit DAC routing
-	 * (targets 0x48/0x49, the path that feeds the rear card RCA).
-	 */
-	if (!strncmp(buf, "dacroute", 8)) {
-		int ret = creative_dsp_headunit_dac_route(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dacroute ret=%d\n", ret);
-		return len;
-	}
 	/* "hutext ABCD": hold text on the head-unit display (shown at the
 	 * next poll, within ~0.5 s); "hutext" alone goes back to the normal
 	 * volume/MUTE display. Printable ASCII only. The frame carries 8
 	 * characters but the display has 4 cells (left-aligned, no scroll;
 	 * dots ride on the cell before them), so only the first 4 show. */
+	/*
+	 * "huframe f0 85 01 02 f7": one raw head-unit frame (hex bytes, up to
+	 * 16). The heartbeat sends it on its next cycle, so it never collides
+	 * with the poll; the reply is logged and shown by reading cmd.
+	 */
+	if (!strncmp(buf, "huframe", 7)) {
+		u8 tx[16];
+		unsigned long flags;
+		unsigned int b;
+		int k = 0, used, i = 7;
+
+		while (k < 16 && sscanf(buf + i, " %x%n", &b, &used) == 1) {
+			tx[k++] = b & 0xff;
+			i += used;
+		}
+		if (k < 3 || tx[0] != 0xf0 || tx[k - 1] != 0xf7)
+			return -EINVAL;
+		spin_lock_irqsave(&g_dbg_chip->lock, flags);
+		memcpy(g_dbg_chip->hu_dbg_tx, tx, k);
+		g_dbg_chip->hu_dbg_len = k;
+		spin_unlock_irqrestore(&g_dbg_chip->lock, flags);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result),
+			  "huframe queued (%d bytes); read again for the reply\n", k);
+		return len;
+	}
 	if (!strncmp(buf, "hutext", 6)) {
 		char t[9] = "";
 		unsigned long flags;
@@ -2597,79 +2394,6 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 			  "hutx reg=0x%02x len=%d sent\n", reg & 0xff, n - 2);
 		return len;
 	}
-	/* "remapstream" — write audio router 0x190000 entries directly */
-	if (!strncmp(buf, "remapstream", 11)) {
-		creative_dsp_write_audio_router(g_dbg_chip);
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "remapstream done\n");
-		return len;
-	}
-	/* "scpreset" — flush SCP command queue via DSPIO_DSP_INIT (0x703) */
-	if (!strncmp(buf, "scpreset", 8)) {
-		int ret = creative_dsp_scp_reset(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "scpreset ret=%d\n", ret);
-		return len;
-	}
-	/* "ampeng" — AMP/RELAY ENGAGE: GPIO pin4 HIGH + ca0113 route (the click) */
-	if (!strncmp(buf, "ampeng", 6)) {
-		int ret = creative_dsp_amp_engage(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "ampeng ret=%d\n", ret);
-		return len;
-	}
-	/* "dacen" — enable codec DAC output amps/coefs (playback unmute) */
-	if (!strncmp(buf, "dacen", 5)) {
-		int ret = creative_dsp_enable_dac_output(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dacen ret=%d\n", ret);
-		return len;
-	}
-	/* "initroute" — init-time head-unit DAC route (0x31 vals, arms DAC) */
-	if (!strncmp(buf, "initroute", 9)) {
-		int ret = creative_dsp_headunit_init_route(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "initroute ret=%d\n", ret);
-		return len;
-	}
-	/* "dsprun" — un-halt the DSP 8051 so it consumes SCP commands */
-	if (!strncmp(buf, "dsprun", 6)) {
-		int ret = creative_dsp_run(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dsprun ret=%d\n", ret);
-		return len;
-	}
-	/* "ampen" — head-unit amp/DAC enable (0x83/0x85/0xb1 output-enable
-	 * block from the capture's playback window; engages the DAC relay).
-	 */
-	if (!strncmp(buf, "ampen", 5)) {
-		int ret = creative_i2c_amp_enable(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "ampen ret=%d\n", ret);
-		return len;
-	}
-	/* "dspfw" — download the DSP firmware (ctefx-desktop.bin) */
-	if (!strncmp(buf, "dspfw", 5)) {
-		int ret = creative_dsp_load_firmware(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dspfw ret=%d\n", ret);
-		return len;
-	}
-	/* "dspprep" — bring up DSP clocks + CT extensions + sanity chipio read */
-	if (!strncmp(buf, "dspprep", 7)) {
-		int ret = creative_dsp_prepare(g_dbg_chip);
-
-		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "dspprep ret=%d\n", ret);
-		return len;
-	}
 	/* "chipior <hex_addx>" — ChipIO read */
 	if (!strncmp(buf, "chipior", 7)) {
 		unsigned int a, v = 0;
@@ -2695,7 +2419,12 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 
 		if (sscanf(buf, "%7s %x %x", op, &a, &v) != 3)
 			return -EINVAL;
+		/* serialized with the driver's own ChipIO use, as chipior */
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		creative_dsp_chipio_addr_invalidate();
 		ret = creative_dsp_chipio_write(g_dbg_chip, a, v);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "chipiow[0x%x]=0x%x ret=%d\n", a, v, ret);
 		return len;
@@ -2733,8 +2462,12 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 
-	/* "verb <cad> <nid> <verbid> <payload>" — send one ICW verb */
-	if (!strncmp(buf, "verb", 4)) {
+	/* "icwverb <cad> <nid> <verbid> <payload>" — send one verb through the
+	 * immediate command interface (the one-argument "verb <hex>" above goes
+	 * through the CORB; this used to be "verb" too and could never run).
+	 * Once the command rings run, the immediate interface stays busy
+	 * (IRS 0x5): useful with corb_rings=0, otherwise it just times out. */
+	if (!strncmp(buf, "icwverb", 7)) {
 		unsigned int cad, nid, vid, pl;
 		u32 resp = 0;
 		int ret;
@@ -2744,7 +2477,7 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		ret = creative_ae9_icw_send_verb(g_dbg_chip,
 			creative_ae9_verb(cad, nid, vid, pl), &resp);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "verb cad=%x nid=%x v=%x p=%x -> ret=%d resp=0x%08x\n",
+			  "icwverb cad=%x nid=%x v=%x p=%x -> ret=%d resp=0x%08x\n",
 			  cad, nid, vid, pl, ret, resp);
 		return len;
 	}
@@ -2758,18 +2491,18 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 
 	if (!strcmp(op, "w2") && n == 3) {
 		creative_ext_writel(g_dbg_chip, off, val);
-		val = creative_ext_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "w2 0x%x <= 0x%x (rb 0x%x)\n", off, val, val);
+			  "w2 0x%x <= 0x%x (rb 0x%x)\n", off, val,
+			  creative_ext_readl(g_dbg_chip, off));
 	} else if (!strcmp(op, "r2")) {
 		val = creative_ext_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "r2 0x%x = 0x%x\n", off, val);
 	} else if (!strcmp(op, "w0") && n == 3) {
 		creative_hda_writel(g_dbg_chip, off, val);
-		val = creative_hda_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
-			  "w0 0x%x <= 0x%x (rb 0x%x)\n", off, val, val);
+			  "w0 0x%x <= 0x%x (rb 0x%x)\n", off, val,
+			  creative_hda_readl(g_dbg_chip, off));
 	} else if (!strcmp(op, "r0")) {
 		val = creative_hda_readl(g_dbg_chip, off);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
@@ -2800,119 +2533,18 @@ static const struct file_operations creative_dbg_fops = {
 /* so the initial ACM I2C init doesn't light the display. Re-run it    */
 /* a few times with delays until the head unit responds.	  */
 /* ------------------------------------------------------------------ */
-/*
- * Deferred DSP standup — runs ~20s after probe (login-screen timing), when the
- * DSP and head-unit MCU are ready. Order: chip-init verb replay -> firmware
- * download -> AE-7 audio-router standup -> output select -> head-unit I2C init.
- */
-static void creative_ae9_dsp_work(struct work_struct *work)
-{
-	struct creative_chip *chip =
-		container_of(work, struct creative_chip, dsp_work.work);
-	int fret;
-
-	dev_info(chip->dev, "Deferred DSP standup starting\n");
-
-	/* chip init BEFORE firmware (sets up DSP for the transfer) */
-	creative_ae9_replay_both(chip);
-
-	fret = creative_dsp_load_firmware(chip);
-	dev_info(chip->dev, "Deferred DSP firmware load: %d\n", fret);
-	if (fret == 0) {
-		creative_ae9_post_fw(chip);
-		creative_dsp_ae9_standup(chip);
-		creative_dsp_select_lineout(chip);
-		chip->dsp_done = 1;
-	}
-
-	/* creative_i2c_init NOT called here — see acm_work comment. */
-	dev_info(chip->dev, "Deferred DSP standup done (dsp_done=%d)\n",
-		 chip->dsp_done);
-}
-
 static void creative_ae9_acm_work(struct work_struct *work)
 {
 	struct creative_chip *chip =
 		container_of(work, struct creative_chip, acm_work.work);
 
 	/*
-	 * creative_i2c_init (the 33-tx ACM I2C sequence) is NOT called here.
-	 *
-	 * Analysis of both MMIO captures (cold-boot + QEMU-reset) confirms:
-	 * - The Windows driver NEVER sends any I2C init sequence to the ca0113
-	 *   head unit. There are zero 0xC0C=0x83 (I2C mode) writes before PCM
-	 *   prepare in either capture.
-	 * - The decompiled Creative Linux driver (v0.73_kernel18) has no
-	 *   head-unit I2C init function at all.
-	 * - The ca0113 head unit self-initialises from its own MCU firmware:
-	 *   "AE-9" display + knob light = MCU self-boot (no host involvement).
-	 *   Relay click + "-HP-" = MCU reacts to audio clock from dac_route.
-	 *
-	 * Sending creative_i2c_init disrupts the ca0113 MCU's state machine,
-	 * leaving it unable to respond to subsequent SPI probe frames.
-	 * Symptoms: probe no ACK, relay3 n=0, 'E' display corruption, no audio.
-	 *
-	 * The only required host action is the heartbeat below, which sends
-	 * the 0xb1/01/02/03 relay engage sequence and keeps the MCU/DAC alive.
-	 * The relay engage at PCM prepare time is handled by pcm_relay_engage().
+	 * The head unit sets itself up from its own MCU firmware; Windows
+	 * sends it no I2C init (both MMIO captures), and ours disrupted it.
+	 * Windows' post-boot replay (creative_ae9_bar2_post_replay) did the
+	 * rest, so only the heartbeat runs here, without the GPIO4 toggle.
 	 */
-	if (post_windows) {
-		creative_hb_skip_gpio4 = true;
-		dev_info(chip->dev, "ACM work: post_windows, heartbeat only (no GPIO4 toggle)\n");
-		goto heartbeat;
-	}
-	dev_info(chip->dev, "ACM work: GPIO5 DAC power ON + 3s delay + second reset\n");
-
-	/*
-	 * GPIO5 = ExternalDACReset_Pin: assert to release DAC from reset.
-	 * ae9_build: "Must be set AFTER ae9_post_dsp_asi_setup(). Wait for
-	 * ACM MCU to boot after GPIO5 released it. 3s is conservative minimum."
-	 */
-	creative_ext_writew(chip, 0x320, 0x0105); /* GPIO5 ON */
-	msleep(3000);
-
-	/*
-	 * Second PLL + CA0113 engine reset — matching ae9_build's second reset
-	 * block in ae9_setup_defaults(). "Without this, the I2S clock to the
-	 * ACM never starts and the relay never clicks."
-	 */
-	if (enable_audio_path)
-		creative_ae9_ca0113_second_reset(chip);
-
-	/*
-	 * Engage relay ONCE at card init time, not at PCM prepare time.
-	 * Uses SPI ACM path (0xC00 writes) — works anytime after MCU alive.
-	 * ae9_build: GPIO4 asserted right after ae9_acm_init(), then
-	 * alt_select_out() sends the HP output preset CA0113 commands.
-	 */
-	creative_i2c_pcm_relay_engage(chip);
-	chip->relay_engaged = 1;
-
-	/*
-	 * Phase 5: Output selection — HP output preset + DAC volume registers.
-	 * ae9_build: called immediately after GPIO4 assert (relay click).
-	 * Sends the final HP output preset CA0113 commands (group 0x48,
-	 * regs 0x1d/0x0d/0x17/0x19) + headphone gain regs (0x11-0x14).
-	 * Also includes the volume preset commands for both group 0x49 regs
-	 * (0x04/0x05/0x02/0x03 = 0x1e, the post-relay DAC output level).
-	 * Without these, the ESS Sabre DAC routes audio internally but the
-	 * HP amplifier input stage gets no level — silent even if DMA runs.
-	 */
-	if (enable_audio_path) {
-		/* HP output preset + DSP unmute (ae9_ca0113_output_presets HP) */
-		creative_dsp_select_out_params(chip);
-		/* Final ES9038 DAC output levels — post-relay (ae9_build line 10831) */
-		creative_dsp_post_relay_dac_levels(chip);
-	}
-
-	/* ca0113_windows: the "second reset" above isn't from Windows and may
-	 * reset the DAC, so send Windows' boot CA0113 commands again */
-	if (ae9_ca0113_windows)
-		creative_dsp_ca0113_replay(chip, ae9_cold_ca0113_boot,
-					   ARRAY_SIZE(ae9_cold_ca0113_boot),
-					   "boot commands (after ACM work)");
-
-heartbeat:
+	dev_info(chip->dev, "ACM work: post_windows, heartbeat only (no GPIO4 toggle)\n");
 	if (acm_heartbeat_ms) {
 		queue_delayed_work(chip->wq, &chip->hb_work,
 				      msecs_to_jiffies(acm_heartbeat_ms));
@@ -2952,6 +2584,12 @@ static const struct { u8 len; u8 d[10]; } hu_poll[] = {
 static unsigned int hu_sbx_mode = 1;
 module_param(hu_sbx_mode, uint, 0644);
 MODULE_PARM_DESC(hu_sbx_mode, "post_windows: send the output-mode frame before each SBX light change, as Windows (1=on, default)");
+
+static bool hu_auto_switch;
+module_param(hu_auto_switch, bool, 0444);
+MODULE_PARM_DESC(hu_auto_switch, "Start with \"Head Unit Auto Switch\" on: plugging into the head unit's 3.5 mm headphone jack switches to headphones, unplugging back to speakers (default off: plugs only log)");
+
+#define HU_PLUG_SETTLE_MS	1500	/* plug must hold still this long */
 
 /* Log raw head-unit button bits (83 01 02 byte changes, b1 press reports). */
 static unsigned int hu_debug;
@@ -3020,9 +2658,10 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
  * card 2026-11-03): bit 5 = 3.5 mm headphone jack, bit 4 = 3.5 mm mic jack.
  * Bit 3 = SBX button, 1 while held; bit 1 = SBX light, 1 while lit (our
  * f0 22 02 01 <on> echoed back) (2026-11-04).
- * The 6.3 mm headphone jack, the XLR/TRS combo jack (a TRS plug set bit 4
- * once in 4 tries) and XLR plugs are effectively not reported. Plug changes
- * are only logged; the driver never switches output on them. Returns the
+ * The 1/4" (6.3 mm) headphone jack and the XLR/TRS jack are not reported
+ * (checked 2026-11-06: bit 4 follows the 3.5 mm jack only). Plug changes
+ * are logged; the output only follows the 3.5 mm headphone plug with
+ * "Head Unit Auto Switch" on (off by default). Returns the
  * signed step count. */
 static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 				 int n, int *press_ms)
@@ -3036,18 +2675,40 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 				 r[4] != (chip->hu_status | (chip->hu_btn_down ? 0 : 0x80))))
 			dev_info(chip->dev, "hu_debug: 83 02 status 0x%02x\n", r[4]);
 		u8 st = r[4] & 0x7f;
-		u8 chg = chip->hu_status_valid ? st ^ chip->hu_status : 0x30;
+		u8 chg = chip->hu_status_valid ? st ^ chip->hu_status : 0x31;
 
 		if (chg & 0x20)
 			dev_info(chip->dev, "head unit: 3.5 mm headphone plug %s\n",
 				 (st & 0x20) ? "out" : "in");
 		if (chg & 0x10)
-			dev_info(chip->dev, "head unit: mic/line plug %s\n",
+			dev_info(chip->dev, "head unit: 3.5 mm mic plug %s\n",
 				 (st & 0x10) ? "out" : "in");
+		/* headphone plug change: the auto switch (when on) acts on it
+		 * once it has held still. Not on the first read at bring-up. */
+		if ((chg & 0x20) && chip->hu_status_valid) {
+			chip->hu_plug_pending = true;
+			chip->hu_plug_at = jiffies;
+		}
+		/* tell the plug controls' readers */
+		if ((chg & 0x20) && chip->hu_plug_ctl[0])
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &chip->hu_plug_ctl[0]->id);
+		if ((chg & 0x10) && chip->hu_plug_ctl[1])
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &chip->hu_plug_ctl[1]->id);
+		/* bit 0 clears while phantom power is on: the head unit's own
+		 * button, no host command (WINDOWS-CAPTURE-ANALYSIS §29) */
+		if (chg & 0x01) {
+			dev_info(chip->dev, "head unit: phantom power %s\n",
+				 (st & 0x01) ? "off" : "on");
+			if (chip->hu_plug_ctl[2])
+				snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+					       &chip->hu_plug_ctl[2]->id);
+		}
 		/* bit 6 (headphone amp) follows every output switch: not logged */
-		if (chg & ~0x7a)
+		if (chg & ~0x7b)
 			dev_info(chip->dev, "head unit: status 0x%02x (other bits changed: 0x%02x)\n",
-				 r[4], chg & ~0x7a);
+				 r[4], chg & ~0x7b);
 		/* bit 3 = SBX button, 1 while held (b5 -> bd, found live
 		 * 2026-11-04): act on the press */
 		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08)) {
@@ -3250,6 +2911,7 @@ static void creative_ae9_hu_light(struct creative_chip *chip, unsigned int on)
 	u8 f[6] = { 0xf0, 0x22, 0x02, 0x02, !!on, 0xf7 }, resp[24];
 
 	chip->hu_light = !!on;
+	chip->hu_light_sent = !!on;
 	creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp));
 	dev_info(chip->dev, "head unit: knob light %s\n", on ? "on" : "off");
 }
@@ -3269,6 +2931,11 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		chip->hu_sbx_press = false;
 		creative_ae9_fx_sbx_toggle(chip);
 	}
+	/* knob light, when it isn't what the head unit last got (after a
+	 * resume): sent from here, the heartbeat, so its frames can't
+	 * interleave with the poll's */
+	if (chip->hu_light_sent != (int)chip->hu_light)
+		creative_ae9_hu_light(chip, chip->hu_light);
 	/* SBX LED: lit while the effects can run (Direct Mode off, SBX on) */
 	sbx_led = !chip->fx.direct && chip->fx.sbx;
 	if (sbx_led != chip->hu_sbx_led) {
@@ -3285,6 +2952,20 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		}
 	}
 
+	/* auto switch: once per plug change, after it settles; a knob or
+	 * control switch made afterwards stands until the next plug change */
+	if (chip->hu_plug_pending &&
+	    time_after_eq(jiffies, chip->hu_plug_at + msecs_to_jiffies(HU_PLUG_SETTLE_MS))) {
+		int want = !(chip->hu_status & 0x20);
+
+		chip->hu_plug_pending = false;
+		if (chip->hu_auto_hp && chip->hu_switch_to < 0 &&
+		    want != (int)chip->hu_output) {
+			dev_info(chip->dev, "head unit: auto switch to %s (3.5 mm headphone plug %s)\n",
+				 want ? "headphones" : "speakers", want ? "in" : "out");
+			chip->hu_switch_to = want;
+		}
+	}
 	if (chip->hu_switch_to >= 0) {
 		int to = chip->hu_switch_to;
 
@@ -3444,7 +3125,9 @@ static const struct snd_kcontrol_new hu_controls[] = {
 	},
 };
 
-/* "XLR Gain Capture Volume": codec 1 node 0x12 (the XLR mic pin) input
+/* "Mic Gain Capture Volume" (was "XLR Gain"): codec 1 node 0x12 input
+ * (the head unit's input pin: XLR/TRS jack and 3.5 mm mic jack, both
+ * boosted, checked 2026-11-06)
  * amp, 0/1/2 = 0/+10/+20 dB, both channels, exactly as Windows sets it.
  * Not called "Mic Boost" on purpose: PipeWire's mixer paths know that name
  * and would tie it to the mic slider. With this name PipeWire leaves it
@@ -3492,7 +3175,7 @@ static int mic_boost_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 
 static const struct snd_kcontrol_new mic_boost_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-	.name = "XLR Gain Capture Volume",
+	.name = "Mic Gain Capture Volume",
 	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_TLV_READ,
 	.info = mic_boost_info,
 	.get = mic_boost_get,
@@ -3689,14 +3372,108 @@ static const struct snd_kcontrol_new hu_out_control = {
 	.put = hu_out_put,
 };
 
+/* "Head Unit 3.5mm Phones Plugged" (head unit's 3.5 mm headphone jack,
+ * status bit 5), "Head Unit 3.5mm Mic Plugged" (head unit's 3.5 mm mic
+ * jack, bit 4; not the XLR/TRS jack) and "Head Unit Phantom Power" (48 V
+ * on the XLR/TRS jack, bit 0; its button, or this control: see
+ * hu_phantom_put). The plug controls are read-only, for apps to show. Each bit reads 0 when on/plugged. Named
+ * without "Jack" on purpose: PipeWire switches outputs on "... Jack"
+ * controls; switching is left to "Head Unit Auto Switch". */
+static int hu_plug_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->hu_status_valid &&
+				     !(chip->hu_status & kc->private_value);
+	return 0;
+}
+
+/*
+ * "Head Unit Phantom Power" is also a switch (2026-11-06): the head unit
+ * takes f0 05 03 02 01 <0|1> f7 (01 01 = on, 01 00 = off; with 00 as the
+ * first byte phantom stays off), and reports it back in 85 01 02 and status
+ * bit 0. Windows only sends 01 00 (off) at boot, in the post-boot replay, so
+ * phantom always comes up off. "On" is refused for the first
+ * AE9_PHANTOM_HOLD_S after a bring-up so a restored mixer state (alsactl at
+ * boot) can't put 48 V on the XLR/TRS jack by itself; apps should warn.
+ */
+
+static int hu_phantom_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	int on = !!uv->value.integer.value[0];
+	unsigned long flags;
+
+	if (!chip->hu_status_valid)
+		return -EAGAIN;
+	if (on == !(chip->hu_status & 0x01))
+		return 0;
+	if (on && time_before(jiffies, chip->hu_phantom_hold)) {
+		dev_info(chip->dev, "head unit: phantom power on refused, too soon after start-up (%u s)\n",
+			 AE9_PHANTOM_HOLD_S);
+		return -EBUSY;
+	}
+	spin_lock_irqsave(&chip->lock, flags);
+	chip->hu_phantom_req = on;
+	spin_unlock_irqrestore(&chip->lock, flags);
+	dev_info(chip->dev, "head unit: phantom power %s requested\n", on ? "on" : "off");
+	return 1;
+}
+
+static const struct snd_kcontrol_new hu_plug_controls[3] = {
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Head Unit 3.5mm Phones Plugged",
+	  .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	  .info = snd_ctl_boolean_mono_info, .get = hu_plug_get, .private_value = 0x20 },
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Head Unit 3.5mm Mic Plugged",
+	  .access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	  .info = snd_ctl_boolean_mono_info, .get = hu_plug_get, .private_value = 0x10 },
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Head Unit Phantom Power",
+	  .access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	  .info = snd_ctl_boolean_mono_info, .get = hu_plug_get, .put = hu_phantom_put,
+	  .private_value = 0x01 },
+};
+
+/* "Head Unit Auto Switch": off (default) = plugs only log; on = the 3.5 mm
+ * headphone plug switches headphones in and out. */
+static int hu_auto_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->hu_auto_hp;
+	return 0;
+}
+
+static int hu_auto_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->hu_auto_hp)
+		return 0;
+	chip->hu_auto_hp = on;
+	dev_info(chip->dev, "head unit: auto switch %s\n", on ? "on" : "off");
+	return 1;
+}
+
+static const struct snd_kcontrol_new hu_auto_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Head Unit Auto Switch",
+	.info = snd_ctl_boolean_mono_info,
+	.get = hu_auto_get,
+	.put = hu_auto_put,
+};
+
 static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 {
+	int i;
+
 	chip->hu_att = HU_ATT_DEFAULT;
 	chip->hu_att_out[0] = chip->hu_att_out[1] = HU_ATT_DEFAULT;
 	chip->hu_output = 0;		/* the boot replay selects speakers */
 	chip->hu_name_until = HU_SP_TICKS;
 	chip->hu_switch_to = -1;
 	chip->hu_light = 1;
+	chip->hu_light_sent = 1;	/* the head unit starts lit */
 	chip->hu_sbx_led = -1;
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
@@ -3713,6 +3490,15 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 		chip->hu_vol_ctl = NULL;
 	if (snd_ctl_add(chip->card, chip->hu_mute_ctl) < 0)
 		chip->hu_mute_ctl = NULL;
+	chip->hu_auto_hp = hu_auto_switch;
+	chip->hu_auto_ctl = snd_ctl_new1(&hu_auto_control, chip);
+	if (snd_ctl_add(chip->card, chip->hu_auto_ctl) < 0)
+		chip->hu_auto_ctl = NULL;
+	for (i = 0; i < ARRAY_SIZE(hu_plug_controls); i++) {
+		chip->hu_plug_ctl[i] = snd_ctl_new1(&hu_plug_controls[i], chip);
+		if (snd_ctl_add(chip->card, chip->hu_plug_ctl[i]) < 0)
+			chip->hu_plug_ctl[i] = NULL;
+	}
 }
 
 static void creative_ae9_hb_work(struct work_struct *work)
@@ -3720,7 +3506,37 @@ static void creative_ae9_hb_work(struct work_struct *work)
 	struct creative_chip *chip =
 		container_of(work, struct creative_chip, hb_work.work);
 
-	if (post_windows && chip->dsp_done) {
+	if (chip->dsp_done) {
+		if (chip->hu_dbg_len) {
+			u8 tx[16], rx[16];
+			unsigned long flags;
+			int k, n, j, o = 0;
+			char hex[16 * 3 + 1] = "";
+
+			spin_lock_irqsave(&chip->lock, flags);
+			k = chip->hu_dbg_len;
+			memcpy(tx, chip->hu_dbg_tx, k);
+			chip->hu_dbg_len = 0;
+			spin_unlock_irqrestore(&chip->lock, flags);
+			n = creative_spi_frame_win(chip, tx, k, rx, sizeof(rx));
+			for (j = 0; j < min(n, 16); j++)
+				o += scnprintf(hex + o, sizeof(hex) - o, " %02x", rx[j]);
+			dev_info(chip->dev, "huframe: sent %*ph, reply%s (%d)\n",
+				 k, tx, n > 0 ? hex : " none", n);
+			scnprintf(g_dbg_result, sizeof(g_dbg_result),
+				  "huframe reply:%s (%d)\n", n > 0 ? hex : " none", n);
+		}
+		if (chip->hu_phantom_req >= 0) {
+			u8 tx[7] = { 0xf0, 0x05, 0x03, 0x02, 0x01, 0x00, 0xf7 };
+			u8 rx[8];
+			unsigned long flags;
+
+			spin_lock_irqsave(&chip->lock, flags);
+			tx[5] = chip->hu_phantom_req;
+			chip->hu_phantom_req = -1;
+			spin_unlock_irqrestore(&chip->lock, flags);
+			creative_spi_frame_win(chip, tx, sizeof(tx), rx, sizeof(rx));
+		}
 		if (time_after_eq(jiffies, chip->hu_next_full)) {
 			chip->hu_next_full = jiffies + msecs_to_jiffies(acm_heartbeat_ms);
 			creative_ae9_hb_windows(chip);
@@ -3733,24 +3549,7 @@ static void creative_ae9_hb_work(struct work_struct *work)
 					      msecs_to_jiffies(min(hu_fast_ms, acm_heartbeat_ms)));
 		return;
 	}
-
-	/*
-	 * Only run the heartbeat (which sends the 0xb1 relay-engage sequence
-	 * and displays "-HP-") AFTER DSP standup is complete.  Running it
-	 * before dsp_done would show "-HP-" before the DSP is ready — the
-	 * correct Windows sequence is: "AE-9" (MCU splash) → standup complete
-	 * → HELLO ACK → click + "-HP-" → volume display.
-	 */
-	if (chip->dsp_done) {
-		creative_i2c_heartbeat(chip);
-
-		/* Same 500ms tick keeps the DSP 8051 from idling into a halt
-		 * (which jams the SCP queue). Cheap; only acts if actually halted.
-		 */
-		creative_dsp_keepalive(chip);
-	}
-
-	/* Re-arm indefinitely until module removal cancels it. */
+	/* DSP not up yet: look again later */
 	if (acm_heartbeat_ms)
 		queue_delayed_work(chip->wq, &chip->hb_work,
 				      msecs_to_jiffies(acm_heartbeat_ms));
@@ -3922,7 +3721,6 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		creative_ae9_log_state(chip, "after bus reset");
 	}
 
-
 	{
 		u16 cfg40, after;
 
@@ -3936,7 +3734,6 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		dev_info(&pdev->dev, "PCI cfg 0x40: 0x%04x -> 0x%04x (pcicfg40_fix=%u)\n",
 			 cfg40, after, pcicfg40_fix);
 	}
-
 
 	creative_ae9_bridge_log(chip, "after bus reset");
 	if (creative_ae9_gone(chip, "after the bus reset"))
@@ -4006,7 +3803,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	 * a PSU power-off brought it back (bus resets, reloads 16 min later,
 	 * the full old bring-up with codec1_failfast=0).
 	 */
-	if (post_windows && load_fw && codec1_failfast &&
+	if (load_fw && codec1_failfast &&
 	    !(chip->codec_ok_mask & BIT(1))) {
 		dev_warn(chip->dev, "codec 1 (DSP) not answering after the bus reset; trying the bring-up again\n");
 		return 0;
@@ -4155,168 +3952,10 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		if (fret == 0) {
 			creative_ae9_post_fw(chip);
 
-			/* post_windows: the replay left the head-unit link in
-			 * Windows' mode; the 0x30 re-init below breaks it */
-			if (post_windows)
-				goto post_setup_done;
-
-			/* DSP SPI init (CMD=0x30) — different from ACM I2C init
-			 * (CMD=0x0d). From cold-boot capture L88-109 (t=0.05s):
-			 * the first BAR2 init writes CMD=0x30 which puts the
-			 * controller in DSP SPI mode for the probe frames.
-			 * creative_i2c_dsp_init uses CMD=0x0d (ACM I2C mode).
-			 */
-			/* DSP SPI init sequence from cold-boot capture L87-115:
-			 * C7C read, C0C: 0x80 init, C00=0x30 (DSP SPI mode),
-			 * C04=0x00, C0C: 0x00 clear → 0x03×3 FIFO mode,
-			 * then C08 FIFO enable: 0x01→0xf1→0x01→0xc7→0xc1,
-			 * C04=0x80 trigger, 0x1c toggle → C14=0x40 idle.
-			 */
-			creative_ext_readl(chip,  0xC7C);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC0C, 0x80);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC00, 0x30);
-			creative_ext_readl(chip,  0xC00);
-			creative_ext_writel(chip, 0xC04, 0x00);
-			creative_ext_readl(chip,  0xC04);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC0C, 0x00);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_readl(chip,  0xC7C);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC0C, 0x03);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_readl(chip,  0xC7C);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC0C, 0x03);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_readl(chip,  0xC7C);
-			creative_ext_readl(chip,  0xC0C);
-			creative_ext_writel(chip, 0xC0C, 0x03);
-			creative_ext_readl(chip,  0xC0C);
-			/*
-			 * C08 FIFO enable sequence (capture L110-126).
-			 * Full sequence: 0x01 → 0xf1 → 0x01 → 0xc7 → 0xc1
-			 * Our old code stopped after 0xf1, leaving C14=0x60
-			 * (controller not fully idle). The remaining writes
-			 * are required to bring C14 to 0x40 (idle/ready).
-			 */
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_writel(chip, 0xC08, 0x01);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_writel(chip, 0xC08, 0xF1);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_writel(chip, 0xC08, 0x01);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_writel(chip, 0xC08, 0xC7);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_readl(chip,  0xC08);
-			creative_ext_writel(chip, 0xC08, 0xC1);
-			creative_ext_readl(chip,  0xC08);
-			/*
-			 * C04=0x80 DATA trigger (capture L126).
-			 * Kicks the SPI controller into active mode.
-			 */
-			creative_ext_readl(chip,  0xC04);
-			creative_ext_writel(chip, 0xC04, 0x80);
-			creative_ext_readl(chip,  0xC04);
-			/*
-			 * 0x1c toggle: clear bit 23 (0x880480→0x480) then
-			 * restore (capture L128-132). This is an interrupt-
-			 * enable or DMA-ready latch that transitions C14
-			 * from 0x60 to 0x40 (idle/ready).
-			 */
-			{
-				u32 v = creative_ext_readl(chip, 0x1c);
-				creative_ext_writel(chip, 0x1c, v & ~0x800000);
-				creative_ext_readl(chip,  0x1c);
-				creative_ext_readl(chip,  0x1c);
-				creative_ext_writel(chip, 0x1c, v);
-				creative_ext_readl(chip,  0x1c);
-			}
-			udelay(100);
-			dev_info(chip->dev,
-				 "DSP SPI init: C0C=0x%02x C08=0x%02x C14=0x%02x C7C=0x%02x\n",
-				 creative_ext_readl(chip, 0xC0C) & 0xff,
-				 creative_ext_readl(chip, 0xC08) & 0xff,
-				 creative_ext_readl(chip, 0xC14) & 0xff,
-				 creative_ext_readl(chip, 0xC7C) & 0xff);
-
-			/* Cold-start the 8051 audio loop via BAR2 SPI.
-			 * From the cold-boot VFIO capture: after firmware
-			 * downloads, the driver probes the DSP via SPI
-			 * MEM_WRITE 0x11111111 until ACK=0x81, then sends
-			 * HELLO "-HP-" which triggers the relay click and
-			 * head unit display. Without this, 0x801c stays 0
-			 * and SCP commands are ignored.
-			 */
-			if (hu_boot_ms) {
-				/* GPIO5 on, then give the head-unit MCU time
-				 * to boot, as acm_work does before its probe. */
-				creative_ext_writew(chip, 0x320, 0x0105);
-				dev_info(chip->dev,
-					 "audio_loop_start: GPIO5 on, waiting %u ms for head-unit MCU\n",
-					 hu_boot_ms);
-				msleep(hu_boot_ms);
-			}
-			if (loop_start) {
-				int aret = creative_i2c_dsp_audio_loop_start(chip);
-				dev_info(chip->dev,
-					 "audio_loop_start: %d\n", aret);
-			} else {
-				dev_info(chip->dev, "audio_loop_start: skipped (loop_start=0)\n");
-			}
-
-			/*
-			 * Allow the 8051 time to fully initialize its SCP
-			 * command handler after the HELLO ACK. In the Windows
-			 * driver, the ACM init sequence (AE-9 display, relay
-			 * click) runs here and takes ~5 seconds, during which
-			 * the 8051 settles. Without a delay, the SCP trigger
-			 * commands (mod=0x18/0x19/0x15) in select_out hit a
-			 * full command queue (sts=0x2) and 0x801c stays 0.
-			 * 500ms matches the time needed for the 8051 to drain
-			 * its startup queue and become ready for SCP commands.
-			 */
-			msleep(500);
-
-			/* standup now includes audio-router write + select_lineout
-			 * internally (at standup-end while SCP is healthy).
-			 */
-			creative_dsp_ae9_standup(chip);
-			/* Enable the codec-side DAC output amps/coefs — the
-			 * playback-unmute step (capture BOOT/INIT). Without it
-			 * the DSP processes audio but the DAC amps stay muted.
-			 */
-			creative_dsp_enable_dac_output(chip);
-
-			/*
-			 * CA0113 handshake — MUST happen before any ca0113
-			 * command_set/play_cmd calls. Sends the full init
-			 * sequence (GPIO0 → engine reset → GPIO5 pulse →
-			 * 0x210 sync → 0xffff→0x208 → ~50 DAC init cmds).
-			 * Without this, ALL ca0113 group 0x48/0x49 commands
-			 * are silently ignored (0x860 stays 0).
-			 */
-			if (enable_audio_path)
-				creative_ae9_ca0113_handshake(chip);
-
-			/* Legacy amp_engage/route paths — these now have a
-			 * valid handshake ahead of them and should execute.
-			 * amp_engage fires GPIO4 (relay) + initial unmute.
-			 * init_route + dac_route configure ESS Sabre DAC.
-			 */
-			if (enable_audio_path)
-				creative_dsp_amp_engage(chip);
-			if (enable_audio_path) {
-				creative_dsp_headunit_init_route(chip);
-				creative_dsp_headunit_dac_route(chip);
-			}
-post_setup_done:
+			/* Windows' post-boot replay (in post_fw) has set up the
+			 * head unit and DAC; our old setup (DSP SPI 0x30 re-init,
+			 * standup, CA0113 handshake, amp/route) is gone: it broke
+			 * the head-unit link */
 			chip->dsp_done = 1;
 			/*
 			 * MCU is confirmed up (HELLO ACK'd). Schedule ACM init
@@ -4350,14 +3989,14 @@ post_setup_done:
 	/* Stream enable */
 	/* post_windows: the replay already set these up as Windows does;
 	 * the DSP I2C init's CMD=0x30 re-init cuts off the head unit */
-	if ((init_mask & 0x04) && !(post_windows && chip->dsp_done)) {
+	if ((init_mask & 0x04) && !chip->dsp_done) {
 		dev_info(chip->dev, "init: stream enable\n");
 		writeb(0x3f, chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
 		wmb();
 	}
 
 	/* DSP I2C controller init */
-	if ((init_mask & 0x08) && !(post_windows && chip->dsp_done)) {
+	if ((init_mask & 0x08) && !chip->dsp_done) {
 		dev_info(chip->dev, "init: DSP I2C\n");
 		creative_i2c_dsp_init(chip);
 	}
@@ -4378,7 +4017,7 @@ static void creative_ae9_stop_works(struct creative_chip *chip);
 
 static int creative_ae9_hw_bringup_retry(struct creative_chip *chip, const char *what)
 {
-	unsigned int attempt, tries = (post_windows && load_fw) ? max(resume_tries, 1U) : 1;
+	unsigned int attempt, tries = load_fw ? max(resume_tries, 1U) : 1;
 	int ret = 0;
 
 	for (attempt = 1; attempt <= tries; attempt++) {
@@ -4407,7 +4046,7 @@ static int creative_ae9_hw_bringup_retry(struct creative_chip *chip, const char 
 	if (chip->card_gone)
 		dev_err(chip->dev, "%s: the card dropped off the bus; nothing more to try. Power off at the PSU before the next attempt (logs welcome: bugzilla 219552)\n",
 			what);
-	else if (post_windows && load_fw && !(chip->codec_ok_mask & BIT(1)))
+	else if (load_fw && !(chip->codec_ok_mask & BIT(1)))
 		dev_err(chip->dev, "%s: codec 1 (DSP) never answered in %u attempts: power off at the PSU for ~20 s\n",
 			what, tries);
 	return ret;
@@ -4482,6 +4121,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 			 pdev->bus->self ? pci_name(pdev->bus->self) : "-",
 			 chip->asmedia ? " (ASMedia ASM1083/1085)" : "",
 			 chip->dma_pad / 1024);
+	chip->hu_phantom_req = -1;	/* nothing to send */
 	chip->hda_regs = pcim_iomap_table(pdev)[layout->hda_bar];
 	chip->ext_regs = pcim_iomap_table(pdev)[layout->ext_bar];
 	vlog_bar0 = chip->hda_regs;
@@ -4512,7 +4152,6 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	 * already-queued timer. The ACM init never ran — no AE-9 display,
 	 * no relay click, no audio. Moving INIT here fixes the race.
 	 */
-	INIT_DELAYED_WORK(&chip->dsp_work, creative_ae9_dsp_work);
 	INIT_DELAYED_WORK(&chip->dsp_switch_work, creative_ae9_dsp_switch_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
@@ -4528,7 +4167,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	if (ret < 0)
 		goto err_hw;
 	/* a DSP that never answered its boot handshake isn't a usable card */
-	if (post_windows && load_fw && !(chip->dsp_done && chip->hs_ok)) {
+	if (load_fw && !(chip->dsp_done && chip->hs_ok)) {
 		dev_err(chip->dev, "DSP did not start after %u attempt(s); not registering the card (reload the driver or power-cycle)\n",
 			max(resume_tries, 1U));
 		ret = -EIO;
@@ -4569,8 +4208,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 			dev_warn(chip->dev, "PCM init failed: %d\n", ret);
 	}
 
-	if (post_windows)
-		creative_ae9_hu_controls_add(chip);
+	creative_ae9_hu_controls_add(chip);
 	if (enable_pcm) {
 		chip->mic_boost = 1;
 		snd_ctl_add(chip->card, snd_ctl_new1(&mic_boost_control, chip));
@@ -4637,7 +4275,7 @@ err_card:
 err_hw:
 	/* works the bring-up scheduled (ACM/heartbeat) must not outlive chip */
 	creative_ae9_stop_works(chip);
-	if (post_windows && chip->corb_buf && !chip->card_gone)
+	if (chip->corb_buf && !chip->card_gone)
 		creative_ae9_win_shutdown(chip, "probe failure");
 	else
 		creative_ae9_corb_free(chip);
@@ -4682,14 +4320,16 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 		}
 	}
 
-	/* input stream 0: capture (XLR); input stream 1: optical in */
+	/* input streams: 0 capture (XLR), 1 optical in, 2 What U Hear */
 	if (intsts & 0x1)
 		creative_ae9_cap_irq(chip);
 	if (intsts & 0x2)
-		creative_ae9_opt_irq(chip);
+		creative_ae9_xcap_irq(chip, 0);
+	if (intsts & 0x4)
+		creative_ae9_xcap_irq(chip, 1);
 
 	/* Acknowledge stream interrupts and notify ALSA of period completion */
-	if (intsts & AZX_INT_ALL_STREAM & ~0x3) {
+	if (intsts & AZX_INT_ALL_STREAM & ~0x7) {
 		u8 sd_sts = readb(chip->hda_regs +
 				  chip->playback_stream_base + AZX_REG_SD_STS);
 		if (sd_sts & SD_INT_COMPLETE) {
@@ -4775,7 +4415,6 @@ static void creative_ae9_stop_works(struct creative_chip *chip)
 	atomic_set(&chip->dma_running, 0);
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
-	cancel_delayed_work_sync(&chip->dsp_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
 }
 
@@ -4788,8 +4427,7 @@ static void creative_ae9_shutdown(struct pci_dev *pdev)
 		return;
 	creative_ae9_stop_works(chip);
 	chip->suspended = true;		/* IRQ handler: hands off */
-	if (post_windows)
-		creative_ae9_win_shutdown(chip, "reboot/power-off");
+	creative_ae9_win_shutdown(chip, "reboot/power-off");
 }
 
 static void creative_ae9_remove(struct pci_dev *pdev)
@@ -4812,8 +4450,8 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 		chip->card = NULL;
 	}
 
-	/* Windows' shutdown (post_windows; without it, nothing is sent) */
-	if (post_windows && !chip->suspended)
+	/* Windows' shutdown */
+	if (!chip->suspended)
 		creative_ae9_win_shutdown(chip, "unload");
 
 	creative_ae9_corb_free(chip);
@@ -4845,7 +4483,6 @@ static int creative_ae9_suspend(struct device *dev)
 	atomic_set(&chip->dma_running, 0);
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
-	cancel_delayed_work_sync(&chip->dsp_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
 	creative_ae9_streams_down(chip);
 	chip->dsp_active = false;
@@ -4926,8 +4563,9 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	chip->hu_dirty = 1;
 	if (want_hp)
 		chip->hu_switch_to = 1;
-	if (!chip->hu_light)
-		creative_ae9_hu_light(chip, 0);
+	/* the head unit wakes lit; if the light was off, the heartbeat turns
+	 * it off again (sending it from here raced the heartbeat's frames) */
+	chip->hu_light_sent = 1;
 	chip->hu_sbx_led = -1;		/* heartbeat sends it again */
 	creative_ae9_mic_boost_apply(chip);
 	if (chip->mic_level != 99)

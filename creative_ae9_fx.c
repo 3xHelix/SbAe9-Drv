@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 //
 // Creative AE-9: SBX effects and equalizer (ALSA controls).
 //
@@ -65,7 +69,7 @@ static const char * const eq_names[FX_EQ_VALUES] = {
 /*
  * EQ presets as the Creative app sends them for the AE-9 (capture 5,
  * 22:59-23:03, every preset in turn; Rock and Gaming match capture 3).
- * Listed A-Z, the game presets A-Z at the end, as Joe asked (cleaner, and
+ * Listed A-Z, the game presets A-Z at the end, as asked (cleaner, and
  * closer to the app). Saved settings are restored by name, so the order
  * can change. 0.1 dB, pre-gain first. Pop and Stadium have finer
  * values (Pop 8 kHz 1.19624, Stadium 62 Hz 5.68521), rounded to 0.1 dB.
@@ -115,7 +119,7 @@ static const char * const sv_mode_names[] = { "Normal", "Loud", "Night" };
  * setting on 2.1), and 8.0 in Direct Mode; ca0132's table is the same
  * (2.0 -> 1.0, 2.1 -> 2.0, 4.0 -> 5.0, 4.1 -> 6.0, 5.1 -> 8.0; capture
  * 6 sends exactly these). 4.0 and up need 6-channel streams to reach the
- * rear and center/sub jacks, so they're offered only with surround=1.
+ * card's Rear and C/Sub jacks, so they're offered only with surround=1.
  */
 static const char * const spk_names[] = { "2.0", "2.1", "4.0", "4.1", "5.1" };
 static const u8 spk_cfgs[] = { 1, 2, 5, 6, 8 };	/* MASTERCONTROL 0x04 value */
@@ -497,7 +501,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			/* nothing playing: switch at the next stream (see
 			 * creative_ae9_dsp_switch_work) */
 			chip->dsp_switch_pending = true;
-		} else if (!fx->direct && chip->pcm_start_rate != 48000) {
+		} else if (!fx->direct && chip->pcm_start_rate != 48000 &&
+			   !(ae9_dsp_96k && chip->pcm_start_rate == 96000)) {
 			/* a direct stream above 48 kHz can't go through the DSP
 			 * (see pcm_open): it plays on direct, and the next
 			 * stream opens at 48 kHz and switches */
@@ -510,10 +515,31 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			creative_ae9_dsp_mode(chip, true);
 			fx_apply_all(chip);
 		} else {
+			bool was_dsp = chip->dsp_active;
+			struct snd_pcm_substream *ss = READ_ONCE(chip->playback_substream);
+
 			chip->dsp_switch_pending = false;
 			/* effects off (speaker config 8), then route direct */
 			fx_apply_all(chip);
 			creative_ae9_dsp_mode(chip, false);
+			/*
+			 * The running stream is now unbound and silent. Windows
+			 * stops it too and leaves the restart to the app
+			 * (capture 2026-11-05, 02:07:01). Report it stopped so
+			 * PipeWire restarts it, and the normal start block routes
+			 * it direct. Does nothing if no stream is running.
+			 * The start block normally goes out once per open, so
+			 * mark it unsent or the restart plays unrouted (first
+			 * test, 2026-11-06: silent until the stream closed).
+			 * The DAC start commands go out again too: DSP mode
+			 * changed the I2S clock under them.
+			 */
+			if (was_dsp && ss) {
+				dev_info(chip->dev, "Direct Mode on: restarting the running stream\n");
+				chip->pcm_start_sent = 0;
+				chip->dac_start_key = 0;
+				snd_pcm_stop_xrun(ss);
+			}
 		}
 		fx_update_active(chip);
 		return 1;

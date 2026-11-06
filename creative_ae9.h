@@ -1,4 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (c) 2026 3xHelix */
 /*
  * Creative Sound Blaster AE-9 / X-Fi (CA0132) HDA controller driver
  *
@@ -56,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.8.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.9.4"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -200,15 +201,20 @@ struct creative_chip {
 	dma_addr_t		cap_bdl_dma;
 	size_t			cap_bdl_size;
 	unsigned int		cap_start_sent;
+	u16			cap_format;	/* capture stream format for the start block */
 	/* optical (codec 2's S/PDIF converters, creative_ae9_pcm.c) */
 	bool			spdif_out;	/* "Optical Out Playback Switch" */
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
-	struct snd_pcm_substream *opt_substream;	/* optical in capture */
-	void			*opt_bdl_raw;
-	void			*opt_bdl;
-	dma_addr_t		opt_bdl_dma;
-	size_t			opt_bdl_size;
+	/* extra capture devices (creative_ae9_pcm.c): [0] optical in (PCM
+	 * device 1), [1] What U Hear (device 2) */
+	struct ae9_xcap_state {
+		struct snd_pcm_substream *substream;
+		void		*bdl_raw;
+		void		*bdl;
+		dma_addr_t	bdl_dma;
+		size_t		bdl_size;
+	} xcap[2];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
 	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
@@ -258,7 +264,6 @@ struct creative_chip {
 	/* Deferred DSP standup (firmware + audio router + head unit), timed
 	 * for ~20s so the DSP and head-unit MCU are ready.
 	 */
-	struct delayed_work	dsp_work;
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
@@ -303,8 +308,13 @@ struct creative_chip {
 	unsigned int		hu_att_out[2];	/* remembered volume per output */
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
 	char			hu_text[9];	/* debugfs "hutext": held display text */
+	u8			hu_dbg_tx[16];	/* debugfs "huframe": frame for the heartbeat to send */
+	int			hu_dbg_len;	/* its length, 0 = none pending */
+	int			hu_phantom_req;	/* phantom power to send: 0/1, -1 = none */
+	unsigned long		hu_phantom_hold; /* "on" requests ignored until (jiffies) */
 	int			hu_switch_to;	/* pending output switch, -1 none */
 	unsigned int		hu_light;	/* knob light on */
+	int			hu_light_sent;	/* knob light as last sent, -1 unknown */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
 	bool			hu_sbx_press;	/* SBX button press to act on */
 	bool			hu_st07_valid;
@@ -319,6 +329,13 @@ struct creative_chip {
 	 * log. Logged only; output switching stays manual. */
 	bool			hu_status_valid;
 	u8			hu_status;
+	struct snd_kcontrol	*hu_plug_ctl[3];	/* phones, mic, phantom (read-only) */
+	/* opt-in auto switch on the 3.5 mm headphone plug: a plug change waits
+	 * until it has held still, then switches once */
+	bool			hu_auto_hp;
+	bool			hu_plug_pending;
+	unsigned long		hu_plug_at;
+	struct snd_kcontrol	*hu_auto_ctl;
 	bool			overlay_sent;	/* overlay transfer ran this bring-up */
 	unsigned long		hu_next_full;
 };
@@ -366,21 +383,13 @@ static inline size_t ae9_dma_size(struct creative_chip *chip, size_t n)
 int creative_ae9_corb_init(struct creative_chip *chip);
 void creative_ae9_corb_free(struct creative_chip *chip);
 int  creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb);
-void creative_ae9_corb_send_verb_wait(struct creative_chip *chip, u32 verb);
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp);
 
 /* creative_ae9_i2c.c */
 int creative_i2c_dsp_init(struct creative_chip *chip);
-int creative_i2c_dsp_audio_loop_start(struct creative_chip *chip);
-void creative_spi_frame_send(struct creative_chip *chip,
-			     const u8 *tx, int tx_len);
-extern bool creative_hb_skip_gpio4;
 int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			   int tx_len, u8 *resp, int resp_len);
-int creative_i2c_init(struct creative_chip *chip);
-int creative_i2c_heartbeat(struct creative_chip *chip);
-int creative_i2c_amp_enable(struct creative_chip *chip);
 int creative_i2c_raw_tx(struct creative_chip *chip, u8 reg,
 			const u8 *data, u8 len);
 
@@ -394,7 +403,6 @@ u32 creative_ae9_verb(unsigned int cad, unsigned int nid,
 		      unsigned int verb_id, unsigned int payload);
 int creative_ae9_hw_reset(struct creative_chip *chip);
 void creative_ae9_hw_init(struct creative_chip *chip);
-void creative_ae9_replay_init_all(struct creative_chip *chip);
 
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
@@ -404,28 +412,7 @@ int creative_dsp_chipio_read(struct creative_chip *chip,
 void creative_dsp_enable_clocks(struct creative_chip *chip);
 int creative_dsp_prepare(struct creative_chip *chip);
 int creative_dsp_load_firmware(struct creative_chip *chip);
-int creative_dsp_select_lineout(struct creative_chip *chip);
-int creative_dsp_start_audio_streams(struct creative_chip *chip);
-int creative_dsp_ae9_standup(struct creative_chip *chip);
-int creative_dsp_headunit_dac_route(struct creative_chip *chip);
-int creative_dsp_headunit_init_route(struct creative_chip *chip);
-void creative_dsp_audio_config(struct creative_chip *chip);
-int creative_dsp_ca0113_trigger7(struct creative_chip *chip);
-int creative_dsp_ca0113_unmute_enable(struct creative_chip *chip);
-int creative_dsp_ca0113_clock_off(struct creative_chip *chip);
-int creative_dsp_ca0113_unmute(struct creative_chip *chip);
-int creative_i2c_pcm_relay_engage(struct creative_chip *chip);
-int creative_dsp_run(struct creative_chip *chip);
-int creative_dsp_scp_reset(struct creative_chip *chip);
 void creative_dsp_keepalive(struct creative_chip *chip);
-void creative_dsp_write_audio_router(struct creative_chip *chip);
-void creative_dsp_pcm_start(struct creative_chip *chip, unsigned int stream_tag);
-int creative_dsp_enable_dac_output(struct creative_chip *chip);
-int creative_dsp_amp_engage(struct creative_chip *chip);
-int creative_ae9_ca0113_handshake(struct creative_chip *chip);
-int creative_ae9_ca0113_second_reset(struct creative_chip *chip);
-int creative_dsp_post_relay_dac_levels(struct creative_chip *chip);
-int creative_dsp_select_out_params(struct creative_chip *chip);
 void creative_ae9_vlog(u32 val, u32 ex, bool is_resp);
 void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
 				  unsigned int rate, u16 format);
@@ -433,7 +420,7 @@ u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
 void creative_ae9_cap_irq(struct creative_chip *chip);
-void creative_ae9_opt_irq(struct creative_chip *chip);
+void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
 extern unsigned int ae9_sentinel_clear;
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
@@ -449,6 +436,7 @@ extern unsigned int ae9_ca0113_windows;
  */
 extern unsigned int ae9_debug;
 extern unsigned int ae9_surround;	/* 5.1 (default on) */
+extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 #define ae9_dbg(chip, fmt, ...) do {					\
 		if (ae9_debug)						\
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\

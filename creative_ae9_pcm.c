@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
 //
 // ALSA PCM device for Creative AE-9 HDA controller
 //
@@ -146,8 +147,8 @@ static void ae9_posbuf_read(struct creative_chip *chip, u32 lpib, u32 bufsz,
  * 2 ch, 24-bit, 48 kHz is 0x0031. 384 kHz is beyond the link's x4
  * multiplier: Windows sends it as 192 kHz with twice the channels (two
  * stereo samples per frame, the same bytes in the same order), 0x1833.
- * Playback offers 44.1-384 kHz with pcm_rates=1; the other entries are
- * unused.
+ * Playback offers 44.1-384 kHz with pcm_rates=2 (default); the other
+ * entries are unused.
  */
 static const struct {
 	unsigned int rate;
@@ -264,26 +265,26 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 /* ------------------------------------------------------------------ */
 
 /*
- * pcm_rates: 0 (default) = playback at 48 kHz only, as Windows' captured
- * start block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the
- * way Windows does it (creative_ae9_cold_pcm_replay). 2 = also 44.1 and
- * 88.2 kHz through the card's sample-rate converter: EXPERIMENTAL, it plays
- * silent or garbled on our card so far (Windows played its first 44.1 kHz
- * stream straight after startup; the clock state before it seems to
- * matter). PipeWire resamples 44.1 kHz files when those rates are left out.
- * Recording stays at 48 kHz.
+ * pcm_rates: 0 = playback at 48 kHz only, as Windows' captured start
+ * block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the way
+ * Windows does it (creative_ae9_cold_pcm_replay). 2 (default) = also 44.1
+ * and 88.2 kHz, stereo, through the card's sample-rate converter. These
+ * played silent or garbled until the DAC got Windows' 44.1 kHz-family
+ * commands (dac_441, 2026-11-06). PipeWire resamples 44.1 kHz files when
+ * those rates are left out. Recording: 48 or 96 kHz (capture side).
  * pcm_bits: 24 (default, as Windows' default format) or 32: the samples'
  * full 32 bits go to the card (format 0x41..., which Windows also uses).
  * Both writable at runtime; they apply to streams opened afterwards.
  */
-/* 48/96/192/384 kHz by default (Direct Mode; DSP mode takes 48 kHz):
- * every rate checked at 24 and 32 bit, switching back and forth, 2026-11-04 */
-static unsigned int pcm_rates = 1;
+/* 44.1-384 kHz by default (Direct Mode; DSP mode takes 48/96 kHz): 48 kHz
+ * family checked at 24 and 32 bit, switching back and forth, 2026-11-04;
+ * 44.1/88.2 kHz at 32 bit, before and after 96 kHz, 2026-11-06 */
+static unsigned int pcm_rates = 2;
 module_param(pcm_rates, uint, 0644);
-MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz (default), 2 = also 44.1/88.2 kHz (experimental)");
+MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2 kHz stereo (default)");
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
- * -> front RCA, Center/Sub jack, Rear jack; checked by ear 2026-11-04) and
+ * -> card's RCA, C/Sub jack, Rear jack; checked by ear 2026-11-04) and
  * the 4.0/4.1/5.1 speaker configs. PipeWire offers it as a profile with
  * config/creative-ae9.conf. Takes effect at the next stream open.
  */
@@ -307,33 +308,62 @@ static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
 };
 
 /*
- * 6 channels up to 96 kHz (48 kHz with surround_96k=0), and above that
- * only 2. Direct Mode only: DSP mode opens at 48 kHz. Windows' 5.1
- * captures are all 48 kHz.
+ * 6 channels up to 192 kHz (96 kHz with surround_192k=0, 48 kHz with
+ * surround_96k=0), and at 384 kHz only 2: Creative's 5.1 maximum is
+ * 192 kHz and Windows never offers 5.1 at 384 kHz. Direct Mode off (DSP
+ * mode) opens at 48 or 96 kHz (dsp_96k).
  */
-#define AE9_SURROUND_RATE_MAX	(surround_96k ? 96000 : 48000)
+#define AE9_SURROUND_RATE_MAX	(!surround_96k ? 48000 : \
+				 surround_192k ? 192000 : 96000)
 
 /* 5.1 at 96 kHz used to stutter more and more as it played: the start
  * block gave it the stereo router setup (front slots only) and the 64 KB
  * buffer was barely one quantum. Both fixed 2026-11-05: all six speakers
  * right, no errors over 2 min; on by default since. The 96 kHz slot
- * layout is our guess (no Windows capture of 5.1 above 48 kHz); 0 goes
+ * layout matches Windows' exactly (capture 2026-11-05, 02:01:48); 0 goes
  * back to 5.1 at 48 kHz only. */
 static unsigned int surround_96k = 1;
 module_param(surround_96k, uint, 0644);
 MODULE_PARM_DESC(surround_96k, "Allow 5.1 at 96 kHz in Direct Mode (1 = yes, default; 0 = 5.1 at 48 kHz only)");
+
+/* 5.1 at 192 kHz: Windows' router layout is our 96 kHz one with twice the
+ * slots (capture 2026-11-05, 02:02:20). 0 = 5.1 up to 96 kHz. */
+static unsigned int surround_192k = 1;
+module_param(surround_192k, uint, 0644);
+MODULE_PARM_DESC(surround_192k, "Allow 5.1 at 192 kHz in Direct Mode (1 = yes, default; 0 = 5.1 up to 96 kHz; needs surround_96k=1)");
+
+/* 96 kHz through the DSP (Direct Mode off), as Windows offers: stereo and
+ * 5.1 with SBX, live Direct Mode switches, no echo (2026-11-06). */
+bool ae9_dsp_96k = true;
+module_param_named(dsp_96k, ae9_dsp_96k, bool, 0644);
+MODULE_PARM_DESC(dsp_96k, "Allow 96 kHz with Direct Mode off, through the DSP (1 = yes, default; 0 = 48 kHz only); applies to streams opened afterwards");
+
+/*
+ * 5.1 rates: the 48 kHz family up to AE9_SURROUND_RATE_MAX. 44.1/88.2 kHz
+ * go through the sample-rate converter, which carries one stereo pair
+ * (Windows offers them in stereo only, capture 2026-11-05 format probes).
+ */
+static unsigned int ae9_surround_rates(unsigned int *list)
+{
+	static const unsigned int r[] = { 48000, 96000, 192000 };
+	unsigned int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(r); i++)
+		if (r[i] <= AE9_SURROUND_RATE_MAX)
+			list[n++] = r[i];
+	return n;
+}
+
 static int ae9_rule_rate_by_ch(struct snd_pcm_hw_params *params,
 			       struct snd_pcm_hw_rule *rule)
 {
 	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
-	struct snd_interval t;
+	unsigned int list[3];
 
 	if (ch->min <= 2)
 		return 0;
-	snd_interval_any(&t);
-	t.max = AE9_SURROUND_RATE_MAX;
-	return snd_interval_refine(rate, &t);
+	return snd_interval_list(rate, ae9_surround_rates(list), list, 0);
 }
 
 static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
@@ -342,9 +372,11 @@ static int ae9_rule_ch_by_rate(struct snd_pcm_hw_params *params,
 	struct snd_interval *ch = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
 	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
 	struct snd_interval t;
+	unsigned int list[3], i, n = ae9_surround_rates(list);
 
-	if (rate->min <= AE9_SURROUND_RATE_MAX)
-		return 0;
+	for (i = 0; i < n; i++)
+		if (snd_interval_test(rate, list[i]))
+			return 0;	/* a 5.1 rate is still possible */
 	snd_interval_any(&t);
 	t.max = 2;
 	return snd_interval_refine(ch, &t);
@@ -534,22 +566,27 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_max = 48000;
 	}
 	/*
-	 * Direct Mode off = through the DSP: 48 kHz only. Windows offers up to
-	 * 96 kHz there, but our DSP-mode start only sets up a 48 kHz input:
-	 * at 96 kHz the router came up with no DSP input path while the direct
-	 * route stayed live, so the stream played twice, direct and through
-	 * the DSP a little later (an echo; 2026-11-04). PipeWire resamples
-	 * other rates to 48 kHz in DSP mode; Direct Mode keeps them all.
+	 * Direct Mode off = through the DSP: 48 kHz, and 96 kHz with dsp_96k.
+	 * Windows offers up to 96 kHz there. Our first 96 kHz try played the
+	 * stream twice, direct and through the DSP a little later (an echo;
+	 * 2026-11-04): most likely stale direct bypass entries (HDA 02/03 ->
+	 * DAC 0x42/0x43) from an earlier 96 kHz+ Direct Mode stream, which
+	 * DSP mode now switches off (creative_ae9_router_front_dsp). Windows
+	 * sends nothing rate-specific for 96 kHz in DSP mode (capture
+	 * 2026-11-05, 01:55:36). PipeWire resamples other rates.
 	 */
 	if (!chip->fx.direct) {
-		runtime->hw.rates &= SNDRV_PCM_RATE_48000;
+		unsigned int top = ae9_dsp_96k ? 96000 : 48000;
+
+		runtime->hw.rates &= SNDRV_PCM_RATE_48000 |
+				     (ae9_dsp_96k ? SNDRV_PCM_RATE_96000 : 0);
 		runtime->hw.rate_min = max(runtime->hw.rate_min, 48000U);
-		runtime->hw.rate_max = min(runtime->hw.rate_max, 48000U);
+		runtime->hw.rate_max = min(runtime->hw.rate_max, top);
 	}
 	/*
 	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
 	 * (captures 5, 6: format 0x35) and in Direct Mode with 5.1 speakers
-	 * (capture 6, 23:39:16). 6 channels up to 96 kHz (see
+	 * (capture 6, 23:39:16). 6 channels up to 192 kHz (see
 	 * AE9_SURROUND_RATE_MAX).
 	 */
 	if (ae9_surround) {
@@ -835,11 +872,57 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 
 /* ------------------------------------------------------------------ */
 /* Capture: input stream 0 (BAR0+0x80), tag 1, from codec 1 node 0x07	  */
-/* (the head unit's XLR input), as in the Windows recording capture.	  */
+/* (the head unit's input: its XLR/TRS jack and its 3.5 mm mic jack	  */
+/* share it; Windows lists them as Microphone and Aux), as in the	  */
+/* Windows recording capture. 48 or 96 kHz (Creative: mic up to 96 kHz); */
+/* Windows' 96 kHz recording is the stream format 0x831 and the same	  */
+/* format on node 0x07, nothing else (VM capture 2026-11-05).		  */
 /* ------------------------------------------------------------------ */
 #define CREATIVE_CAP_STREAM_BASE	0x80	/* input stream descriptor 0 */
 #define CREATIVE_CAP_STREAM_TAG		1
 #define CREATIVE_CAP_BDL_MAX		8
+
+/*
+ * cap_bits: the recording's sample bits, 24 (default) or 32, as Windows'
+ * recording format choice (VM captures 2026-11-03: node 0x07 format 0x41 /
+ * 0x841 at 32-bit). Same S32_LE container either way; taken at the next
+ * recording start, like "PCM Bit Depth" for playback.
+ */
+static unsigned int cap_bits = 24;
+module_param(cap_bits, uint, 0644);
+MODULE_PARM_DESC(cap_bits, "Recording sample bits: 24 (default) or 32; also the 'Capture Bit Depth' control");
+
+static int cap_bits_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.enumerated.item[0] = cap_bits == 32;
+	return 0;
+}
+
+static int cap_bits_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	unsigned int want = uv->value.enumerated.item[0] ? 32 : 24;
+
+	if (uv->value.enumerated.item[0] > 1)
+		return -EINVAL;
+	if (want == (cap_bits == 32 ? 32 : 24))
+		return 0;
+	cap_bits = want;	/* the next recording opens with it */
+	return 1;
+}
+
+static const struct snd_kcontrol_new cap_bits_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Capture Bit Depth",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = pcm_bits_info,		/* "24-bit", "32-bit" */
+	.get = cap_bits_get,
+	.put = cap_bits_put,
+};
+
+static unsigned int cap_bits_now(void)
+{
+	return cap_bits == 32 ? 32 : 24;
+}
 
 static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 {
@@ -849,19 +932,20 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 	chip->capture_substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
-	/* Windows: format 0x31 (2 ch, 24-bit in 32-bit containers, 48 kHz) */
+	/* Windows: format 0x31 (2 ch, 24-bit in 32-bit containers, 48 kHz),
+	 * 0x831 at 96 kHz */
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	runtime->hw.rates = SNDRV_PCM_RATE_48000;
+	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000;
 	runtime->hw.rate_min = 48000;
-	runtime->hw.rate_max = 48000;
-	runtime->hw.buffer_bytes_max = 64 * 1024;
+	runtime->hw.rate_max = 96000;
+	runtime->hw.buffer_bytes_max = 128 * 1024;	/* ~170 ms at 96 kHz */
 	runtime->hw.period_bytes_min = 1920;	/* 5 ms */
 	runtime->hw.period_bytes_max = 32 * 1024;
 	runtime->hw.periods_min = 2;
 	runtime->hw.periods_max = CREATIVE_CAP_BDL_MAX;
-	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
+	snd_pcm_hw_constraint_msbits(runtime, 0, 32, cap_bits_now());
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	chip->cap_start_sent = 0;
 	return 0;
@@ -958,13 +1042,16 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, period * periods);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, periods - 1);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT,
-			    creative_ae9_stream_format(runtime->channels, 24,
+			    creative_ae9_stream_format(runtime->channels, cap_bits_now(),
 						    runtime->rate));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
 
 	/* Windows' start block once per open (re-prepares after an xrun
-	 * must not resend it) */
+	 * must not resend it), with node 0x07 given this recording's format
+	 * before its bind (see creative_ae9_cap_replay) */
+	chip->cap_format = creative_ae9_stream_format(runtime->channels, cap_bits_now(),
+						      runtime->rate);
 	if (!chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, true);
 		if (chip->mic_level != 99)
@@ -1033,31 +1120,90 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 }
 
 /* ------------------------------------------------------------------ */
-/* Optical in: PCM device 1, input stream 1 (BAR0+0xa0), tag 2, from	  */
-/* codec 2's S/PDIF input converter 0x09. Its own stream, so it records */
-/* alongside the XLR mic. S/PDIF input doesn't resample: open it at the */
-/* rate the sender uses.						  */
+/* Extra capture devices, each on its own input stream so they record	  */
+/* alongside the XLR mic:						  */
+/*   PCM device 1 "AE-9 Optical": codec 2's S/PDIF input converter	  */
+/*     0x09 (pin 0x0e), input stream 1 (BAR0+0xa0), tag 2, 44.1-192 kHz.*/
+/*     S/PDIF input doesn't resample: open it at the sender's rate.	  */
+/*   PCM device 2 "AE-9 What U Hear": codec 1's loopback ADC 0x0a (pin	  */
+/*     0x13, "What U Hear In"), input stream 2 (BAR0+0xc0), tag 3. What */
+/*     the card plays, both with Direct Mode on and off (with SBX off it */
+/*     is the stream as sent: a 440 Hz test tone came back level-exact  */
+/*     on both channels). 48 or 96 kHz (wuh_96k).			  */
 /* ------------------------------------------------------------------ */
-#define AE9_OPT_STREAM_BASE	0xa0	/* input stream descriptor 1 */
-#define AE9_OPT_STREAM_TAG	2
+struct ae9_xcap {
+	const char	*name;
+	unsigned int	base, tag, cad, nid;
+	unsigned int	rates, rate_min, rate_max;
+	unsigned int	signal_pin;	/* codec pin whose sense says "signal", 0 none */
+};
 
-static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
+static const struct ae9_xcap ae9_xcaps[2] = {
+	{ "AE-9 Optical", 0xa0, 2, AE9_SPDIF_CAD, AE9_SPDIF_IN_NID,
+	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	  44100, 192000, AE9_SPDIF_IN_PIN },
+	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
+	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
+};
+#define AE9_XCAP_WUH	1
+
+/*
+ * What U Hear at 96 kHz: only the stream and ADC 0x0a format change, as
+ * the mic's 96 kHz recording. Tested 2026-11-06: a 440 Hz tone comes back
+ * at 440 Hz and the same level (-23.1 dBFS, L == R) with the card playing
+ * at 48 or 96 kHz. Also moving its DSP connection point (ca0132's
+ * MEM_CONNID_WUH = 0x0a, 48 kHz from Windows' boot table) to 96 kHz was
+ * wrong: ~810 Hz, 3 dB low. Leave it at 48 kHz.
+ */
+static bool wuh_96k = true;
+module_param(wuh_96k, bool, 0644);
+MODULE_PARM_DESC(wuh_96k, "What U Hear at 48 or 96 kHz (1 = yes, default; 0 = 48 kHz only)");
+
+
+
+/* PCM device n (1, 2) -> table index */
+static unsigned int ae9_xcap_idx(struct snd_pcm_substream *substream)
+{
+	return substream->pcm->device - 1;
+}
+
+/* one verb to a capture device's codec: 12-bit verb + 8-bit payload, or
+ * (verb < 0x10) a 4-bit verb + 16-bit payload */
+static int ae9_xcap_verb(struct creative_chip *chip, const struct ae9_xcap *x,
+			 unsigned int nid, unsigned int verb, unsigned int payload,
+			 u32 *resp)
+{
+	u32 v = (x->cad << 28) | (nid << 20), r;
+
+	v |= verb < 0x10 ? (verb << 16) | (payload & 0xffff) :
+			   (verb << 8) | (payload & 0xff);
+	if (chip->corb_buf)
+		return creative_ae9_corb_send_verb_sync(chip, v, resp ? resp : &r);
+	return creative_ae9_icw_send_verb(chip, v, resp ? resp : &r);
+}
+
+static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int i = ae9_xcap_idx(substream);
+	const struct ae9_xcap *x = &ae9_xcaps[i];
 
-	chip->opt_substream = substream;
+	chip->xcap[i].substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
 	/* 24-bit in 32-bit containers, as the XLR capture */
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
-	runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
-			    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
-			    SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000;
-	runtime->hw.rate_min = 44100;
-	runtime->hw.rate_max = 192000;
+	runtime->hw.rates = x->rates;
+	runtime->hw.rate_min = x->rate_min;
+	runtime->hw.rate_max = x->rate_max;
+	if (i == AE9_XCAP_WUH && wuh_96k) {
+		runtime->hw.rates |= SNDRV_PCM_RATE_96000;
+		runtime->hw.rate_max = 96000;
+	}
 	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
 	runtime->hw.period_bytes_min = 1024;
 	runtime->hw.period_bytes_max = CREATIVE_PCM_BUF_MAX / 2;
@@ -1070,76 +1216,84 @@ static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static int creative_ae9_opt_close(struct snd_pcm_substream *substream)
+static int creative_ae9_xcap_close(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 
-	chip->opt_substream = NULL;
+	chip->xcap[ae9_xcap_idx(substream)].substream = NULL;
 	return 0;
 }
 
-static void creative_ae9_opt_bdl_free(struct creative_chip *chip)
+static void creative_ae9_xcap_bdl_free(struct creative_chip *chip, unsigned int i)
 {
-	if (chip->opt_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->opt_bdl_size,
-				  chip->opt_bdl_raw, chip->opt_bdl_dma);
-		chip->opt_bdl_raw = NULL;
-		chip->opt_bdl = NULL;
+	struct ae9_xcap_state *st = &chip->xcap[i];
+
+	if (st->bdl_raw) {
+		dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
+		st->bdl_raw = NULL;
+		st->bdl = NULL;
 	}
 }
 
-static int creative_ae9_opt_hw_params(struct snd_pcm_substream *substream,
-				      struct snd_pcm_hw_params *hw_params)
+static int creative_ae9_xcap_hw_params(struct snd_pcm_substream *substream,
+				       struct snd_pcm_hw_params *hw_params)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int i = ae9_xcap_idx(substream);
+	struct ae9_xcap_state *st = &chip->xcap[i];
 	int ret;
 
-	creative_ae9_opt_bdl_free(chip);
+	creative_ae9_xcap_bdl_free(chip, i);
 	ret = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
 	if (ret < 0)
 		return ret;
-	chip->opt_bdl_size = ae9_dma_size(chip, CREATIVE_CAP_BDL_MAX * 16 + 128);
-	chip->opt_bdl_raw = dma_alloc_coherent(chip->dev, chip->opt_bdl_size,
-					       &chip->opt_bdl_dma, GFP_KERNEL);
-	if (!chip->opt_bdl_raw) {
+	st->bdl_size = ae9_dma_size(chip, CREATIVE_CAP_BDL_MAX * 16 + 128);
+	st->bdl_raw = dma_alloc_coherent(chip->dev, st->bdl_size, &st->bdl_dma,
+					 GFP_KERNEL);
+	if (!st->bdl_raw) {
 		snd_pcm_lib_free_pages(substream);
 		return -ENOMEM;
 	}
-	chip->opt_bdl = PTR_ALIGN(chip->opt_bdl_raw, 128);
+	st->bdl = PTR_ALIGN(st->bdl_raw, 128);
 	return 0;
 }
 
-static int creative_ae9_opt_hw_free(struct snd_pcm_substream *substream)
+static int creative_ae9_xcap_hw_free(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int i = ae9_xcap_idx(substream);
+	const struct ae9_xcap *x = &ae9_xcaps[i];
 
-	ae9_spdif_verb(chip, AE9_SPDIF_IN_NID, 0x706, 0);	/* off the stream */
-	creative_ae9_opt_bdl_free(chip);
+	ae9_xcap_verb(chip, x, x->nid, 0x706, 0, NULL);	/* off the stream */
+	creative_ae9_xcap_bdl_free(chip, i);
 	return snd_pcm_lib_free_pages(substream);
 }
 
-static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
+static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	unsigned int base = AE9_OPT_STREAM_BASE;
+	unsigned int i = ae9_xcap_idx(substream);
+	const struct ae9_xcap *x = &ae9_xcaps[i];
+	struct ae9_xcap_state *st = &chip->xcap[i];
+	unsigned int base = x->base;
 	unsigned int period = snd_pcm_lib_period_bytes(substream);
 	unsigned int periods = runtime->periods;
-	dma_addr_t bdl_dma = ALIGN(chip->opt_bdl_dma, 128);
+	dma_addr_t bdl_dma = ALIGN(st->bdl_dma, 128);
 	dma_addr_t addr = runtime->dma_addr;
-	unsigned int i;
+	unsigned int k;
 	u16 format;
 	u32 ctl;
 
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
-	/* With no S/PDIF signal the codec sends nothing and the stream never
-	 * moves (a read just times out with an I/O error): say so instead.
-	 * Pin sense bit 31 is set while a signal comes in. */
-	{
+	/* Optical: with no S/PDIF signal the codec sends nothing and the
+	 * stream never moves (a read just times out with an I/O error): say
+	 * so instead. Pin sense bit 31 is set while a signal comes in. */
+	if (x->signal_pin) {
 		u32 sense = 0;
 
-		if (ae9_spdif_verb_resp(chip, AE9_SPDIF_IN_PIN, 0xf09, 0, &sense) == 0 &&
+		if (ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
 		    !(sense & 0x80000000)) {
 			dev_info_ratelimited(chip->dev,
 				"optical in: no signal on the optical input (connect a source, then record)\n");
@@ -1148,11 +1302,11 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 	}
 	creative_ae9_stream_reset(chip, base);
 
-	memset(chip->opt_bdl, 0, CREATIVE_CAP_BDL_MAX * 16);
-	for (i = 0; i < periods; i++) {
-		__le64 *bdl_addr = chip->opt_bdl + i * 16;
-		__le32 *bdl_len = chip->opt_bdl + i * 16 + 8;
-		__le32 *bdl_ioc = chip->opt_bdl + i * 16 + 12;
+	memset(st->bdl, 0, CREATIVE_CAP_BDL_MAX * 16);
+	for (k = 0; k < periods; k++) {
+		__le64 *bdl_addr = st->bdl + k * 16;
+		__le32 *bdl_len = st->bdl + k * 16 + 8;
+		__le32 *bdl_ioc = st->bdl + k * 16 + 12;
 
 		*bdl_addr = cpu_to_le64(addr);
 		*bdl_len = cpu_to_le32(period);
@@ -1163,7 +1317,7 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~(0xf << 20);
-	ctl |= (AE9_OPT_STREAM_TAG & 0xf) << 20;
+	ctl |= (x->tag & 0xf) << 20;
 	writel(ctl & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 	format = creative_ae9_stream_format(runtime->channels, 24, runtime->rate);
@@ -1173,27 +1327,28 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
 
-	/* converter 0x09 onto the stream: same format, tag, channel 0 */
-	ae9_spdif_verb(chip, AE9_SPDIF_IN_NID, 0x2, format);
-	ae9_spdif_verb(chip, AE9_SPDIF_IN_NID, 0x706, AE9_OPT_STREAM_TAG << 4);
-	ae9_dbg(chip, "optical in prepare: SD_FMT=0x%04x\n", format);
+	/* the converter onto the stream: same format, tag, channel 0 */
+	ae9_xcap_verb(chip, x, x->nid, 0x2, format, NULL);
+	ae9_xcap_verb(chip, x, x->nid, 0x706, x->tag << 4, NULL);
+	ae9_dbg(chip, "%s prepare: SD_FMT=0x%04x\n", x->name, format);
 	return 0;
 }
 
-static int creative_ae9_opt_trigger(struct snd_pcm_substream *substream, int cmd)
+static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		creative_ae9_stream_start(chip, AE9_OPT_STREAM_BASE);
+		creative_ae9_stream_start(chip, base);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		creative_ae9_stream_stop(chip, AE9_OPT_STREAM_BASE);
+		creative_ae9_stream_stop(chip, base);
 		break;
 	default:
 		return -EINVAL;
@@ -1202,43 +1357,65 @@ static int creative_ae9_opt_trigger(struct snd_pcm_substream *substream, int cmd
 }
 
 static snd_pcm_uframes_t
-creative_ae9_opt_pointer(struct snd_pcm_substream *substream)
+creative_ae9_xcap_pointer(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
 	unsigned int pos;
 
-	pos = readl(chip->hda_regs + AE9_OPT_STREAM_BASE + AZX_REG_SD_LPIB);
+	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
 		pos = 0;
 	return bytes_to_frames(substream->runtime, pos);
 }
 
-static const struct snd_pcm_ops creative_ae9_opt_ops = {
-	.open		= creative_ae9_opt_open,
-	.close		= creative_ae9_opt_close,
-	.hw_params	= creative_ae9_opt_hw_params,
-	.hw_free	= creative_ae9_opt_hw_free,
-	.prepare	= creative_ae9_opt_prepare,
-	.trigger	= creative_ae9_opt_trigger,
-	.pointer	= creative_ae9_opt_pointer,
+static const struct snd_pcm_ops creative_ae9_xcap_ops = {
+	.open		= creative_ae9_xcap_open,
+	.close		= creative_ae9_xcap_close,
+	.hw_params	= creative_ae9_xcap_hw_params,
+	.hw_free	= creative_ae9_xcap_hw_free,
+	.prepare	= creative_ae9_xcap_prepare,
+	.trigger	= creative_ae9_xcap_trigger,
+	.pointer	= creative_ae9_xcap_pointer,
 };
 
-/* Called from the IRQ handler: acknowledge input stream 1, notify ALSA. */
-void creative_ae9_opt_irq(struct creative_chip *chip)
+/* Called from the IRQ handler: acknowledge extra input stream i, notify ALSA. */
+void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i)
 {
-	unsigned int base = AE9_OPT_STREAM_BASE;
+	unsigned int base = ae9_xcaps[i].base;
 	u8 sts = readb(chip->hda_regs + base + AZX_REG_SD_STS);
 
 	if (!sts)
 		return;
 	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
-	if ((sts & SD_INT_COMPLETE) && chip->opt_substream)
-		snd_pcm_period_elapsed(chip->opt_substream);
+	if ((sts & SD_INT_COMPLETE) && chip->xcap[i].substream)
+		snd_pcm_period_elapsed(chip->xcap[i].substream);
 }
 
-static void creative_ae9_opt_pcm_free(struct snd_pcm *pcm)
+static void creative_ae9_xcap_pcm_free(struct snd_pcm *pcm)
 {
-	creative_ae9_opt_bdl_free(pcm->private_data);
+	creative_ae9_xcap_bdl_free(pcm->private_data, pcm->device - 1);
+}
+
+/* PCM device i+1 for ae9_xcaps[i] */
+static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
+{
+	const struct ae9_xcap *x = &ae9_xcaps[i];
+	struct snd_pcm *pcm;
+	int ret;
+
+	ret = snd_pcm_new(chip->card, x->name, i + 1, 0, 1, &pcm);
+	if (ret < 0) {
+		dev_warn(chip->dev, "%s device not added (%d)\n", x->name, ret);
+		return;
+	}
+	pcm->private_data = chip;
+	pcm->private_free = creative_ae9_xcap_pcm_free;
+	strscpy(pcm->name, x->name, sizeof(pcm->name));
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &creative_ae9_xcap_ops);
+	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV, chip->dev,
+					      ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX),
+					      ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1281,31 +1458,19 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	ret = snd_ctl_add(chip->card, snd_ctl_new1(&pcm_bits_control, chip));
 	if (ret < 0)
 		dev_warn(chip->dev, "PCM Bit Depth control not added (%d)\n", ret);
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&cap_bits_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "Capture Bit Depth control not added (%d)\n", ret);
 
 	/* optical: out follows the main stream, in is PCM device 1 */
 	chip->spdif_out = spdif_out;
 	ret = snd_ctl_add(chip->card, snd_ctl_new1(&spdif_out_control, chip));
 	if (ret < 0)
 		dev_warn(chip->dev, "Optical Out control not added (%d)\n", ret);
-	{
-		struct snd_pcm *opt;
+	creative_ae9_xcap_new(chip, 0);	/* optical in */
+	creative_ae9_xcap_new(chip, 1);	/* What U Hear */
 
-		ret = snd_pcm_new(chip->card, "AE-9 Optical", 1, 0, 1, &opt);
-		if (ret < 0) {
-			dev_warn(chip->dev, "optical in device not added (%d)\n", ret);
-		} else {
-			opt->private_data = chip;
-			opt->private_free = creative_ae9_opt_pcm_free;
-			strscpy(opt->name, "AE-9 Optical", sizeof(opt->name));
-			snd_pcm_set_ops(opt, SNDRV_PCM_STREAM_CAPTURE, &creative_ae9_opt_ops);
-			snd_pcm_lib_preallocate_pages_for_all(opt,
-				SNDRV_DMA_TYPE_DEV, chip->dev,
-				ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX),
-				ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX));
-		}
-	}
-
-	dev_info(chip->dev, "PCM device initialized (playback + capture, optical in)\n");
+	dev_info(chip->dev, "PCM device initialized (playback + capture, optical in, What U Hear)\n");
 	return 0;
 }
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 """Extract the AE-9 DSP overlay image from the Creative Windows driver.
 
 Usage: extract_overlay.py /path/to/CtxHda.sys [out.bin]

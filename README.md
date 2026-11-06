@@ -7,24 +7,24 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-05, v0.8.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-06, v0.9.4):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
-> Recording from the head unit's XLR mic input works (arecord, Audacity).
+> Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
-> to 24-bit/192 kHz), in is its own recording device.
+> to 24-bit/192 kHz), in is its own recording device. What U Hear records
+> what the card plays.
 > The ACM head unit shows the volume; its knob sets the volume, a press
-> mutes, a medium hold switches between the RCA outputs and the head unit's
-> headphone jack, and a long hold toggles the knob light. The SBX button
+> mutes, a medium hold switches between the card's RCA outputs and the
+> head unit's headphone jacks, and a long hold toggles the knob light. The SBX button
 > turns SBX on and off (with Direct Mode off) and its light shows when the
 > effects are running.
 > The driver gets there by doing what the Windows driver does in a cold-boot
 > VFIO capture; that setup is the built-in default, no module options needed. Playback at
-> 48, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
-> the box in Direct Mode; 44.1/88.2 kHz playback and recording above
-> 48 kHz are not done yet. SBX effects and the EQ work through the card's
-> DSP, with Direct Mode off. 5.1 works on the card's front, rear and
-> center/sub jacks, at 48 or 96 kHz in Direct Mode and 48 kHz through the
-> DSP.
+> 44.1, 48, 88.2, 96, 192 and 384 kHz, 24- or 32-bit ("PCM Bit Depth"), works out of
+> the box in Direct Mode. SBX effects and the EQ work through the card's
+> DSP, with Direct Mode off. 5.1 works on the card's RCA, Rear and
+> C/Sub jacks, at 48, 96 or 192 kHz in Direct Mode and 48 or 96 kHz through
+> the DSP.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -33,6 +33,8 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
+> Driver v0.9.4 pairs with SbAe9-SBC v0.10.0 (its rate picker knows each
+> mode's rates); older SbC versions still work, with shorter rate lists.
 
 ## Hardware / Environment
 
@@ -148,12 +150,27 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
 - Prefer a GUI? [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) gives
   every control below a Sound Blaster Command-style window (Python 3 +
   PySide6), and follows the knob and alsamixer live.
-- Output: the RCA jacks on the card (speaker mode, "-SP-") or the head
-  unit's headphone jack ("-HP-"). Starts on speakers; switch with a 1.5-3 s
+- Output: the card's RCA jacks (speaker mode, "-SP-") or the head unit's
+  headphone jacks, 3.5 mm and 1/4" ("-HP-"). Starts on speakers; switch with a 1.5-3 s
   knob hold or the "Head Unit Output" control. Each output remembers its own
   volume (both start at -36 dB).
 - Knob: turn = volume, press (< 1 s) = mute, hold 1.5-3 s = speakers /
   headphones, hold 3 s or more = knob light on/off.
+- Plugs: "Head Unit 3.5mm Phones Plugged" (the head unit's 3.5 mm
+  headphone jack) and "Head Unit 3.5mm Mic Plugged" (its 3.5 mm mic jack)
+  show what's plugged in, read-only, for apps to show. The 1/4" headphone
+  jack and the XLR/TRS jack don't report plugs.
+- Phantom power: "Head Unit Phantom Power" shows and switches the head
+  unit's 48 V phantom power for the XLR/TRS jack (its own button works too).
+  It always starts off, and switching it on is refused for 30 s after the
+  card starts or wakes, so a restored mixer state can't turn 48 V on by
+  itself. Only turn it on for mics that need it: 48 V can damage some gear
+  (ribbon mics, some line-level sources).
+- Auto switch: "Head Unit Auto Switch" (off by default) makes the head unit's
+  3.5 mm headphone jack switch outputs: plug in = headphones, unplug = speakers,
+  about 1.5 s after the plug settles. Off, plugs change nothing. The
+  1/4" headphone jack isn't reported, so it can't auto switch. To start with it
+  on: options snd-hda-codec-creative-ae9 hu_auto_switch=1
 - SBX button (head unit): turns SBX on/off, same as "SBX Switch", only
   with Direct Mode off (with Direct Mode on it does nothing). Its light is
   on while the effects are running: Direct Mode off and SBX on.
@@ -163,25 +180,35 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   volume only.
 - The PCM takes 2 or 6 channels, S32_LE. "PCM Bit Depth" (24-bit, the
   default as Windows, or 32-bit) sets how the card takes it; it applies to
-  the next stream (24-bit sources lose nothing at 32-bit). Rates: 48, 96,
-  192 and 384 kHz in Direct Mode, 48 kHz with Direct Mode off (PipeWire
-  resamples; 96 kHz through the DSP isn't done yet). Recording is 48 kHz.
+  the next stream (24-bit sources lose nothing at 32-bit). Rates: 44.1, 48,
+  88.2, 96, 192 and 384 kHz in Direct Mode (44.1/88.2 kHz stereo only),
+  48 or 96 kHz with Direct Mode off, through the DSP (v0.9.4; PipeWire
+  resamples other rates). Recording is 48 or 96 kHz.
 - Choosing a rate: PipeWire runs at 48 kHz unless told otherwise.
-  `pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 192000 384000 ]'`
-  follows 48 kHz-family files, `clock.force-rate 192000` forces one (0 =
+  `pw-metadata -n settings 0 clock.allowed-rates '[ 44100 48000 88200 96000 192000 384000 ]'`
+  follows each file's rate, `clock.force-rate 192000` forces one (0 =
   back to automatic). SbAe9-SBC does this from its rate picker. For
-  small quantums, see "Low latency" below. Don't add 44100/88200: that family isn't working yet
-  (`pcm_rates=2` offers it, experimental: silent or garbled so far), and
-  PipeWire resamples those files when they're left out. `pcm_rates=0`
-  limits the card to 48 kHz.
-- Recording: the head unit's XLR mic input (`arecord -D hw:AE9 -c 2 -r 48000
-  -f S32_LE`, or the AE-9 input in PipeWire/Audacity). "XLR Gain" sets
+  small quantums, see "Low latency" below. 44.1/88.2 kHz (v0.9.4) play
+  through the card's sample-rate converter; leave 44100/88200 out and
+  PipeWire resamples those files to 48 kHz instead. `pcm_rates=1` drops
+  44.1/88.2 kHz from the card's list, `pcm_rates=0` limits it to 48 kHz.
+- Recording: the head unit's input, at 48 or 96 kHz (`arecord -D hw:AE9 -c 2
+  -r 96000 -f S32_LE`, or the AE-9 input in PipeWire/Audacity). The head unit's
+  XLR/TRS jack and its 3.5 mm mic jack share it (Windows lists them as
+  Microphone and Aux; the mic's own mute switch affects both). "Capture Bit
+  Depth" picks 24-bit (default) or 32-bit samples, as Windows' recording
+  format choice (`amixer -c AE9 cset name='Capture Bit Depth' 32-bit`; it
+  takes effect at the next recording start). For a clearer
+  desktop name, copy `config/61-ae9-names.conf` to
+  `~/.config/wireplumber/wireplumber.conf.d/` and run
+  `systemctl --user restart wireplumber`: the source shows as "AE-9 Head Unit
+  Mic / Aux" (node names stay the same). "Mic Gain" (was "XLR Gain") sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
-  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'XLR Gain' 0|1|2`. "Capture"
+  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'Mic Gain' 0|1|2`. "Capture"
   is the mic level, -89 to +9 dB in 1 dB steps with mute at 0 (default +9 dB,
   what Windows' recording setup uses), set the way Windows' Recording ->
   Levels slider does it; PipeWire uses it as the mic's hardware volume, so
-  the desktop microphone slider moves it (100% = +9 dB). XLR Gain stays
+  the desktop microphone slider moves it (100% = +9 dB). Mic Gain stays
   separate. Phantom power is the 48V button on the head unit's front panel;
   the driver doesn't need to do anything.
 - DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
@@ -206,12 +233,25 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     record at the sender's rate (PipeWire runs at 48 kHz unless told
     otherwise). With nothing sending, recording fails at once and the
     kernel log says "no signal on the optical input".
+- What U Hear (new): records what the card plays, as its own capture
+  device, `hw:AE9,2` ("AE-9 What U Hear"), 48 or 96 kHz (96 kHz since
+  0.9.5, `wuh_96k`), next to the XLR mic and optical in
+  (`arecord -D hw:AE9,2 -c 2 -r 96000 -f S32_LE out.wav`). The PipeWire
+  config below records at 48 kHz; change its `audio.rate` to 96000 for
+  96 kHz. It
+  works in Direct Mode and through the DSP; with SBX off it's the stream
+  exactly as sent (a test tone comes back level-exact on both channels).
+  For PipeWire, copy `config/ae9-what-u-hear.conf` to
+  `~/.config/pipewire/pipewire.conf.d/` and run
+  `systemctl --user restart pipewire`: an "AE-9 What U Hear" source
+  appears (never the default input), for recording or streaming the
+  card's own output.
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
-  card's RCA jacks, center and LFE out of the Center/Sub jack, rear L/R
-  out of the Rear jack. Works in Direct Mode (straight to the DACs, 48 or
-  96 kHz; 192/384 kHz stay stereo) and with Direct Mode off (through the
-  DSP, 48 kHz). With Direct Mode off, "Speaker
+  card's RCA jacks, center and LFE out of its 3.5 mm C/Sub jack, rear L/R
+  out of its 3.5 mm Rear jack. Works in Direct Mode (straight to the DACs, 48,
+  96 or 192 kHz; 384 kHz stays stereo) and with Direct Mode off (through the
+  DSP, 48 or 96 kHz). With Direct Mode off, "Speaker
   Config" tells the DSP your layout: 2.0/2.1 fold the six channels down
   to the front (and sub), 4.0/4.1 drop the center, 5.1 uses all six. It
   follows the stream by itself: a 5.1 stream turns 2.0/2.1 into 5.1, a
@@ -304,6 +344,15 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
   card's hardware volume); app volumes above 100% are software gain and
   can clip.
 
+### Reporting a problem
+
+`sudo scripts/ae9-full-dump.sh` saves everything the driver can read about
+the card (streams, controls, PipeWire, registers, the DSP's router, the
+driver's recent log) to `ae9-dump-<time>.txt` in the current directory,
+without changing anything. Take one while the problem is happening (and one
+when it's fine, if you can) and attach them to your report. It only names
+the apps that are playing; look it over before posting.
+
 ### Known issues
 
 - Optical in: if the S/PDIF signal stops in the middle of a recording,
@@ -362,7 +411,7 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands |
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
-| `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (follows playback) and optical in (device 1) |
+| `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (follows playback), optical in (device 1) and What U Hear (device 2) |
 | `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
@@ -371,6 +420,8 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 | `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
+| `config/ae9-what-u-hear.conf` | Optional PipeWire source for What U Hear (see "What U Hear") |
+| `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Head Unit Mic / Aux" |
 
 ## Module parameters
 
@@ -386,7 +437,7 @@ code path for comparison:
   pre-download init as Windows does it (815-verb cold table).
 - `fw_split`, `dl_windows`, `dl_reset_chunks` (default 1), `dl_bdl64`
   (default 1), `hs_immediate`, `scp_event`, `scp_win_read`, `chipio_nocache`,
-  `sentinel_clear=0`, `lineout_prerun=0`, `loop_start=0` —
+  `sentinel_clear=0` —
   firmware download, DSP start and the MASTERCONTROL boot handshake.
 - `overlay` — transfer the DSP overlay image during the handshake.
 - `surround` (default 1, writable at runtime) — 6-channel (5.1) playback and
@@ -396,6 +447,16 @@ code path for comparison:
   `surround_96k` (1, writable at runtime) — 5.1 at 96 kHz in Direct Mode
   (fixed 2026-11-05: all six speakers right, clean over minutes); 0 limits
   5.1 to 48 kHz. Pick the 5.1 profile and `clock.force-rate 96000`.
+  `surround_192k` (1, writable at runtime) — 5.1 at 192 kHz in Direct Mode
+  (v0.9.4, Windows' router layout); 0 limits 5.1 to 96 kHz.
+- `pcm_rates` (2, writable at runtime) — playback rates: 2 = 44.1-384
+  kHz, 1 = without 44.1/88.2 kHz, 0 = 48 kHz only. `dac_441` (1) sends
+  Windows' DAC commands for 44.1/88.2 kHz (without them those rates play
+  garbled or silent).
+- `wuh_96k` (1, writable at runtime) — What U Hear at 48 or 96 kHz
+  (0.9.5); 0 = 48 kHz only.
+- `dsp_96k` (1, writable at runtime) — 96 kHz with Direct Mode off, through
+  the DSP (v0.9.4); 0 limits DSP mode to 48 kHz.
 - `debug` (default 0, writable at runtime) — log detail. 0: startup, your
   actions (Direct Mode/SBX, output switches, mutes) and problems. 1: also
   the routine per-stream and per-step lines (command blocks, router, volume
@@ -407,9 +468,10 @@ code path for comparison:
 - `fw_verify` (default 0) — read the firmware back after download and count
   mismatches.
 - `ca0113_windows` — head-unit DAC commands with Windows' protocol/values.
-- `post_windows` — replay Windows' post-boot BAR2 activity (speaker mode),
-  Windows' head-unit poll, volume display, knob, and the ALSA controls
-  "Head Unit Playback Volume" / "Head Unit Playback Switch".
+- Head unit: the driver replays Windows' post-boot BAR2 activity (speaker
+  mode) and runs Windows' head-unit poll, volume display and knob, with the
+  ALSA controls "Head Unit Playback Volume" / "Head Unit Playback Switch"
+  (always on since 0.9.5; the old `post_windows=0` path is gone).
   `hu_master` (1) names the volume/mute "Master" for desktop sync;
   `warm_reset` (0) replays Windows' warm-DSP reset block before the
   download (1 = when the DSP reads dead, 2 = always; experimental);
@@ -435,6 +497,8 @@ code path for comparison:
   commands only when the rate or output changed (each send makes it
   re-lock, a brief hiccup); 0 sends them at every start, as Windows.
 
+- Recording: `cap_bits` (24, writable at runtime; also the "Capture Bit
+  Depth" control) 24- or 32-bit recording samples.
 - Optical: `spdif_out` (1, writable at runtime; also the "Optical Out
   Playback Switch") optical out follows the main output; 0 keeps it
   silent.
@@ -446,7 +510,6 @@ Older parameters:
   off the card LEDs on this board).
 - `full_init` (default `0`) — replay captured codec init verbs (bitmask:
   1=cad1, 2=cad2, 3=both).
-- `enable_audio_path` (default `1`) — run DAC route + amp enable after ACM init.
 - `acm_first_delay_ms` / `acm_pass_gap_ms` / `acm_passes` / `acm_heartbeat_ms`
   (12 s / 4 s / 2 / 500 ms) — head-unit init and keepalive timing.
 
@@ -458,12 +521,38 @@ decode tools live in the development repository; the `creative_ae9_*_verbs.h`
 tables here hold everything the driver uses from them. Creative's Windows
 driver files are not included.
 
+## Credits
+
+This driver stands on other people's work:
+
+- **The Linux kernel's CA0132 driver** (`sound/pci/hda/patch_ca0132.c`,
+  Copyright (c) 2011 Creative Technology Ltd., based on `patch_ca0110.c`,
+  Copyright (c) 2008 Takashi Iwai): the DSP firmware download (ChipIO,
+  DSPIO, SCP), the AE-5/AE-7 init tables, the audio router and the effect
+  defaults are adapted from it.
+- **[verzic/sb-ae9](https://github.com/verzic/sb-ae9)**: the first
+  out-of-tree AE-9 driver, which showed the card could work on Linux.
+- **[DarkNikGr/sb-ae9](https://github.com/DarkNikGr/sb-ae9)**: optical
+  S/PDIF routing, the stream 0x05 setup, and the reverse-engineering notes
+  on the head unit's serial link.
+- **[s3boun3t/ae9_build](https://github.com/s3boun3t/ae9_build)**: the
+  AE-9 MMIO init sequence and the head unit (ACM) init, adapted here.
+- **Creative's own CA0132 Linux build** ("0.73_kernel18", GPL), shared with
+  the project: the AE-9 output, mic and speaker setup sequences.
+- **Kaiba**: testing on an ASMedia-bridge AE-9, round after round.
+
+Everything Windows-side (timings, verb order, the head unit protocol) comes
+from our own VFIO captures of Creative's Windows driver; none of its code
+is included. Each source file names what it adapted, with the original
+copyright notices.
+
 ## License
 
-GPL-2.0-only, the same license as the Linux kernel: see [COPYING](COPYING).
+GPL-2.0-or-later: the GNU GPL version 2, or (at your option) any later version. It fits in the Linux kernel (GPLv2) and can also be used under GPLv3. Full text: [COPYING](COPYING).
 Use it, change it and share it freely; if you share it, share the source
 too, under the same terms. `ca0132_regs.h` comes from the kernel's CA0132
-driver and keeps its GPL-2.0-or-later license. The DSP firmware is
+driver unchanged; code adapted from it and from the projects under
+Credits keeps their copyright notices. The DSP firmware is
 Creative's and is not part of this repository: `extract_firmware.py` pulls
 it from your own copy of the Windows driver.
 

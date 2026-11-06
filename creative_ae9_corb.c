@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
 //
 // CORB / RIRB ring buffer management for Creative AE-9 HDA controller
 //
@@ -310,28 +311,6 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 	chip->corb_wp = next_wp;
 
 	return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Send a verb via CORB, spinning until CORB space is available.	  */
-/* Used for large bulk bursts (e.g. 1183-verb DSP audio config) that  */
-/* would overflow the 256-entry CORB ring if fired at CPU speed.	  */
-/* Caller must hold corb_mutex.					  */
-/* ------------------------------------------------------------------ */
-void creative_ae9_corb_send_verb_wait(struct creative_chip *chip, u32 verb)
-{
-	unsigned int timeout = 5000; /* ~5ms max spin at 1µs per iteration */
-
-	if (!chip->corb_buf)
-		return;
-	while (timeout--) {
-		if (creative_ae9_corb_send_verb(chip, verb) == 0 || chip->card_gone)
-			return;
-		/* CORB full: spin 1µs and retry */
-		udelay(1);
-	}
-	/* If still full after 5ms, drop the verb — better than deadlock */
-	dev_err_ratelimited(chip->dev, "CORB still full after 5ms, dropping verb 0x%08x\n", verb);
 }
 
 /* ------------------------------------------------------------------ */

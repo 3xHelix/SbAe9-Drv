@@ -1,4 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (c) 2026 3xHelix */
 /* Auto-generated from ae9_corb_capture_raw.log (0x0071). Do not edit. */
 /* Ordered codec init verb sequence captured from the Windows driver. */
 #ifndef CREATIVE_AE9_INIT_VERBS_H
