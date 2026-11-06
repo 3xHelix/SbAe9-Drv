@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
+// and from s3boun3t/ae9_build (driver/ca0132/ca0132.c, GPL-2.0-or-later):
+//   the AE-9 init sequence (ca0132_mmio_init_ae9, ae9_acm_init).
 //
 // Creative AE-9 ACM (Audio Control Module, the head unit) communication
 //

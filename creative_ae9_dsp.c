@@ -1,4 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
+// and from Creative's own ca0132 build ("0.73_kernel18", GPL).
 //
 // Creative AE-9 CA0132 DSP firmware download (ChipIO / DSPIO / SCP / dspxfr).
 //

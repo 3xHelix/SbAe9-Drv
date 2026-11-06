@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 # Everything we can read about the AE-9's state without changing anything:
 # ALSA stream and controls, PipeWire, driver parameters, HDA stream
 # registers, card (BAR2) registers, codec converter state, ChipIO (router,

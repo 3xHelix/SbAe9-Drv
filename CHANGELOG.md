@@ -155,7 +155,7 @@ Upgrading from 0.6.8: rebuild, replace the module (`sudo depmod -a`),
 reboot (PSU off is the safest start). Drop `surround_96k=1` from your
 options file if you added it; it's the default now.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.8 (2026-11-04)
 
@@ -207,7 +207,7 @@ Upgrading from 0.6.7: rebuild, replace the module (`sudo depmod -a`),
 reboot (PSU off is the safest start). You can drop `pcm_rates=1` and
 `pcm_bits=32` from your options file; use the control instead.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.7 (2026-11-04)
 
@@ -279,7 +279,7 @@ Upgrading from 0.6.6: rebuild, replace the module (`sudo depmod -a`),
 install the two PipeWire files (setup step 4), reboot. First boot: a PSU
 power-off is the safest start.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.6 (2026-11-04)
 
@@ -303,7 +303,7 @@ Upgrading from 0.6.5: `sudo dnf install dkms kernel-devel` if you don't
 have them, then `sudo scripts/dkms-install.sh` and reboot. That's the last
 time you copy a .ko by hand.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.5 (2026-11-04)
 
@@ -356,7 +356,7 @@ control panel.
 Upgrading from 0.6.4: rebuild, replace the module, `sudo depmod -a`,
 reboot.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.4 (2026-11-04)
 
@@ -405,7 +405,7 @@ between. 99% on the money, and now that last 1% too.
 Upgrading from 0.6.3: rebuild, replace the module, `sudo depmod -a`,
 reboot. Muscle memory heads up: knob light is 3 s now.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.3 (2026-11-04)
 
@@ -466,7 +466,7 @@ Upgrading from 0.6.2: rebuild for your kernel, replace the module,
 DSP mode ever comes up silent after a reboot, power off at the PSU for
 20 seconds. A warm reboot keeps the card's bad mood.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.2 (2026-11-04)
 
@@ -503,7 +503,7 @@ Upgrading from 0.6.1: replace the module, `sudo depmod -a`, reboot. If
 DSP mode ever sounds wrong after an update, power off at the PSU once;
 a warm reboot keeps the card's old state.
 
--- Joe
+-- 3xHelix
 
 ## 0.6.1 (2026-11-04)
 
@@ -589,7 +589,7 @@ Direct Mode as in 0.5.0 (48/96/192 kHz, recording, sleep).
 
 Upgrading from 0.5.0: replace the module, `sudo depmod -a`, reboot.
 
-If you've got an AE-9 and Linux, try it and tell me what breaks. -- Joe
+If you've got an AE-9 and Linux, try it and tell me what breaks. -- 3xHelix
 
 ## 0.5.0 (2026-11-03)
 

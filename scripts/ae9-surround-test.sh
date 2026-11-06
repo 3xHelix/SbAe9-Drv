@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 # 5.1 jack mapping test: plays a 6-channel stream in DSP mode with
 # speaker-test speaking each channel's name ("Front Left", "Center", ...),
 # so you can hear which jack each one comes out of. Run it once per speaker

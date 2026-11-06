@@ -1,4 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (c) 2026 3xHelix */
 /*
  * Creative Sound Blaster AE-9 / X-Fi (CA0132) HDA controller driver
  *

@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 //
 // Creative AE-9: SBX effects and equalizer (ALSA controls).
 //
@@ -65,7 +69,7 @@ static const char * const eq_names[FX_EQ_VALUES] = {
 /*
  * EQ presets as the Creative app sends them for the AE-9 (capture 5,
  * 22:59-23:03, every preset in turn; Rock and Gaming match capture 3).
- * Listed A-Z, the game presets A-Z at the end, as Joe asked (cleaner, and
+ * Listed A-Z, the game presets A-Z at the end, as asked (cleaner, and
  * closer to the app). Saved settings are restored by name, so the order
  * can change. 0.1 dB, pre-gain first. Pop and Stadium have finer
  * values (Pop 8 kHz 1.19624, Stadium 62 Hz 5.68521), rounded to 0.1 dB.

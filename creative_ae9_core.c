@@ -1,4 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 3xHelix
+// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+//   Copyright (c) 2011, Creative Technology Ltd.
+//   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
+// and from s3boun3t/ae9_build (driver/ca0132/ca0132.c, GPL-2.0-or-later):
+//   the AE-9 init sequence (ca0132_mmio_init_ae9, ae9_acm_init).
 //
 // Creative Sound Blaster AE-9 / X-Fi (CA0132) HDA controller driver
 //
@@ -29,7 +35,7 @@
 #include "creative_ae9_switch_ops.h"
 #include "creative_ae9_warm_verbs.h"
 
-MODULE_AUTHOR("openco de");
+MODULE_AUTHOR("3xHelix");
 MODULE_DESCRIPTION(CREATIVE_AE9_DRV_DESC);
 MODULE_LICENSE("GPL");
 MODULE_VERSION(CREATIVE_AE9_DRV_VERSION);
@@ -3042,7 +3048,7 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
  * Bit 3 = SBX button, 1 while held; bit 1 = SBX light, 1 while lit (our
  * f0 22 02 01 <on> echoed back) (2026-11-04).
  * The 1/4" (6.3 mm) headphone jack and the XLR/TRS jack are not reported
- * (Joe, 2026-11-06: bit 4 follows the 3.5 mm jack only). Plug changes
+ * (checked 2026-11-06: bit 4 follows the 3.5 mm jack only). Plug changes
  * are logged; the output only follows the 3.5 mm headphone plug with
  * "Head Unit Auto Switch" on (off by default). Returns the
  * signed step count. */

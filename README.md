@@ -499,12 +499,38 @@ decode tools live in the development repository; the `creative_ae9_*_verbs.h`
 tables here hold everything the driver uses from them. Creative's Windows
 driver files are not included.
 
+## Credits
+
+This driver stands on other people's work:
+
+- **The Linux kernel's CA0132 driver** (`sound/pci/hda/patch_ca0132.c`,
+  Copyright (c) 2011 Creative Technology Ltd., based on `patch_ca0110.c`,
+  Copyright (c) 2008 Takashi Iwai): the DSP firmware download (ChipIO,
+  DSPIO, SCP), the AE-5/AE-7 init tables, the audio router and the effect
+  defaults are adapted from it.
+- **[verzic/sb-ae9](https://github.com/verzic/sb-ae9)**: the first
+  out-of-tree AE-9 driver, which showed the card could work on Linux.
+- **[DarkNikGr/sb-ae9](https://github.com/DarkNikGr/sb-ae9)**: optical
+  S/PDIF routing, the stream 0x05 setup, and the reverse-engineering notes
+  on the head unit's serial link.
+- **[s3boun3t/ae9_build](https://github.com/s3boun3t/ae9_build)**: the
+  AE-9 MMIO init sequence and the head unit (ACM) init, adapted here.
+- **Creative's own CA0132 Linux build** ("0.73_kernel18", GPL), shared with
+  the project: the AE-9 output, mic and speaker setup sequences.
+- **Kaiba**: testing on an ASMedia-bridge AE-9, round after round.
+
+Everything Windows-side (timings, verb order, the head unit protocol) comes
+from our own VFIO captures of Creative's Windows driver; none of its code
+is included. Each source file names what it adapted, with the original
+copyright notices.
+
 ## License
 
-GPL-2.0-only, the same license as the Linux kernel: see [COPYING](COPYING).
+GPL-2.0-or-later: the GNU GPL version 2, or (at your option) any later version. It fits in the Linux kernel (GPLv2) and can also be used under GPLv3. Full text: [COPYING](COPYING).
 Use it, change it and share it freely; if you share it, share the source
 too, under the same terms. `ca0132_regs.h` comes from the kernel's CA0132
-driver and keeps its GPL-2.0-or-later license. The DSP firmware is
+driver unchanged; code adapted from it and from the projects under
+Credits keeps their copyright notices. The DSP firmware is
 Creative's and is not part of this repository: `extract_firmware.py` pulls
 it from your own copy of the Windows driver.
 

@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 # How often does a ChipIO read come back wrong? Reads one address N times
 # (default: router entry 0x190030, constant within a boot) and counts the
 # values. 2026-11-04 snapshot: ~4% of router reads were 0, 0x1, or the

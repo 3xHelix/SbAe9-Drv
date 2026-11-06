@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
 """Extract the CA0132 DSP firmware (FLS image) for the Sound Blaster AE-9
 from the Creative Windows driver (CtxHda.sys).
 
