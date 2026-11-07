@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-06, v0.9.9):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-07, v0.10.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -24,7 +24,9 @@ playback.
 > the box in Direct Mode. SBX effects and the EQ work through the card's
 > DSP, with Direct Mode off. 5.1 works on the card's RCA, Rear and
 > C/Sub jacks, at 48, 96 or 192 kHz in Direct Mode and 48 or 96 kHz through
-> the DSP.
+> the DSP. With Direct Mode off there's also Sound Blaster Command's speaker
+> setup (bass redirection, per-speaker level and distance) and its 32
+> headphone profiles.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -33,9 +35,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.9.9 pairs with SbAe9-SBC v0.11.2 (phantom power button, What U
-> Hear rate picker, rates per mode incl. 176.4 kHz, ignores virtual PipeWire devices); older SbC versions still work, with
-> fewer controls.
+> Driver v0.10.0 pairs with SbAe9-SBC v0.12.0 (Speaker Setup tab,
+> Headphone Profile picker, DSP/Direct switch); older SbC versions still
+> work, with fewer controls.
 
 ## Hardware / Environment
 
@@ -97,26 +99,33 @@ Packages: `creative-ae9` (boot setup, PipeWire profiles, `ae9-get-firmware`,
 `ae9-full-dump`) pulls in `akmod-creative-ae9` (the module).
 `sudo dnf remove creative-ae9 akmod-creative-ae9` takes it all out.
 
-### 1. Firmware
+### 1. Firmware (and headphone profiles)
 
-The DSP firmware isn't in the repo or the packages: it's Creative's. Get the
-"Sound Blaster AE-Series Driver" package from Creative, unpack it, and find
-`AESeriesDriver/Driver/AMD64/CtxHda.sys` (a Windows install has it as
-`C:\Windows\System32\drivers\CtxHda.sys`). Then:
+The DSP firmware isn't in the repo or the packages: it's Creative's. The
+easiest source is Creative's own installer for the AE-9, **Sound Blaster
+Command + driver** (`AECMDMasterInstaller_3.4.92.00.exe`, from Creative's AE-9
+support page). `ae9-get-firmware` reads it directly (it needs
+`innoextract`, in Fedora's, Arch's and Debian's repos; the installer is only
+unpacked, never run):
 
 ```sh
-sudo ae9-get-firmware /path/to/CtxHda.sys          # installed from the package
-sudo scripts/ae9-get-firmware.sh /path/to/CtxHda.sys   # from this repo
+sudo dnf install innoextract                            # once (or pacman / apt)
+sudo ae9-get-firmware ~/Downloads/AECMDMasterInstaller_3.4.92.00.exe
+sudo scripts/ae9-get-firmware.sh ~/Downloads/AECMDMasterInstaller_3.4.92.00.exe   # from this repo
 ```
 
-It extracts both images (the main DSP image and the AE-9 overlay), checks
-them against the MD5 of the firmware this driver is tested with
-(`85c8f2b4…` main image, `0e222c94…` overlay), and installs them to
-`/lib/firmware`. On Fedora Atomic it uses `/etc/firmware` and adds the kernel
-option `firmware_class.path=/etc/firmware`, active after the next reboot.
+That installs the main DSP image and the AE-9 overlay, checked against the
+MD5 of the firmware this driver is tested with (`85c8f2b4…` main image,
+`0e222c94…` overlay), plus Sound Blaster Command's 32 **headphone profiles**
+(also checked) for the "Headphone Profile" control. It also takes an unpacked
+installer folder, the AE-Series driver installer on its own (firmware only),
+or just `CtxHda.sys` (`AESeriesDriver/Driver/AMD64/CtxHda.sys`; a Windows
+install has it as `C:\Windows\System32\drivers\CtxHda.sys`). Files go to
+`/lib/firmware`; on Fedora Atomic to `/etc/firmware`, with the kernel option
+`firmware_class.path=/etc/firmware` added (active after the next reboot).
 `ae9-get-firmware --check` shows what's installed.
 
-By hand, the same thing:
+By hand, from `CtxHda.sys`:
 
 ```sh
 python3 extract_firmware.py /path/to/CtxHda.sys ctefx-desktop.bin   # main DSP image
@@ -124,7 +133,15 @@ python3 extract_overlay.py  /path/to/CtxHda.sys ctefx-ae9-overlay.bin
 sudo cp ctefx-desktop.bin ctefx-ae9-overlay.bin /lib/firmware/
 ```
 
-Both scripts refuse a different image unless you pass `--force`.
+and the headphone profiles from an unpacked installer (`innoextract
+AECMDMasterInstaller_3.4.92.00.exe`):
+
+```sh
+python3 extract_hpeq.py tmp/AE9HPEQ hp/
+sudo mkdir -p /lib/firmware/creative-ae9/hp && sudo cp hp/*.bin /lib/firmware/creative-ae9/hp/
+```
+
+The scripts refuse a different image unless you pass `--force`.
 
 ### 2. Build and install (other distributions, or from source)
 
@@ -327,11 +344,22 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   "EQ Switch", "EQ Preset" (Windows' 20 presets, Flat to Stadium), "EQ Pre-gain" and ten
   bands (31 Hz-16 kHz, -12..+12 dB) and "Scout Mode Switch" act; otherwise
   they are greyed out and keep their values. Set them in `alsamixer -c AE9`.
+  Speaker setup (0.10.0; Direct Mode off, SBX on or off): "Bass Redirect
+  Switch" sends the bass to the sub (x.1 configs), "Bass Redirect
+  Crossover" (50-200 Hz, default 80; Windows' Tower is 80, Desktop 120) and
+  "Bass Redirect Sub Gain Volume" (-12..+12 dB); per speaker (Front L/R,
+  Center, Sub, Rear L/R) "Speaker Level ... Volume" (-12..+12 dB) and
+  "Speaker Distance ..." (0-500 cm of delay, as Windows' calibration).
+  "Headphone Profile" (0.10.0): Sound Blaster Command's 32 headphone curves
+  (ATH-M50, HD 280 Pro, ...), active with Direct Mode off, headphones out
+  and a 48 kHz stream; off on speakers. The curves are Creative's:
+  `ae9-get-firmware` installs them from Creative's installer (step 1).
   Works on speakers and headphones, across sleep and reboots. With Direct
   Mode off, a new stream after boot, wake or a switch made while stopped
   plays direct for 3 s (`dsp_switch_ms`), then moves to the DSP. Turning
-  Direct Mode on is silent until the stream restarts (pause/play), as in
-  Windows.
+  Direct Mode on restarts a stream that was going through the DSP by itself
+  (0.9.4); one still waiting to move there (a 44.1 kHz stream stays direct)
+  keeps playing (0.10.0).
 - Volume: turn the head-unit knob (0.5 dB per step, ~1 dB per click); press
   it to mute or unmute. The same setting is the ALSA "Master Playback
   Volume" / "Master Playback Switch" (`alsamixer -c AE9`; `hu_master=0`
@@ -470,6 +498,7 @@ the apps that are playing; look it over before posting.
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
 | `extract_firmware.py`, `extract_overlay.py` | Extract the DSP firmware and overlay from Creative's `CtxHda.sys` |
+| `extract_hpeq.py` | Extracts the headphone profiles from Creative's installer (`AE9HPEQ/*.reg`) |
 | `config/` | Boot binding (udev rule, modprobe hook, dracut omit) and optional module options |
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |

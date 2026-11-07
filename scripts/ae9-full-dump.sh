@@ -96,11 +96,23 @@ for a in 0x100e30 0x100e30 0x100e30 0x100e30 0x801c 0x40004 0x3f3b4 0x110f00 0x1
 done
 
 sec "ChipIO: audio router 0x190000-0x1901fc (non-zero; src -> dst, state)"
+# Single ChipIO reads glitch while audio plays (an entry can read as 0):
+# read until two reads in a row agree, as the driver does; "unsteady" marks
+# an entry that never did.
+rt_read() {
+	local p= v t
+	for t in 1 2 3 4 5 6; do
+		v=$(dbg "chipior $1" | grep -o '=0x[0-9a-f]*' | tr -d =)
+		[ -n "$v" ] && [ "$v" = "$p" ] && { echo "$v"; return; }
+		p=$v
+	done
+	echo "$v unsteady"
+}
 for i in $(seq 0 127); do
 	a=$(printf '0x%x' $((0x190000 + i * 4)))
-	v=$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*' | tr -d =)
-	[ -n "$v" ] && [ "$v" != 0x0 ] && printf '%s %-8s %02x -> %02x  state %d\n' "$a" "$v" \
-		$((v & 0xff)) $(((v >> 8) & 0xff)) $(((v >> 16) & 3))
+	set -- $(rt_read "$a"); v=${1:-}; note=${2:+  (reads unsteady)}
+	[ -n "$v" ] && [ "$v" != 0x0 ] && printf '%s %-8s %02x -> %02x  state %d%s\n' "$a" "$v" \
+		$((v & 0xff)) $(((v >> 8) & 0xff)) $(((v >> 16) & 3)) "$note"
 done
 
 sec "Codec converter state (GET verbs; replies in the log section below)"

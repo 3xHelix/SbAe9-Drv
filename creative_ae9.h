@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.9"
+#define CREATIVE_AE9_DRV_VERSION	"0.10.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -230,13 +230,21 @@ struct creative_chip {
 		s16		eq[11];		/* 0.1 dB: pre-gain, 31 Hz .. 16 kHz */
 		u8		eq_preset;
 		u8		spk;		/* index into spk_cfgs (fx.c) */
+		/* speaker setup (Direct Mode off) */
+		bool		bass_redirect;
+		u8		xover;		/* bass redirect crossover, Hz */
+		s8		sub_gain;	/* dB */
+		s8		spk_level[6];	/* dB: FL FR C LFE RL RR */
+		u16		spk_dist[6];	/* cm of delay */
+		u8		hp_profile;	/* headphone profile (fx.c), 0 = off */
+		u8		hp_loaded;	/* profile the DSP holds, 0 = none */
 		bool		scout;
 		bool		dead;		/* DSP stopped answering */
 		unsigned int	fails;
 		bool		saved_sv_on, saved_eq_on;	/* before Scout Mode */
 		u8		saved_sv_level, saved_sv_mode;
 		s16		saved_eq[11];
-		struct snd_kcontrol *kc[32];
+		struct snd_kcontrol *kc[48];
 		unsigned int	nkc;
 	} fx;
 
@@ -438,11 +446,13 @@ extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\
 	} while (0)
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
+int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name);
 void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
+void creative_ae9_fx_output_changed(struct creative_chip *chip);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);

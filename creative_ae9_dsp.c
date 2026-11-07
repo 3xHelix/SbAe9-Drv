@@ -937,31 +937,34 @@ static const struct ae9_dsp_image_seg *seg_next(const struct ae9_dsp_image_seg *
 #define OVL_SD		0x100		/* stream descriptor 4, as Windows */
 #define OVL_FMT		0x41		/* 2 ch, 32-bit, 48 kHz */
 
-/* Program and start the overlay stream over the prepared buffer. */
-static void ovl_stream_run(struct creative_chip *chip, dma_addr_t bdl_dma)
+/* Program and start a DSP transfer stream (descriptor at BAR0 + sdoff,
+ * stream tag) over the prepared buffer. */
+static void xfer_stream_run(struct creative_chip *chip, unsigned int sdoff,
+			    unsigned int tag, dma_addr_t bdl_dma)
 {
-	void __iomem *sd = chip->hda_regs + OVL_SD;
+	void __iomem *sd = chip->hda_regs + sdoff;
 
 	writel(SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
 	udelay(50);
 	writel(0, sd + AZX_REG_SD_CTL);
 	udelay(50);
-	writel(1 << 20, sd + AZX_REG_SD_CTL);		/* tag 1 */
+	writel(tag << 20, sd + AZX_REG_SD_CTL);
 	writel(OVL_BUF_BYTES, sd + AZX_REG_SD_CBL);
 	writew(OVL_BDL_ENTRIES - 1, sd + AZX_REG_SD_LVI);
 	writew(OVL_FMT, sd + AZX_REG_SD_FORMAT);
 	writel(lower_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPL);
 	writel(upper_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPU);
 	wmb();
-	writel((1 << 20) | SD_CTL_DMA_START, sd + AZX_REG_SD_CTL);
+	writel((tag << 20) | SD_CTL_DMA_START, sd + AZX_REG_SD_CTL);
 	wmb();
 }
 
-static void ovl_stream_stop(struct creative_chip *chip)
+static void xfer_stream_stop(struct creative_chip *chip, unsigned int sdoff,
+			     unsigned int tag)
 {
-	void __iomem *sd = chip->hda_regs + OVL_SD;
+	void __iomem *sd = chip->hda_regs + sdoff;
 
-	writel(1 << 20, sd + AZX_REG_SD_CTL);
+	writel(tag << 20, sd + AZX_REG_SD_CTL);
 	udelay(50);
 	writel(SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
 	udelay(50);
@@ -1087,14 +1090,14 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 		rl = sizeof(r);
 		ret |= dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b,
 				 sizeof(a3b), &r, &rl);
-		ovl_stream_run(chip, bdl_dma);
+		xfer_stream_run(chip, OVL_SD, 1, bdl_dma);
 		for (t = 0; t < 200; t++) {
 			creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
 			if (!(v & 0xfff))
 				break;
 			usleep_range(1000, 2000);
 		}
-		ovl_stream_stop(chip);
+		xfer_stream_stop(chip, OVL_SD, 1);
 		/* leftover word(s) go in directly (Windows: 0x03f3a0 = 0x00800082) */
 		for (i = 0; i < rem; i++)
 			creative_dsp_chipio_write(chip, seg->chip_addr + 4 * i,
@@ -1126,6 +1129,168 @@ out:
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
 	release_firmware(fw);
 	(void)resp;
+	return ret;
+}
+
+/*
+ * Headphone profile (Sound Blaster Command's headphone list): a speaker EQ
+ * image for the DSP's Y memory, uploaded the way Windows does it at run
+ * time (capture 2026-11-07, 00:58:52; notes 12/13): "use speaker EQ" off,
+ * GET 0x80/0x3c = where the speaker EQ lives (Y word address; 0x1d5e with
+ * our firmware), a converter on stream tag 2 (tag 1 is the playback),
+ * a DMA channel (GET 0x0a), a port, GET 0x3a/0x3b to arm the DSP's DMA,
+ * the data over stream descriptor 5, then port, converter and channel
+ * free (SET 0x0a = channel). The image is Creative's (extracted from its
+ * installer): one FLS segment of 1024 words at chip address 0x40000 (the
+ * start of Y memory). The second words of 0x3a/0x3b carry OUR channel
+ * (Windows' builders, decompile FUN_00028b5c/FUN_00028cc0: 0x3a word 1 =
+ * code << 31 | chan, 0x3b word 1 = code << 31 | Y memory << 30 | chan;
+ * bits 4-29 there are uninitialised stack, hence Windows' 0x7fff9482).
+ * Copying Windows' 0x40000002 armed channel 2, one of the playback's,
+ * while ours was 4: all audio stalled until a power-off (2026-11-07).
+ * The caller turns "use speaker EQ" on after.
+ * Caller holds replay_mutex; a playback may be running (its DSP DMA
+ * channels keep going, so only our channel's bit is waited on).
+ */
+#define HPEQ_SD		0x120	/* stream descriptor 5, as Windows */
+#define HPEQ_TAG	2
+#define HPEQ_WORDS	1024
+#define HPEQ_3B_YMEM	BIT(30)	/* 0x3b word 1: the target is Y memory */
+
+int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
+{
+	const struct firmware *fw;
+	const struct ae9_dsp_image_seg *seg;
+	void *buf = NULL;
+	__le32 *bdl = NULL;
+	dma_addr_t buf_dma = 0, bdl_dma = 0;
+	u32 addr = ~0U, chan = ~0U, r, v = 0, v0 = 0, a3a[2], a3b[2], zero = 0;
+	unsigned int port, rl, i, t, seen;
+	int ret;
+
+	if (!chip->dsp_done || chip->card_gone)
+		return -ENODEV;
+	ret = request_firmware(&fw, name, chip->dev);
+	if (ret) {
+		dev_warn(chip->dev, "headphone profile: /lib/firmware/%s not available (%d); extract the profiles with ae9-get-firmware\n",
+			 name, ret);
+		return ret;
+	}
+	seg = (const void *)fw->data;
+	if (fls_image_check(chip, fw, name) || seg->count != HPEQ_WORDS ||
+	    seg->chip_addr != 0x40000) {
+		dev_err(chip->dev, "headphone profile %s: unexpected image (chip 0x%x, %u words)\n",
+			name, fw->size >= sizeof(*seg) ? seg->chip_addr : 0,
+			fw->size >= sizeof(*seg) ? seg->count : 0);
+		ret = -EINVAL;
+		goto out;
+	}
+	buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), &buf_dma, GFP_KERNEL);
+	bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), &bdl_dma, GFP_KERNEL);
+	if (!buf || !bdl) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < OVL_BDL_ENTRIES; i++) {
+		dma_addr_t a = buf_dma + (dma_addr_t)i * (OVL_BUF_BYTES / OVL_BDL_ENTRIES);
+
+		bdl[i * 4 + 0] = cpu_to_le32(lower_32_bits(a));
+		bdl[i * 4 + 1] = cpu_to_le32(upper_32_bits(a));
+		bdl[i * 4 + 2] = cpu_to_le32(OVL_BUF_BYTES / OVL_BDL_ENTRIES);
+		bdl[i * 4 + 3] = 0;
+	}
+	memset(buf, 0, OVL_BUF_BYTES);
+	memcpy(buf, seg->data, HPEQ_WORDS * 4);
+	wmb();
+
+	scp_set_u32(chip, 0x96, 0x1f, zero);		/* use speaker EQ: off */
+	ret = scp_get_u32(chip, MASTERCONTROL, 0x3c, &addr);
+	if (ret || addr == ~0U || addr > 0xffff) {
+		dev_err(chip->dev, "headphone profile: speaker EQ address query failed (ret %d, 0x%x)\n",
+			ret, addr);
+		ret = ret ?: -EIO;
+		goto out;
+	}
+	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_STREAM_FORMAT, OVL_FMT);
+	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, HPEQ_TAG << 4);
+	ret = scp_get_u32(chip, MASTERCONTROL, 0x0a, &chan);
+	if (ret || chan > 7) {
+		dev_err(chip->dev, "headphone profile: no DSP DMA channel (ret %d, 0x%x)\n", ret, chan);
+		ret = ret ?: -EBUSY;
+		goto unbind;
+	}
+	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET, 0x01);
+	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, 0x10);
+	port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
+	for (i = 0; (port == 0 || port == ~0U) && i < 10; i++) {
+		msleep(5);
+		port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
+	}
+	if (port == 0 || port == ~0U) {
+		dev_err(chip->dev, "headphone profile: no ChipIO port (0x%x)\n", port);
+		ret = -EBUSY;
+		goto free_chan;
+	}
+	a3a[0] = port;
+	a3a[1] = chan & 0xf;
+	a3b[0] = (HPEQ_WORDS << 16) | (addr & 0xffff);
+	a3b[1] = HPEQ_3B_YMEM | (chan & 0xf);
+	/*
+	 * GET 0x3a and 0x3b arm the DSP's DMA. Their replies are not checked,
+	 * as in the boot overlay load (and Windows): our DSP sometimes answers
+	 * 0x3a with an empty header (seen at boot for 0x96/0x3a too), and
+	 * stopping there left later GETs one reply behind (2026-11-07). The
+	 * channel start bit below tells whether the transfer ran.
+	 */
+	rl = sizeof(r);
+	ret = dspio_scp(chip, MASTERCONTROL, 0, 0x3a, SCP_GET, a3a, sizeof(a3a), &r, &rl);
+	rl = sizeof(r);
+	ret |= dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b, sizeof(a3b), &r, &rl);
+	if (ret)
+		dev_info(chip->dev, "headphone profile: 0x3a/0x3b reply not as expected (%d), sending anyway\n", ret);
+	ret = 0;
+	xfer_stream_run(chip, HPEQ_SD, HPEQ_TAG, bdl_dma);
+	/*
+	 * Wait for our channel's start bit to come on, then to go off. 4 KB
+	 * at the stream's rate takes ~11 ms; Windows saw the bit on at its
+	 * first read and off 13 ms later (0x7 -> 0x3). The first build
+	 * stopped as soon as the bit read off, i.e. before the DSP had taken
+	 * the channel: the transfer was cut and the DSP's DMA stalled (all
+	 * audio silent until a power-off, 2026-11-07).
+	 */
+	seen = 0;
+	for (t = 0; t < 300; t++) {
+		creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
+		if (t == 0)
+			v0 = v;
+		if (v & BIT(chan))
+			seen++;
+		else if (seen)
+			break;
+		usleep_range(500, 1000);
+	}
+	xfer_stream_stop(chip, HPEQ_SD, HPEQ_TAG);
+	if (!seen || (v & BIT(chan)))
+		ret = -ETIMEDOUT;
+	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u)\n",
+		 name, HPEQ_WORDS, addr, chan, port,
+		 ret ? (seen ? "FAILED (still running)" : "FAILED (channel never started)") : "done",
+		 t, v0, v, seen);
+	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
+free_chan:
+	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00);
+	scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);	/* free the channel */
+	goto inval;
+unbind:
+	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00);
+inval:
+	creative_dsp_chipio_addr_invalidate();
+out:
+	if (buf)
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
+	if (bdl)
+		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
+	release_firmware(fw);
 	return ret;
 }
 

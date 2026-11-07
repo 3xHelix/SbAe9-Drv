@@ -2682,6 +2682,7 @@ static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 					"head unit: switch to speakers");
 	chip->hu_output = hp;
 	chip->hu_att = chip->hu_att_out[hp];
+	creative_ae9_fx_output_changed(chip);	/* headphone profile back on */
 	chip->hu_name_until = chip->hu_ticks + HU_SP_TICKS;
 	creative_ae9_hu_label(chip);
 	creative_ae9_hu_apply_volume(chip);

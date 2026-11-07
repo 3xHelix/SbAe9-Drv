@@ -3,6 +3,35 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.10.0 (2026-11-07)
+Sound Blaster Command's speaker setup and headphone profiles. 🎧
+Pairs with [SbAe9-SBC v0.12.0](https://github.com/3xHelix/SbAe9-SBC) (Speaker Setup tab, Headphone Profile picker).
+
+- **Speaker setup** (Direct Mode off, SBX on or off), decoded from a new
+  Windows capture: "Bass Redirect Switch", "Bass Redirect Crossover"
+  (50-200 Hz; Windows sets it from the speaker type: Tower 80, Desktop 120),
+  "Bass Redirect Sub Gain Volume" (dB), and per speaker (Front L/R, Center,
+  Sub, Rear L/R) "Speaker Level ... Volume" (dB) and "Speaker Distance ..."
+  (cm, sent as a delay like Windows' calibration). Levels and distance
+  checked by ear; crossover and sub gain want a subwoofer to hear.
+- **Headphone profiles**: "Headphone Profile" picks one of Sound Blaster
+  Command's 32 headphone curves (Audio-Technica ATH-M50, Sennheiser HD 280
+  Pro, Sony MDR-1R, Creative's own ...). The curve is uploaded into the DSP
+  as Windows does and is active with Direct Mode off, on headphones, for
+  48 kHz streams; off on speakers, back on when you switch to headphones.
+  Tested with real ATH-M50s.
+- **`ae9-get-firmware` reads Creative's installer**: `sudo ae9-get-firmware
+  AECMDMasterInstaller_3.4.92.00.exe` installs the DSP firmware and the 32
+  headphone curves in one go (needs `innoextract`, in Fedora's, Arch's and
+  Debian's repos; the installer is only unpacked, never run). No Windows
+  install needed. `CtxHda.sys` still works for the firmware alone;
+  `--check` also counts the headphone curves.
+- **Fix:** turning Direct Mode back on while a stream was still waiting to
+  move into the DSP (e.g. 44.1 kHz, which stays direct) silenced it until
+  the player reopened. It keeps playing now.
+- Decoder (`docs/DECODED-SEQUENCES.md`): speaker levels, delays,
+  crossover, sub gain and the headphone EQ named with their units.
+
 ## 0.9.9 (2026-11-06)
 Fedora packages: install with dnf, updates with your kernel. 📦
 Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC), as 0.9.8.

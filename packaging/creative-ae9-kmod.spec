@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.9.9
+Version:        0.10.0
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,5 +55,8 @@ done
 %{?akmod_install}
 
 %changelog
+* Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.0-1
+- Driver 0.10.0: speaker setup, headphone profiles, Direct Mode fix
+
 * Fri Nov 06 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.9.9-1
 - First package: akmod for Fedora and Fedora Atomic (driver 0.9.9 = 0.9.8 code)
