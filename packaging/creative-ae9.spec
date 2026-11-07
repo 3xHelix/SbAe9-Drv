@@ -47,7 +47,6 @@ install -D -m 644 config/00-ae9-override.rules %{buildroot}%{_udevrulesdir}/00-a
 install -D -m 644 config/89-ae9-pipewire.rules %{buildroot}%{_udevrulesdir}/89-ae9-pipewire.rules
 install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-override.conf
 install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
-%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
@@ -79,6 +78,7 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_udevrulesdir}/89-ae9-pipewire.rules
 %{_modprobedir}/ae9-override.conf
 %{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+%{_prefix}/lib/modules-load.d/creative-ae9.conf
 %{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 %{_bindir}/ae9-get-firmware
 %{_bindir}/ae9-full-dump
