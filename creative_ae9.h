@@ -57,7 +57,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.10.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.10.1"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -208,14 +208,14 @@ struct creative_chip {
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
 	/* extra capture devices (creative_ae9_pcm.c): [0] optical in (PCM
-	 * device 1), [1] What U Hear (device 2) */
+	 * device 1), [1] What U Hear (device 2), [2] rear RCA in (device 3) */
 	struct ae9_xcap_state {
 		struct snd_pcm_substream *substream;
 		void		*bdl_raw;
 		void		*bdl;
 		dma_addr_t	bdl_dma;
 		size_t		bdl_size;
-	} xcap[2];
+	} xcap[3];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
 	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
@@ -273,6 +273,10 @@ struct creative_chip {
 	 * for ~20s so the DSP and head-unit MCU are ready.
 	 */
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
+	struct delayed_work	hp_work;	/* headphone profile upload, debounced (fx.c) */
+	unsigned long		hp_last;	/* jiffies of the last profile upload */
+	unsigned int		corb_timeouts;	/* verb timeouts so far (corb.c) */
+	unsigned int		hp_tries;	/* failed uploads in a row */
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
 	int			dsp_done;
@@ -447,12 +451,16 @@ extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 	} while (0)
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
 int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name);
+void creative_ae9_corb_scan_unsol(struct creative_chip *chip);
+int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
+			   unsigned int req, unsigned int count, unsigned int wait_us);
 void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_fx_output_changed(struct creative_chip *chip);
+void creative_ae9_fx_hp_work(struct work_struct *w);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);

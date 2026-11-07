@@ -1139,6 +1139,12 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 /*     the card plays, both with Direct Mode on and off (with SBX off it */
 /*     is the stream as sent: a 440 Hz test tone came back level-exact  */
 /*     on both channels). 48 or 96 kHz (wuh_96k).			  */
+/*   PCM device 3 "AE-9 Rear RCA In": the head unit's rear RCA L/R	  */
+/*     jacks = codec 2 pin 0x11 -> ADC 0x08 (24-bit up to 192 kHz),	  */
+/*     input stream 3 (BAR0+0xe0), tag 4. Proven by hand 2026-11-07: a  */
+/*     440 Hz tone into the jacks came back only while 0x08 was on the  */
+/*     capture stream. Windows calls it "Aux" (codec 2 on MS hdaudio).  */
+/*     Pin config and pin control (0x22) come from the cold table.	  */
 /* ------------------------------------------------------------------ */
 struct ae9_xcap {
 	const char	*name;
@@ -1147,13 +1153,17 @@ struct ae9_xcap {
 	unsigned int	signal_pin;	/* codec pin whose sense says "signal", 0 none */
 };
 
-static const struct ae9_xcap ae9_xcaps[2] = {
+static const struct ae9_xcap ae9_xcaps[3] = {
 	{ "AE-9 Optical", 0xa0, 2, AE9_SPDIF_CAD, AE9_SPDIF_IN_NID,
 	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
 	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
 	  44100, 192000, AE9_SPDIF_IN_PIN },
 	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
 	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
+	{ "AE-9 Rear RCA In", 0xe0, 4, 2, 0x08,
+	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	  44100, 192000, 0 },
 };
 #define AE9_XCAP_WUH	1
 
@@ -1171,7 +1181,7 @@ MODULE_PARM_DESC(wuh_96k, "What U Hear at 48 or 96 kHz (1 = yes, default; 0 = 48
 
 
 
-/* PCM device n (1, 2) -> table index */
+/* PCM device n (1, 2, 3) -> table index */
 static unsigned int ae9_xcap_idx(struct snd_pcm_substream *substream)
 {
 	return substream->pcm->device - 1;
@@ -1478,6 +1488,7 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 		dev_warn(chip->dev, "Optical Out control not added (%d)\n", ret);
 	creative_ae9_xcap_new(chip, 0);	/* optical in */
 	creative_ae9_xcap_new(chip, 1);	/* What U Hear */
+	creative_ae9_xcap_new(chip, 2);	/* head unit rear RCA in */
 
 	dev_info(chip->dev, "PCM device initialized (playback + capture, optical in, What U Hear)\n");
 	return 0;

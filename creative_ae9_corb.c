@@ -364,6 +364,55 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 /* ------------------------------------------------------------------ */
 /* Send a verb via CORB and wait for the response			  */
 /* Returns 0 on success, -ETIMEDOUT on timeout			  */
+/*
+ * One unsolicited RIRB entry: log it, and count it as a DSP reply
+ * announcement only if it is one: codec 1, tag 0x16 (the DSP node; resp
+ * 0x02c00001). Windows' handler filters on (resp >> 21) & 0x1f == 0x16
+ * (decompile FUN_0001da88); counting every codec-1 entry would count a
+ * jack event as a reply (2026-11-07).
+ */
+static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
+{
+	creative_ae9_vlog(res, fl, true);
+	if ((fl & 0xf) == 1 && ((res >> 21) & 0x1f) == 0x16)
+		atomic_inc(&chip->scp_unsol);
+}
+
+/*
+ * Look for DSP reply announcements WITHOUT sending a verb: scan the RIRB
+ * the DMA has written since our last look. Windows sends nothing to the
+ * DSP between a GET (and its one trailing F01) and the announcement (606
+ * of 606 GETs, 15 captures; notes 24); we used to poll F01 every
+ * 0.2-0.4 ms there, the one place our reads differ from Windows'.
+ * A solicited entry here can only be a late reply to a timed-out verb.
+ */
+void creative_ae9_corb_scan_unsol(struct creative_chip *chip)
+{
+	struct creative_rirb_entry *rirb = chip->rirb_buf;
+	u16 raw, wp, i;
+
+	if (!rirb || chip->card_gone)
+		return;
+	mutex_lock(&chip->corb_mutex);
+	raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	if (raw == 0xffff && creative_ae9_gone(chip, "RIRB scan")) {
+		mutex_unlock(&chip->corb_mutex);
+		return;
+	}
+	wp = raw & 0xff;
+	rmb();
+	for (i = chip->rirb_rp; i != wp;) {
+		u32 fl;
+
+		i = (i + 1) & 0xff;
+		fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
+		if (fl & 0x10)
+			rirb_unsol(chip, le32_to_cpu(READ_ONCE(rirb[i].response)), fl);
+	}
+	chip->rirb_rp = wp;
+	mutex_unlock(&chip->corb_mutex);
+}
+
 /* ------------------------------------------------------------------ */
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp)
@@ -399,12 +448,8 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 
 			i = (i + 1) & 0xff;
 			fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
-			if (fl & 0x10) {
-				creative_ae9_vlog(le32_to_cpu(READ_ONCE(rirb[i].response)),
-						  fl, true);
-				if ((fl & 0xf) == 1)
-					atomic_inc(&chip->scp_unsol);
-			}
+			if (fl & 0x10)
+				rirb_unsol(chip, le32_to_cpu(READ_ONCE(rirb[i].response)), fl);
 		}
 	}
 	chip->rirb_rp = wp_start;
@@ -441,10 +486,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				if (!(fl & 0x10))
 					goto got_response;
 				/* unsolicited — log/count it, keep scanning */
-				creative_ae9_vlog(le32_to_cpu(READ_ONCE(rirb[next].response)),
-						  fl, true);
-				if ((fl & 0xf) == 1)
-					atomic_inc(&chip->scp_unsol);
+				rirb_unsol(chip, le32_to_cpu(READ_ONCE(rirb[next].response)), fl);
 				cur_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
 			}
 			udelay(10);
@@ -457,6 +499,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	}
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
+	chip->corb_timeouts++;
 
 	/*
 	 * Recover the command ring after a timeout, the HD-Audio spec way.
@@ -486,7 +529,22 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		chip->corb_wp = 0;
 		writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
 
-		/* skip responses that may still arrive for the dropped verb */
+		/* skip responses that may still arrive for the dropped verb,
+		 * but count the DSP reply announcements among them: skipping
+		 * one left every later GET one reply behind */
+		{
+			struct creative_rirb_entry *rirb = chip->rirb_buf;
+			u16 i = wp;
+
+			while (i != cur_rirb_wp) {
+				u32 fl;
+
+				i = (i + 1) & 0xff;
+				fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
+				if (fl & 0x10)
+					rirb_unsol(chip, le32_to_cpu(READ_ONCE(rirb[i].response)), fl);
+			}
+		}
 		chip->rirb_rp = cur_rirb_wp;
 		dev_warn(chip->dev, "CORB ring reset after timeout (RP=WP=0)\n");
 	}

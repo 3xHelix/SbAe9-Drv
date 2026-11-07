@@ -16,7 +16,7 @@
 //     0x07/0x08 Crystalizer on, level  0x18/0x19 Bass (X-Bass) on, level
 //     0x17 Bass crossover (Hz)         0x09      EQ on
 //     0x0a EQ pre-gain (dB)            0x0b-0x14 EQ bands 31 Hz-16 kHz (dB)
-//     0x15 bass redirect, 0x16 its crossover (Hz), 0x1e its sub gain (dB)
+//     0x15 bass redirect, 0x16 its crossover (Hz), 0x1e subwoofer boost (on/off)
 //     0x1f use speaker EQ, 0x3a output mute
 //     0x21-0x26 speaker level (dB), 0x31-0x36 speaker delay (seconds),
 //               Front L, Front R, Center, Sub, Rear L, Rear R
@@ -317,6 +317,17 @@ static void fx_hp_sync_locked(struct creative_chip *chip, bool log)
 	fx_send(chip, FX_MID_OUT, 0x1f, fx_f32(want, 1), log);
 }
 
+/*
+ * Headphone profile picks are debounced. Each upload is a few hundred
+ * commands to the card; seven in 3 s (a fast scroll through the list)
+ * choked the command ring, the DSP's DMA arm reply was lost and the DSP
+ * stopped answering until a power-off (2026-11-07, 12:42:34). So: upload
+ * only the pick still standing after HP_SETTLE_MS, at most one upload per
+ * HP_GAP_MS, and retry a failed one once.
+ */
+#define HP_SETTLE_MS	700
+#define HP_GAP_MS	2000
+
 /* Effects run only with Direct Mode off and SBX on. */
 static bool fx_eff(const struct creative_ae9_fx *fx)
 {
@@ -523,13 +534,43 @@ static bool fx_live_spk(struct creative_chip *chip)
 	       !chip->dsp_switch_pending;
 }
 
+void creative_ae9_fx_hp_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w),
+						  struct creative_chip, hp_work);
+	struct creative_ae9_fx *fx = &chip->fx;
+	unsigned long next = chip->hp_last + msecs_to_jiffies(HP_GAP_MS);
+
+	if (!fx_live_spk(chip))
+		return;
+	if (chip->hp_last && time_before(jiffies, next)) {
+		queue_delayed_work(chip->wq, &chip->hp_work, next - jiffies);
+		return;
+	}
+	fx_live_begin(chip);
+	if (fx_live_spk(chip)) {
+		bool upload = fx->hp_profile && fx->hp_loaded != fx->hp_profile &&
+			      chip->hu_output;
+
+		fx_hp_sync_locked(chip, true);
+		if (upload) {
+			chip->hp_last = jiffies ?: 1;
+			if (fx->hp_loaded != fx->hp_profile && !fx->dead &&
+			    chip->hp_tries++ < 1)
+				queue_delayed_work(chip->wq, &chip->hp_work,
+						   msecs_to_jiffies(HP_GAP_MS));
+		}
+	}
+	fx_live_end(chip);
+}
+
 static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
 	switch (PV_K(kc->private_value)) {
 	case K_SBX: case K_ON: case K_EQON: case K_SCOUT: case K_DIRECT:
-	case K_REDIR:
+	case K_REDIR: case K_SUBGAIN:
 		return snd_ctl_boolean_mono_info(kc, ui);
-	case K_XOVER: case K_SUBGAIN: case K_SPKLVL: case K_SPKDIST: {
+	case K_XOVER: case K_SPKLVL: case K_SPKDIST: {
 		static const struct { s16 min, max, step; } r[] = {
 			[K_XOVER - K_XOVER]	= { XOVER_MIN, XOVER_MAX, XOVER_STEP },
 			[K_SUBGAIN - K_XOVER]	= { SPK_LVL_MIN, SPK_LVL_MAX, 1 },
@@ -818,8 +859,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			fx_live_end(chip);
 		}
 		return 1;
-	case K_SUBGAIN:
-		v = clamp_t(long, v, SPK_LVL_MIN, SPK_LVL_MAX);
+	case K_SUBGAIN:	/* Creative: SubwooferBoost, on/off (0x96/0x1e = 0 / 1.0) */
+		v = !!v;
 		if (v == fx->sub_gain)
 			return 0;
 		fx->sub_gain = v;
@@ -850,11 +891,11 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			return 0;
 		fx->hp_profile = e;
 		dev_info(chip->dev, "Headphone Profile: %s\n", hp_profiles[e].name);
-		if (fx_live_spk(chip)) {
-			fx_live_begin(chip);
-			fx_hp_sync_locked(chip, true);
-			fx_live_end(chip);
-		}
+		/* upload once the picker has been still for a moment */
+		chip->hp_tries = 0;
+		if (fx_live_spk(chip))
+			mod_delayed_work(chip->wq, &chip->hp_work,
+					 msecs_to_jiffies(HP_SETTLE_MS));
 		return 1;
 	case K_SCOUT:
 		if (!!v == fx->scout)
@@ -953,7 +994,7 @@ static int fx_add(struct creative_chip *chip, const char *name,
 	struct snd_kcontrol *kc;
 	int err;
 
-	if (kind == K_EQ || kind == K_SPKLVL || kind == K_SUBGAIN) {
+	if (kind == K_EQ || kind == K_SPKLVL) {
 		kn.access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
 		kn.tlv.p = kind == K_EQ ? eq_tlv : spk_tlv;
 	}
@@ -1005,7 +1046,7 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	if (!err)
 		err = fx_add(chip, "Bass Redirect Crossover", K_XOVER, 0);
 	if (!err)
-		err = fx_add(chip, "Bass Redirect Sub Gain Volume", K_SUBGAIN, 0);
+		err = fx_add(chip, "Bass Redirect Sub Boost Switch", K_SUBGAIN, 0);
 	for (i = 0; !err && i < ARRAY_SIZE(spk_ch_names); i++) {
 		snprintf(name, sizeof(name), "Speaker Level %s Volume", spk_ch_names[i]);
 		err = fx_add(chip, name, K_SPKLVL, i);

@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.10.0
+Version:        0.10.1
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -47,6 +47,8 @@ install -D -m 644 config/00-ae9-override.rules %{buildroot}%{_udevrulesdir}/00-a
 install -D -m 644 config/89-ae9-pipewire.rules %{buildroot}%{_udevrulesdir}/89-ae9-pipewire.rules
 install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-override.conf
 install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+%{_prefix}/lib/modules-load.d/creative-ae9.conf
+install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
@@ -54,7 +56,7 @@ install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_fi
 install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
 install -D -m 644 extract_hpeq.py %{buildroot}%{_datadir}/%{name}/extract_hpeq.py
 # optional extras, copied by hand if wanted (see README)
-for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf; do
+for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do
 	install -D -m 644 config/$f %{buildroot}%{_datadir}/%{name}/examples/$f
 done
 
@@ -83,6 +85,10 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.1-1
+- Driver 0.10.1: early module load (modules-load.d), Rear RCA In, reliable
+  headphone profiles, firmware in creative-ae9/, Sub Boost switch
+
 * Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.0-1
 - ae9-get-firmware reads Creative's installer (firmware + headphone profiles);
   extract_hpeq.py; Recommends: innoextract

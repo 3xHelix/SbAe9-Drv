@@ -16,6 +16,8 @@
 # in /lib/firmware; read-only ones (Fedora Atomic: Silverblue, Kinoite,
 # Bazzite, ...) in /etc/firmware, plus the kernel option
 # firmware_class.path=/etc/firmware (takes effect after the next reboot).
+# Everything goes in a creative-ae9/ folder there: "ctefx-desktop.bin" in the
+# firmware root is also the AE-5/AE-7 file from linux-firmware.
 set -u
 FILES="ctefx-desktop.bin ctefx-ae9-overlay.bin"
 MD5_DESKTOP=85c8f2b47180cd6623a2b0e8b8911fe0
@@ -39,14 +41,20 @@ check() {
 	local f p m ok=0
 	for f in $FILES; do
 		p=
-		for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware /usr/lib/firmware; do [ -f "$d/$f" ] && { p=$d/$f; break; }; done
+		# the driver's order: creative-ae9/ first, then the old place
+		for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware/updates /usr/lib/firmware/updates /lib/firmware /usr/lib/firmware; do
+			[ -f "$d/creative-ae9/$f" ] && { p=$d/creative-ae9/$f; break; }
+		done
+		[ -n "$p" ] || for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware/updates /usr/lib/firmware/updates /lib/firmware /usr/lib/firmware; do
+			[ -f "$d/$f" ] && { p=$d/$f; break; }
+		done
 		if [ -z "$p" ]; then echo "  $f: missing"; ok=1; continue; fi
 		m=$(md5sum "$p" | cut -d' ' -f1)
 		if [ "$m" = "$(want_md5 $f)" ]; then echo "  $f: ok ($p)"
 		else echo "  $f: $p is not the tested image (md5 $m)"; ok=1; fi
 	done
 	n=0
-	for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware /usr/lib/firmware; do
+	for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware/updates /usr/lib/firmware/updates /lib/firmware /usr/lib/firmware; do
 		[ -d "$d/creative-ae9/hp" ] && { n=$(ls "$d/creative-ae9/hp"/*.bin 2>/dev/null | wc -l); hp=$d/creative-ae9/hp; break; }
 	done
 	if [ "$n" -gt 0 ]; then echo "  headphone profiles: $n ($hp)"
@@ -99,13 +107,13 @@ fi
 
 python3 -I "$EX/extract_firmware.py" "$SYS" "$T/ctefx-desktop.bin" || { echo "main DSP image: extraction refused" >&2; exit 1; }
 python3 -I "$EX/extract_overlay.py" "$SYS" "$T/ctefx-ae9-overlay.bin" || { echo "overlay: extraction refused" >&2; exit 1; }
-mkdir -p "$DEST"
+mkdir -p "$DEST/creative-ae9"
 for f in $FILES; do
 	[ "$(md5sum "$T/$f" | cut -d' ' -f1)" = "$(want_md5 $f)" ] || { echo "$f: unexpected image, not installed" >&2; exit 1; }
-	install -m 644 "$T/$f" "$DEST/$f"
+	install -m 644 "$T/$f" "$DEST/creative-ae9/$f"
 done
-command -v restorecon >/dev/null && restorecon -F "$DEST"/ctefx-desktop.bin "$DEST"/ctefx-ae9-overlay.bin 2>/dev/null
-echo "installed to $DEST: $FILES"
+command -v restorecon >/dev/null && restorecon -RF "$DEST/creative-ae9" 2>/dev/null
+echo "installed to $DEST/creative-ae9: $FILES"
 
 # Headphone profiles (optional): only Creative's AECMDMasterInstaller has them.
 if [ -n "${HPEQ:-}" ]; then

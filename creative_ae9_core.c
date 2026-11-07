@@ -147,7 +147,7 @@ MODULE_PARM_DESC(verb_log, "Log this many verbs/responses for debugfs creative_a
  * ex: bit 31 response; bit 30 MMIO entry, then bit 29 write, bits 27:26
  * size-1 (log2), bit 24 region (0 = BAR0, 1 = BAR2), bits 15:0 offset.
  */
-struct vlog_ent { u32 val; u32 ex; };
+struct vlog_ent { u32 val; u32 ex; u64 ns; };	/* ns: ktime, for timing diffs */
 static struct vlog_ent *vlog_buf;
 static atomic_t vlog_n = ATOMIC_INIT(0);
 
@@ -162,6 +162,7 @@ void creative_ae9_vlog(u32 val, u32 ex, bool is_resp)
 		return;
 	vlog_buf[i].val = val;
 	vlog_buf[i].ex = (ex & 0x3fffffff) | (is_resp ? 0x80000000 : 0);
+	vlog_buf[i].ns = ktime_get_ns();
 }
 
 static unsigned int mmio_log;
@@ -192,6 +193,7 @@ void ae9_mmio_log(const volatile void __iomem *addr, u32 val, int size, bool wri
 		return;
 	vlog_buf[i].val = val;
 	vlog_buf[i].ex = ex;
+	vlog_buf[i].ns = ktime_get_ns();
 }
 EXPORT_SYMBOL_GPL(ae9_mmio_log);
 
@@ -216,22 +218,25 @@ static int vlog_seq_show(struct seq_file *m, void *v)
 {
 	loff_t i = *(loff_t *)v;
 	const struct vlog_ent *e = &vlog_buf[i];
+	u64 us = div_u64(e->ns, 1000);
 
+	/* "<index> <us> ..." : the microsecond stamp (CLOCK_MONOTONIC) lets
+	 * the timing be compared with the Windows capture's mmio_trace */
 	if (e->ex & BIT(30)) {
 		unsigned int sz = 1u << ((e->ex >> 26) & 3);
 		unsigned int rg = (e->ex & BIT(24)) ? 2 : 0;
 
 		if (e->ex & BIT(29))
-			seq_printf(m, "%lld vfio_region_write  (0000:06:00.0:region%u+0x%x, 0x%x, %u)\n",
-				   i, rg, e->ex & 0xffff, e->val, sz);
+			seq_printf(m, "%lld %llu vfio_region_write  (0000:06:00.0:region%u+0x%x, 0x%x, %u)\n",
+				   i, us, rg, e->ex & 0xffff, e->val, sz);
 		else
-			seq_printf(m, "%lld vfio_region_read  (0000:06:00.0:region%u+0x%x, %u) = 0x%x\n",
-				   i, rg, e->ex & 0xffff, sz, e->val);
+			seq_printf(m, "%lld %llu vfio_region_read  (0000:06:00.0:region%u+0x%x, %u) = 0x%x\n",
+				   i, us, rg, e->ex & 0xffff, sz, e->val);
 	} else if (e->ex & 0x80000000)
-		seq_printf(m, "%lld RIRB idx=  0 resp=0x%08x ex=0x%08x\n",
-			   i, e->val, e->ex & 0x7fffffff);
+		seq_printf(m, "%lld %llu RIRB idx=  0 resp=0x%08x ex=0x%08x\n",
+			   i, us, e->val, e->ex & 0x7fffffff);
 	else
-		seq_printf(m, "%lld CORB idx=  0 verb=0x%08x\n", i, e->val);
+		seq_printf(m, "%lld %llu CORB idx=  0 verb=0x%08x\n", i, us, e->val);
 	return 0;
 }
 
@@ -1202,6 +1207,84 @@ static void ae9_in05_off(struct creative_chip *chip)
 	chip->in05_ch = 0;
 }
 
+/*
+ * The router chip (the 8051 on ChipIO) takes stream binds and formats
+ * (verbs 0x706 / 0x200 on node 0x02) at once but does the routing work
+ * later, from its own queue, and that work reads the *current* stream
+ * setting. A quick unbind -> format -> bind (PipeWire reopening the stream
+ * at another bit depth) could reach it before the unbind was processed:
+ * nothing was torn down and the link from host audio (connection point
+ * 0x43) kept the old sample format, cached in its link record at XRAM
+ * 0x0769 (0x31 24-bit / 0x41 32-bit). The DSP then read 32-bit samples as
+ * 24-bit or the reverse: static on the right channel until the next
+ * restart (2026-11-07; found by reading the 8051's ROM and catching its
+ * tables while the static played: mismatch in both noisy states, match in
+ * all seven clean ones). Fix: let the 8051 finish its queue before the
+ * bind, and check the cached format after the start; on a mismatch, one
+ * more unbind -> wait -> bind. Addresses are those of the tested firmware.
+ */
+static unsigned int fmt_check = 1;
+module_param(fmt_check, uint, 0644);
+MODULE_PARM_DESC(fmt_check, "DSP mode: wait for the router chip before a stream bind and verify its cached format (1 = on, default; 0 = off)");
+
+#define AE9_8051_LINK_HOST_FMT	0x0769	/* link record 5 (0x43 -> 0x00), format */
+
+/* ChipIO GET 0xf04: the 8051's work-queue depth (0 = idle). */
+static int ae9_8051_queue_depth(struct creative_chip *chip)
+{
+	u32 resp = 0;
+
+	if (creative_ae9_corb_send_verb_sync(chip, 0x115f0400, &resp) < 0)
+		return -EIO;
+	return resp & 0xff;
+}
+
+/* Wait (up to ~100 ms) until the 8051 has worked through its queue. */
+static void ae9_8051_wait_idle(struct creative_chip *chip, const char *why)
+{
+	int d = 0, i;
+
+	mutex_lock(&chip->replay_mutex);
+	for (i = 0; i < 100; i++) {
+		d = ae9_8051_queue_depth(chip);
+		if (d <= 0)
+			break;
+		mutex_unlock(&chip->replay_mutex);
+		usleep_range(1000, 1500);
+		mutex_lock(&chip->replay_mutex);
+	}
+	mutex_unlock(&chip->replay_mutex);
+	if (i)
+		dev_info(chip->dev, "router chip: queue idle after %d ms (%s)%s\n", i, why,
+			d > 0 ? ", gave up" : "");
+}
+
+/* One byte of the 8051's XRAM (0x70d/0x70e address, 0xf07 read); reads
+ * glitch while audio plays, so two in a row must agree. */
+static int ae9_8051_xram_byte(struct creative_chip *chip, u16 addr)
+{
+	u32 r, prev = ~0U;
+	int t, v = -EIO;
+
+	mutex_lock(&chip->replay_mutex);
+	for (t = 0; t < 6; t++) {
+		r = 0;
+		if (creative_ae9_corb_send_verb_sync(chip, 0x11570d00 | (addr & 0xff), &r) < 0 ||
+		    creative_ae9_corb_send_verb_sync(chip, 0x11570e00 | (addr >> 8), &r) < 0 ||
+		    creative_ae9_corb_send_verb_sync(chip, 0x115f0700, &r) < 0)
+			break;
+		r &= 0xff;
+		if (r == prev) {
+			v = r;
+			break;
+		}
+		prev = r;
+	}
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	return v;
+}
+
 static void ae9_dsp_mode_start(struct creative_chip *chip, u16 format,
 			       bool count_ff)
 {
@@ -1237,8 +1320,34 @@ static void ae9_dsp_mode_start(struct creative_chip *chip, u16 format,
 		creative_ae9_dsp_mode(chip, true);
 		return;
 	}
+	if (fmt_check)
+		ae9_8051_wait_idle(chip, "before the bind");
 	creative_ae9_verb_block_replay(chip, t, ARRAY_SIZE(t), false,
 				       "SBX: playback start in DSP mode");
+	if (fmt_check) {
+		int got;
+
+		ae9_8051_wait_idle(chip, "after the bind");
+		got = ae9_8051_xram_byte(chip, AE9_8051_LINK_HOST_FMT);
+		if (got >= 0 && got != (format & 0xff)) {
+			static const u32 unbind[] = { 0x10270600 };
+			u32 rebind[] = { 0x10220000 | format, 0x10270610 };
+
+			dev_info(chip->dev, "router chip kept the old stream format (0x%02x, stream 0x%02x): unbind and bind again\n",
+				 got, format & 0xff);
+			creative_ae9_verb_block_replay(chip, unbind, ARRAY_SIZE(unbind), false,
+						       "SBX: unbind (format repair)");
+			ae9_8051_wait_idle(chip, "after the repair unbind");
+			creative_ae9_verb_block_replay(chip, rebind, ARRAY_SIZE(rebind), false,
+						       "SBX: bind again (format repair)");
+			ae9_8051_wait_idle(chip, "after the repair bind");
+			got = ae9_8051_xram_byte(chip, AE9_8051_LINK_HOST_FMT);
+			dev_info(chip->dev, "router chip stream format now 0x%02x (%s)\n", got,
+				 got == (format & 0xff) ? "fixed" : "STILL WRONG");
+		} else {
+			dev_info(chip->dev, "router chip stream format 0x%02x ok\n", got);
+		}
+	}
 	creative_ae9_router_front_dsp(chip, count_ff);
 }
 
@@ -2101,6 +2210,28 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		creative_dsp_chipio_addr_invalidate();
 		mutex_unlock(&g_dbg_chip->replay_mutex);
 		dev_info(g_dbg_chip->dev, "dbg verb 0x%08x -> 0x%08x (%d)\n", v, resp, ret);
+		return len;
+	}
+	/* "vlogreset": start the verb log over (log just one test) */
+	if (!strncmp(buf, "vlogreset", 9)) {
+		atomic_set(&vlog_n, 0);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result), "verb log reset\n");
+		return len;
+	}
+	/* "scpprobe <mid> <req> <count> <wait_us>": raw reply timing probe */
+	if (!strncmp(buf, "scpprobe ", 9)) {
+		unsigned int mid, req, cnt, wus;
+		int ret;
+
+		if (sscanf(buf + 9, "%x %x %u %u", &mid, &req, &cnt, &wus) != 4 ||
+		    cnt > 500 || wus > 20000)
+			return -EINVAL;
+		mutex_lock(&g_dbg_chip->replay_mutex);
+		ret = creative_dsp_scp_probe(g_dbg_chip, mid, req & 0x7f, cnt, wus);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&g_dbg_chip->replay_mutex);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result),
+			  "scpprobe done (%d); results in the kernel log\n", ret);
 		return len;
 	}
 	if (!strncmp(buf, "scp ", 4)) {
@@ -3104,17 +3235,20 @@ static int dac_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = uv->value.enumerated.item[0];
-	u8 cmd[1][3] = { { 0x48, 0x07, 0 } };
+	/* 49/0e = SABRE9006A reg 14 "FIR Rolloff", bit 0: 1 fast (its
+	 * power-on default), 0 slow (datasheet p.14) */
+	u8 cmd[2][3] = { { 0x48, 0x07, 0 }, { 0x49, 0x0e, 0x01 } };
 
 	if (v > 2 || v == chip->dac_filter)
 		return 0;
 	if (!v) {
-		/* back to Windows' boot filter (bits 7:5 = 100) */
+		/* back to Windows' boot filter (bits 7:5 = 100), and the
+		 * second DAC back to fast (it stayed slow after Slow) */
 		chip->dac_filter = 0;
 		cmd[0][2] = (chip->dac48_07 & 0x1f) | 0x80;
 		if (chip->corb_buf && chip->dsp_done)
 			creative_dsp_ca0113_replay_quiet(chip,
-							 (const u8 (*)[3])cmd, 1);
+							 (const u8 (*)[3])cmd, 2);
 		return 1;
 	}
 	chip->dac_filter = v;
@@ -3901,6 +4035,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	 * no relay click, no audio. Moving INIT here fixes the race.
 	 */
 	INIT_DELAYED_WORK(&chip->dsp_switch_work, creative_ae9_dsp_switch_work);
+	INIT_DELAYED_WORK(&chip->hp_work, creative_ae9_fx_hp_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
@@ -4059,16 +4194,19 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 		}
 	}
 
-	/* input streams: 0 capture (XLR), 1 optical in, 2 What U Hear */
+	/* input streams: 0 capture (XLR), 1 optical in, 2 What U Hear,
+	 * 3 rear RCA in */
 	if (intsts & 0x1)
 		creative_ae9_cap_irq(chip);
 	if (intsts & 0x2)
 		creative_ae9_xcap_irq(chip, 0);
 	if (intsts & 0x4)
 		creative_ae9_xcap_irq(chip, 1);
+	if (intsts & 0x8)
+		creative_ae9_xcap_irq(chip, 2);
 
 	/* Acknowledge stream interrupts and notify ALSA of period completion */
-	if (intsts & AZX_INT_ALL_STREAM & ~0x7) {
+	if (intsts & AZX_INT_ALL_STREAM & ~0xf) {
 		u8 sd_sts = readb(chip->hda_regs +
 				  chip->playback_stream_base + AZX_REG_SD_STS);
 		if (sd_sts & SD_INT_COMPLETE) {
@@ -4155,6 +4293,7 @@ static void creative_ae9_stop_works(struct creative_chip *chip)
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
+	cancel_delayed_work_sync(&chip->hp_work);
 }
 
 /* Reboot / power-off: same as Windows shutting down. */
@@ -4223,6 +4362,7 @@ static int creative_ae9_suspend(struct device *dev)
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
+	cancel_delayed_work_sync(&chip->hp_work);
 	creative_ae9_streams_down(chip);
 	chip->dsp_active = false;
 	chip->suspended = true;

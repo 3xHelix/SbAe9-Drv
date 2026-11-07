@@ -246,6 +246,38 @@ static int fls_image_check(struct creative_chip *chip, const struct firmware *fw
 #define MASTERCONTROL_ALLOC_DMA_CHAN 10
 
 #define DESKTOP_EFX_FILE "ctefx-desktop.bin"
+#define DESKTOP_EFX_SIZE 655436		/* the tested AE-9 image */
+#define AE9_OVERLAY_SIZE 432
+
+/*
+ * Creative's DSP images live in creative-ae9/ (ae9-get-firmware 0.10.1+).
+ * "ctefx-desktop.bin" in the firmware root is also the AE-5/AE-7 file in
+ * linux-firmware (Kaiba, 2026-11-07: clashed on Arch), so the old location
+ * is used only as a fallback, and only if it's the AE-9 image's size.
+ */
+static int ae9_request_fw(struct creative_chip *chip, const struct firmware **fw,
+			  const char *name, size_t size)
+{
+	char path[64];
+	int ret;
+
+	snprintf(path, sizeof(path), "creative-ae9/%s", name);
+	if (!firmware_request_nowarn(fw, path, chip->dev))
+		return 0;
+	ret = request_firmware(fw, name, chip->dev);
+	if (ret)
+		return ret;
+	if ((*fw)->size != size) {
+		dev_err(chip->dev, "firmware %s is not the AE-9 image (%zu bytes, the AE-9's is %zu): probably the AE-5/AE-7 file from linux-firmware; run ae9-get-firmware\n",
+			name, (*fw)->size, size);
+		release_firmware(*fw);
+		*fw = NULL;
+		return -EINVAL;
+	}
+	dev_info_once(chip->dev, "firmware %s from its old location; ae9-get-firmware now installs it to creative-ae9/\n",
+		      name);
+	return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Verb transport — CORB when available, ICW otherwise		  */
@@ -601,6 +633,9 @@ static int dspio_read_multiple(struct creative_chip *chip, unsigned int *buffer,
  */
 static void scp_drain_announced(struct creative_chip *chip);
 
+/* Recover from a late SCP reply instead of reading every later reply one
+ * behind (see dspio_scp_unlocked). 0 = old behaviour, for comparison. */
+
 /* The DSP announces SCP replies through the RIRB: without running rings
  * (corb_rings=0, or fw_rings_off=1 before the rings start) poll instead. */
 static bool scp_ev(struct creative_chip *chip)
@@ -663,52 +698,169 @@ struct scp_msg {
 	unsigned int data[SCP_MAX_DATA_WORDS];
 };
 
-/* Read one announced SCP reply, Windows-style. Returns words read. */
-static int scp_read_announced(struct creative_chip *chip, u32 *hdr,
-			      u32 *data, unsigned int max)
+/*
+ * DSP reply reads, the Windows way (decompile FUN_00027ce0 / FUN_00027e9c /
+ * FUN_0001dae8; notes 14-17, 2026-11-07). One word: post the read (0x702,
+ * again while it answers 1 = busy), read the status (0xF01, again while 1),
+ * then 3 = queue empty (stop), anything else = read the word (0xF02). The
+ * old reader went straight to 0xF02: while the DSP was still busy that read
+ * 0, the real word came in the next read and every GET after was one reply
+ * behind (Kaiba's silent DSP; the address 0 that wrote the EQ over Y memory).
+ * Windows never read an empty header in 670 replies (15 captures), and at
+ * least 0.6 ms passed between its 0x702 and 0xF02; we keep that gap too in
+ * case the status never shows busy at full speed.
+ */
+#define SCP_BUSY_MS	50	/* Windows: 5 tries 10 ms apart */
+
+static int scp_wait_not_busy(struct creative_chip *chip, unsigned int verb,
+			     unsigned int parm, unsigned int *res)
 {
-	unsigned int size, i, cnt;
+	unsigned long until = jiffies + msecs_to_jiffies(SCP_BUSY_MS);
 
-	dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_SCP_POST_READ_DATA, 0);
-	dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
-	*hdr = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_SCP_READ_DATA, 0);
+	for (;;) {
+		*res = dsp_read(chip, WIDGET_DSP_CTRL, verb, parm);
+		if (*res != VENDOR_STATUS_DSPIO_BUSY)
+			return *res == ~0U ? -EIO : 0;
+		if (!time_before(jiffies, until) || chip->card_gone)
+			return -EBUSY;
+		usleep_range(500, 1000);
+	}
+}
+
+static unsigned int scp_last_pr, scp_last_st;	/* for the logs */
+
+static int scp_read_word(struct creative_chip *chip, u32 *w)
+{
+	unsigned int r;
+	int ret;
+
+	ret = scp_wait_not_busy(chip, VENDOR_DSPIO_SCP_POST_READ_DATA, 0, &r);
+	scp_last_pr = r;
+	if (ret)
+		return ret;
+	usleep_range(600, 800);	/* Windows' 0x702 -> 0xF02 was never under 0.6 ms */
+	ret = scp_wait_not_busy(chip, VENDOR_DSPIO_STATUS, 0, &r);
+	scp_last_st = r;
+	if (ret)
+		return ret;
+	if (r == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		return -ENODATA;
+	if (r == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
+		return -EIO;
+	*w = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_SCP_READ_DATA, 0);
+	return 0;
+}
+
+/*
+ * Read one reply from the DSP's reply queue: header, the count (logged
+ * only; Windows doesn't use it), then the header's number of words.
+ * Returns the words stored, -EAGAIN if the queue is empty, -EBADMSG for a
+ * header that can't be a reply (no reply flag, all-ones, too long: a
+ * failed read would otherwise pull 31 words out of the queue), other
+ * negatives on a failed read.
+ */
+static unsigned int scp_queue_words(struct creative_chip *chip)
+{
+	unsigned int r;
+
+	if (scp_wait_not_busy(chip, 0x704, 0x02, &r) ||
+	    scp_wait_not_busy(chip, VENDOR_DSPIO_STATUS, 0, &r) ||
+	    r == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		return 0;
+	r = dsp_read(chip, WIDGET_DSP_CTRL, 0xf04, 0);
+	return r == ~0U ? 0 : r;
+}
+
+static bool scp_hdr_ok(u32 h)
+{
+	return h != ~0U && (h & BIT(25)) && ((h >> 27) & 0x1f) <= SCP_MAX_DATA_WORDS;
+}
+
+static unsigned int scp_last_cnt;	/* queue words after the last header */
+
+/*
+ * Read one reply exactly as Windows does (FUN_00027ce0 / FUN_00027e9c):
+ * header word, 704 p=2 / F01 / F04 (the words still queued: the rest of
+ * this reply plus any later ones; Windows always saw 1), then the
+ * header's number of words. No re-reads (Windows never re-reads F02:
+ * 0 of 1324) and no skipping of strays (a data word like 0x3f800000
+ * passes as a header). Returns the words stored, -EAGAIN if the queue
+ * is empty, -EBADMSG for a word that can't be a header.
+ */
+static int scp_read_reply(struct creative_chip *chip, u32 *hdr, u32 *data,
+			  unsigned int max)
+{
+	unsigned int size, i;
+	u32 w;
+	int ret;
+
+	ret = scp_read_word(chip, hdr);
+	if (ret == -ENODATA)
+		return -EAGAIN;
+	if (ret)
+		return ret;
+	if (!scp_hdr_ok(*hdr)) {
+		/*
+		 * The header read came back empty, but the header itself has
+		 * left the queue: the next read gets this reply's data word
+		 * (seen every time: hdr 0, then 0x1d5e; scpprobe and verb log,
+		 * 2026-11-07). So discard what the queue count says is left of
+		 * it, and the next GET starts in step. A count that reads 0
+		 * skips this (the safe direction).
+		 */
+		unsigned int left = scp_queue_words(chip), k;
+
+		for (k = 0; k < left && k < SCP_MAX_DATA_WORDS; k++)
+			if (scp_read_word(chip, &w))
+				break;
+		dev_info_ratelimited(chip->dev, "scp: not a reply header 0x%08x (post-read 0x%x, status 0x%x); %u queued word(s) discarded\n",
+				     *hdr, scp_last_pr, scp_last_st, k);
+		return -EBADMSG;
+	}
 	size = (*hdr >> 27) & 0x1f;
-
-	dsp_read(chip, WIDGET_DSP_CTRL, 0x704, 0x02);
-	dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
-	cnt = dsp_read(chip, WIDGET_DSP_CTRL, 0xf04, 0);
-
+	scp_last_cnt = scp_queue_words(chip);
 	for (i = 0; i < size; i++) {
-		u32 w;
-
-		dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_SCP_POST_READ_DATA, 0);
-		dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
-		w = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_SCP_READ_DATA, 0);
+		ret = scp_read_word(chip, &w);
+		if (ret) {
+			dev_info_ratelimited(chip->dev, "scp: reply 0x%08x word %u of %u not read (%d)\n",
+					     *hdr, i, size, ret);
+			return ret == -ENODATA ? -EBADMSG : ret;
+		}
 		if (i < max)
 			data[i] = w;
 	}
-	chip->scp_unsol_done++;
-	dev_dbg(chip->dev, "scp reply hdr=0x%08x count=0x%x size=%u\n",
-		*hdr, cnt, size);
 	return min(size, max);
 }
 
-/* Read out (and discard) replies the DSP has announced but we haven't read. */
+/*
+ * Before a message, if the DSP announced replies nobody read: read out the
+ * reply queue (replies nobody waited for, e.g. the DSP's error replies to some SETs), stopping
+ * at "queue empty" like Windows' work item (FUN_0001dae8). Safe now that
+ * every read waits out busy and stops on status 3 (the blind version of
+ * this broke DSP mode, build E08FCE05). Then the announcement count is
+ * level again, so a miscount can't carry over to the next GET.
+ */
 static void scp_drain_announced(struct creative_chip *chip)
 {
 	unsigned int guard = 16;
 	u32 hdr, junk[SCP_MAX_DATA_WORDS];
+	int n;
 
-	while (guard-- &&
-	       (int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) > 0) {
-		int n = scp_read_announced(chip, &hdr, junk, ARRAY_SIZE(junk));
-
-		if (ae9_debug)
-			dev_info_ratelimited(chip->dev,
-			"scp: drained unexpected reply hdr=0x%08x (%d words: %08x %08x %08x %08x)\n",
-			hdr, n, n > 0 ? junk[0] : 0, n > 1 ? junk[1] : 0,
-			n > 2 ? junk[2] : 0, n > 3 ? junk[3] : 0);
+	/* only when the DSP announced something nobody read, as Windows
+	 * (its work item runs on an announcement with no GET waiting) */
+	if ((int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) <= 0)
+		return;
+	while (guard--) {
+		n = scp_read_reply(chip, &hdr, junk, ARRAY_SIZE(junk));
+		if (n == -EAGAIN)
+			break;
+		if (n < 0)
+			break;
+		dev_info_ratelimited(chip->dev,
+			"scp: cleared a reply nobody waited for: hdr 0x%08x (%d words, first 0x%08x)\n",
+			hdr, n, n > 0 ? junk[0] : 0);
 	}
+	chip->scp_unsol_done = atomic_read(&chip->scp_unsol);
 }
 
 /* simplified SCP send: we only need SET (no reply) and basic GET for dma_chan */
@@ -787,36 +939,132 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 
 	if (scp_ev(chip)) {
 		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
-		unsigned int got;
+		unsigned long until;
+		unsigned int dropped = 0;
+		int got = -EAGAIN;
 
 		chip->dsp_wait_scp = 0;
-		/* status polls run the RIRB scan that counts announcements */
-		while ((int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) <= 0) {
-			if (time_after(jiffies, timeout)) {
-				dev_info_ratelimited(chip->dev,
-					"scp GET mid=0x%02x req=0x%02x: no reply announced\n",
-					mod_id, req);
-				return -EIO;
+		/*
+		 * Wait for the announcement. Some replies come without one
+		 * (seen 2026-11-07 in DSP mode with music: 2 of 50 GETs; and
+		 * DarkNikGr's AE-9 driver polls the queue for that reason),
+		 * and an unannounced reply left in the queue piles up until
+		 * the DSP stops answering. So after 200 ms without one, look in
+		 * the queue too (status-checked reads, a few at most; the loop
+		 * below stops at the first empty or bad header).
+		 */
+		{
+			unsigned long quiet = jiffies + msecs_to_jiffies(200);
+			unsigned int peeks = 0;
+
+			while ((int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) <= 0) {
+				if (time_after(jiffies, timeout)) {
+					dev_info_ratelimited(chip->dev,
+						"scp GET mid=0x%02x req=0x%02x: no reply announced (queue looked at %u times; post-read 0x%x, status 0x%x)\n",
+						mod_id, req, peeks, scp_last_pr, scp_last_st);
+					return -EIO;
+				}
+				if (creative_ae9_gone(chip, "SCP reply wait"))
+					return -ENODEV;
+				if (time_after(jiffies, quiet) && peeks < 3) {
+					u32 h;
+
+					peeks++;
+					quiet = jiffies + msecs_to_jiffies(200);
+					got = scp_read_reply(chip, &h, scp_reply.data,
+							     SCP_MAX_DATA_WORDS);
+					if (got == -EAGAIN)
+						continue;
+					if (got < 0)
+						return -EIO;
+					scp_reply.hdr = h;
+					if (!((h ^ chip->dsp_wait_scp_header) & 0x00ffffff)) {
+						dev_info_ratelimited(chip->dev,
+							"scp GET mid=0x%02x req=0x%02x: reply found in the queue without an announcement\n",
+							mod_id, req);
+						goto have_reply;
+					}
+					dropped++;
+					dev_info_ratelimited(chip->dev,
+						"scp GET mid=0x%02x req=0x%02x: dropped an unannounced reply for another request (hdr 0x%08x)\n",
+						mod_id, req, h);
+					continue;
+				}
+				/* no verb to the DSP while it prepares the reply */
+				creative_ae9_corb_scan_unsol(chip);
+				usleep_range(100, 200);
 			}
-			if (creative_ae9_gone(chip, "SCP reply wait"))
-				return -ENODEV;
-			dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
-			usleep_range(200, 400);
 		}
-		got = scp_read_announced(chip, &scp_reply.hdr, scp_reply.data,
-					 SCP_MAX_DATA_WORDS);
-		if ((scp_reply.hdr & 0x00ffffff) !=
-		    (chip->dsp_wait_scp_header & 0x00ffffff))
+		/*
+		 * Give the DSP 1.5 ms after the announcement before the first
+		 * read: in DSP mode with music, reading at once lost 4 of 50
+		 * headers, reading 1.5 ms later lost none (scpprobe, build
+		 * E94FD65B, 2026-11-07 14:37). The verb log showed the same
+		 * timing for good and lost reads, so it's odds, not a cliff.
+		 */
+		usleep_range(1500, 1700);
+		/*
+		 * Read replies until ours (header match), for up to 50 ms. A
+		 * reply for another request (late, or an error reply to a SET)
+		 * is dropped with its words and the next one read. Every read
+		 * is status-checked, so nothing is read blind.
+		 */
+		until = jiffies + msecs_to_jiffies(50);
+		for (;;) {
+			got = scp_read_reply(chip, &scp_reply.hdr, scp_reply.data,
+					     SCP_MAX_DATA_WORDS);
+			if (got >= 0 &&
+			    !((scp_reply.hdr ^ chip->dsp_wait_scp_header) & 0x00ffffff))
+				break;
+			if (got >= 0) {
+				dropped++;
+				dev_info_ratelimited(chip->dev,
+					"scp GET mid=0x%02x req=0x%02x: dropped a reply for another request (hdr 0x%08x)\n",
+					mod_id, req, scp_reply.hdr);
+			} else if (got != -EAGAIN) {
+				break;
+			}
+			if (!time_before(jiffies, until) || dropped >= 8 ||
+			    creative_ae9_gone(chip, "SCP reply read"))
+				break;
+			if (got == -EAGAIN)
+				usleep_range(200, 400);
+		}
+have_reply:
+		chip->scp_unsol_done = atomic_read(&chip->scp_unsol);
+		if (got < 0 ||
+		    ((scp_reply.hdr ^ chip->dsp_wait_scp_header) & 0x00ffffff)) {
 			dev_info_ratelimited(chip->dev,
-				"scp GET mid=0x%02x req=0x%02x: reply hdr 0x%08x (want 0x%06x)\n",
-				mod_id, req, scp_reply.hdr, chip->dsp_wait_scp_header);
+				"scp GET mid=0x%02x req=0x%02x: our reply not read (%d, last hdr 0x%08x, %u dropped; post-read 0x%x, status 0x%x)\n",
+				mod_id, req, got, got >= 0 ? scp_reply.hdr : 0, dropped,
+				scp_last_pr, scp_last_st);
+			return -EIO;
+		}
+		/* words still queued after our reply = replies nobody read:
+		 * read them out to "queue empty", as Windows' work item does,
+		 * so nothing old is left for the next GET */
+		if (scp_last_cnt > (unsigned int)got && scp_last_cnt <= 32) {
+			u32 h, junk[SCP_MAX_DATA_WORDS];
+			unsigned int k, left = scp_last_cnt - got;
+
+			for (k = 0; k < 8; k++) {
+				int n = scp_read_reply(chip, &h, junk, ARRAY_SIZE(junk));
+
+				if (n < 0)
+					break;
+				dev_info_ratelimited(chip->dev,
+					"scp GET mid=0x%02x req=0x%02x: cleared a leftover reply 0x%08x (%u word(s) were queued after ours)\n",
+					mod_id, req, h, left);
+			}
+			chip->scp_unsol_done = atomic_read(&chip->scp_unsol);
+		}
 		extract_scp_header(scp_reply.hdr, &resp_flag, &error_flag,
 				   &reply_data_size);
 		if (!resp_flag || error_flag)
 			return -EIO;
 		if (reply && reply_len) {
 			unsigned int rl = min(*reply_len,
-					      got * (unsigned int)sizeof(u32));
+					      (unsigned int)got * (unsigned int)sizeof(u32));
 			memcpy(reply, scp_reply.data, rl);
 			*reply_len = rl;
 		}
@@ -890,6 +1138,85 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 }
 
 /*
+ * Debug probe (debugfs "scpprobe <mid> <req> <count> <wait_us>"): send the
+ * same GET <count> times and log the raw facts of each reply, bypassing the
+ * normal resync: time to the announcement, the status read right before the
+ * header read, header, 0xf04 count, first data word. After an empty header
+ * it watches 50 ms for a second announcement and logs the status values seen
+ * meanwhile (without reading). Caller holds replay_mutex. For finding why
+ * replies go one behind (2026-11-07).
+ */
+int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
+			   unsigned int req, unsigned int count,
+			   unsigned int wait_us)
+{
+	unsigned int i, ok = 0, empty = 0, other = 0, none = 0, bad = 0;
+	/* Windows: src 0x00 for MASTERCONTROL, 0x20 for the effect modules */
+	unsigned int src = mid == MASTERCONTROL ? 0 : 0x20;
+
+	if (!scp_ev(chip) || !chip->dsp_done)
+		return -ENODEV;
+	mutex_lock(&chip->scp_mutex);
+	scp_drain_announced(chip);
+	for (i = 0; i < count && !chip->card_gone; i++) {
+		struct scp_msg m = { 0 };
+		u32 want, hdr = 0, data[SCP_MAX_DATA_WORDS] = { 0 };
+		unsigned int polls = 0;
+		ktime_t t0;
+		s64 t_ann;
+		int n, tries = 0;
+
+		m.hdr = make_scp_header(mid, src, 1, req, 0, 0, 0, 0);
+		want = (m.hdr & 0xffff0000) | ((m.hdr & 0xff) << 8) | ((m.hdr >> 8) & 0xff);
+		t0 = ktime_get();
+		if (dspio_write_multiple(chip, &m.hdr, 1) < 0) {
+			dev_info(chip->dev, "scpprobe %u: send failed\n", i);
+			break;
+		}
+		while ((int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) <= 0 &&
+		       ktime_us_delta(ktime_get(), t0) < 500000) {
+			creative_ae9_corb_scan_unsol(chip);	/* no verb, as Windows */
+			polls++;
+			usleep_range(100, 200);
+		}
+		t_ann = (int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) > 0 ?
+			ktime_us_delta(ktime_get(), t0) : -1;
+		if (t_ann < 0)
+			none++;
+		if (wait_us)
+			usleep_range(wait_us, wait_us + 100);
+		/* read with the driver's reader; unannounced: look anyway */
+		do {
+			n = scp_read_reply(chip, &hdr, data, ARRAY_SIZE(data));
+			tries++;
+			if (n == -EAGAIN)
+				usleep_range(1000, 1500);
+		} while (n == -EAGAIN && tries < 20);
+		chip->scp_unsol_done = atomic_read(&chip->scp_unsol);
+		if (n == -EAGAIN) {
+			empty++;
+		} else if (n < 0) {
+			bad++;
+		} else if (!((hdr ^ want) & 0x00ffffff)) {
+			ok++;
+			if (t_ann >= 0 && tries == 1)
+				continue;
+		} else {
+			other++;
+		}
+		dev_info(chip->dev, "scpprobe %u: %s, hdr 0x%08x data 0x%08x, announced %s%lld us, %d read tries, post-read 0x%x status 0x%x\n",
+			 i, n == -EAGAIN ? "QUEUE EMPTY" : n < 0 ? "READ FAILED" :
+			 (hdr ^ want) & 0x00ffffff ? "NOT OURS" : "ok",
+			 hdr, data[0], t_ann < 0 ? "NOT (" : "after ", t_ann, tries,
+			 scp_last_pr, scp_last_st);
+	}
+	mutex_unlock(&chip->scp_mutex);
+	dev_info(chip->dev, "scpprobe 0x%02x/0x%02x src 0x%02x x%u wait %u us: %u ok, %u queue empty, %u not ours, %u read failed, %u unannounced\n",
+		 mid, req, src, count, wait_us, ok, empty, other, bad, none);
+	return 0;
+}
+
+/*
  * Send one SCP message given as a raw header word plus data words, as
  * recorded in the Windows capture. GET replies are read and discarded.
  */
@@ -959,17 +1286,46 @@ static void xfer_stream_run(struct creative_chip *chip, unsigned int sdoff,
 	wmb();
 }
 
-static void xfer_stream_stop(struct creative_chip *chip, unsigned int sdoff,
+/*
+ * Stop a transfer stream the way the HDA spec asks: clear RUN and wait
+ * until it reads 0 (the engine finishes its fetch), then reset and wait
+ * for SRST to read back 1 and then 0, then clear the BDL pointer. The
+ * old stop used fixed 50 us pauses with no read-back; after a headphone
+ * profile upload the card then wrote to memory we had already freed
+ * (IOMMU page faults, 2026-11-07 12:42:34 and 12:50:17) and the DSP died.
+ */
+static bool xfer_stream_stop(struct creative_chip *chip, unsigned int sdoff,
 			     unsigned int tag)
 {
 	void __iomem *sd = chip->hda_regs + sdoff;
+	unsigned int i;
+	u32 ctl = 0;
 
 	writel(tag << 20, sd + AZX_REG_SD_CTL);
-	udelay(50);
+	for (i = 0; i < 1000; i++) {
+		ctl = readl(sd + AZX_REG_SD_CTL);
+		if (!(ctl & SD_CTL_DMA_START))
+			break;
+		udelay(10);
+	}
+	if (ctl & SD_CTL_DMA_START) {
+		/* still fetching: leave it alone; the caller must not free
+		 * its buffers (2026-11-07 14:45:14: freed under a running
+		 * stream, the card wrote into them, IOMMU faults, dead DSP) */
+		dev_warn(chip->dev, "transfer stream 0x%x: RUN still set after 10 ms (ctl 0x%x)\n",
+			 sdoff, ctl);
+		return false;
+	}
 	writel(SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
-	udelay(50);
+	for (i = 0; i < 100 && !(readl(sd + AZX_REG_SD_CTL) & SD_CTL_STREAM_RESET); i++)
+		udelay(10);
 	writel(0, sd + AZX_REG_SD_CTL);
-	wmb();
+	for (i = 0; i < 100 && (readl(sd + AZX_REG_SD_CTL) & SD_CTL_STREAM_RESET); i++)
+		udelay(10);
+	writel(0, sd + AZX_REG_SD_BDLPL);
+	writel(0, sd + AZX_REG_SD_BDLPU);
+	readl(sd + AZX_REG_SD_CTL);	/* flush the posted writes */
+	return true;
 }
 
 static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out);
@@ -1002,7 +1358,7 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 	u32 chan = ~0U, resp;
 	int ret;
 
-	ret = request_firmware(&fw, AE9_OVERLAY_FILE, chip->dev);
+	ret = ae9_request_fw(chip, &fw, AE9_OVERLAY_FILE, AE9_OVERLAY_SIZE);
 	if (ret) {
 		dev_warn(chip->dev, "overlay: /lib/firmware/%s not available (%d), skipped; extract it with extract_overlay.py\n",
 			 AE9_OVERLAY_FILE, ret);
@@ -1164,12 +1520,16 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	void *buf = NULL;
 	__le32 *bdl = NULL;
 	dma_addr_t buf_dma = 0, bdl_dma = 0;
-	u32 addr = ~0U, chan = ~0U, r, v = 0, v0 = 0, a3a[2], a3b[2], zero = 0;
+	u32 addr = ~0U, chan = ~0U, r, v = 0, v0 = 0, a3a[2], a3b[2], zero = 0, busy = ~0U;
+	bool stopped = true;
+	unsigned int to0, bad = 0;
+	u32 yfirst = 0, ylast = 0;
 	unsigned int port, rl, i, t, seen;
 	int ret;
 
 	if (!chip->dsp_done || chip->card_gone)
 		return -ENODEV;
+	to0 = chip->corb_timeouts;
 	ret = request_firmware(&fw, name, chip->dev);
 	if (ret) {
 		dev_warn(chip->dev, "headphone profile: /lib/firmware/%s not available (%d); extract the profiles with ae9-get-firmware\n",
@@ -1203,17 +1563,50 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	memcpy(buf, seg->data, HPEQ_WORDS * 4);
 	wmb();
 
-	scp_set_u32(chip, 0x96, 0x1f, zero);		/* use speaker EQ: off */
+	/* use speaker EQ: off, from src 0x20 as Windows (all 4 uploads) */
+	dspio_scp(chip, 0x96, 0x20, 0x1f, SCP_SET, &zero, sizeof(zero), NULL, NULL);
+	/*
+	 * Ask twice; both answers must agree and be a real address. Once the
+	 * DSP answered 0 with a correct header (2026-11-07, 12:29:41; every
+	 * good answer before was 0x1d5e): 1024 words went over the start of
+	 * Y memory and the DSP stopped answering until a power-off.
+	 */
 	ret = scp_get_u32(chip, MASTERCONTROL, 0x3c, &addr);
-	if (ret || addr == ~0U || addr > 0xffff) {
-		dev_err(chip->dev, "headphone profile: speaker EQ address query failed (ret %d, 0x%x)\n",
+	if (!ret) {
+		u32 again = ~0U;
+
+		ret = scp_get_u32(chip, MASTERCONTROL, 0x3c, &again);
+		if (!ret && again != addr) {
+			dev_err(chip->dev, "headphone profile: speaker EQ address answers differ (0x%x, 0x%x)\n",
+				addr, again);
+			ret = -EIO;
+		}
+	}
+	if (ret || addr == 0 || addr > 0x10000 - HPEQ_WORDS) {
+		dev_err(chip->dev, "headphone profile: speaker EQ address query failed (ret %d, 0x%x); not uploading\n",
 			ret, addr);
 		ret = ret ?: -EIO;
 		goto out;
 	}
 	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_STREAM_FORMAT, OVL_FMT);
 	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, HPEQ_TAG << 4);
+	/*
+	 * The DSP channels already running (the playback's). Once GET 0x0a
+	 * "gave" channel 0, the playback's own, because its data word read
+	 * as 0 (2026-11-07 14:45:14): the profile went into the playback's
+	 * channel and the DSP died. A data word of 0 can't be caught by its
+	 * value, so check it against what the card says is busy.
+	 */
+	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &busy);
 	ret = scp_get_u32(chip, MASTERCONTROL, 0x0a, &chan);
+	if (!ret && chan <= 7 && busy != ~0U && (busy & BIT(chan))) {
+		/* not ours to free: whatever we really got stays allocated
+		 * until the next bring-up (a leak beats freeing the playback's) */
+		dev_err(chip->dev, "headphone profile: DSP gave channel %u, which is busy (0x%x); not uploading\n",
+			chan, busy);
+		ret = -EBUSY;
+		goto unbind;
+	}
 	if (ret || chan > 7) {
 		dev_err(chip->dev, "headphone profile: no DSP DMA channel (ret %d, 0x%x)\n", ret, chan);
 		ret = ret ?: -EBUSY;
@@ -1236,19 +1629,39 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	a3b[0] = (HPEQ_WORDS << 16) | (addr & 0xffff);
 	a3b[1] = HPEQ_3B_YMEM | (chan & 0xf);
 	/*
-	 * GET 0x3a and 0x3b arm the DSP's DMA. Their replies are not checked,
-	 * as in the boot overlay load (and Windows): our DSP sometimes answers
-	 * 0x3a with an empty header (seen at boot for 0x96/0x3a too), and
-	 * stopping there left later GETs one reply behind (2026-11-07). The
-	 * channel start bit below tells whether the transfer ran.
+	 * GET 0x3a and 0x3b arm the DSP's DMA. Both must be answered before
+	 * the data goes out. The first builds sent anyway (an empty 0x3a
+	 * header left later GETs one reply behind, which the busy-aware reader now
+	 * handles), but with the 0x3b reply lost while the command ring was
+	 * choking, sending anyway ended in the card's DMA reading unmapped
+	 * memory (IOMMU page fault) and a dead DSP (2026-11-07, 12:42:34).
 	 */
 	rl = sizeof(r);
 	ret = dspio_scp(chip, MASTERCONTROL, 0, 0x3a, SCP_GET, a3a, sizeof(a3a), &r, &rl);
-	rl = sizeof(r);
-	ret |= dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b, sizeof(a3b), &r, &rl);
-	if (ret)
-		dev_info(chip->dev, "headphone profile: 0x3a/0x3b reply not as expected (%d), sending anyway\n", ret);
-	ret = 0;
+	if (!ret) {
+		rl = sizeof(r);
+		ret = dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b, sizeof(a3b), &r, &rl);
+	}
+	if (ret) {
+		dev_warn(chip->dev, "headphone profile: the DSP didn't confirm the transfer (0x3a/0x3b, %d); not sending\n",
+			 ret);
+		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
+		goto free_chan;
+	}
+	/*
+	 * Windows reads the channel's DMA state back before RUN, and the
+	 * channel's start bit was already on in all 4 of its uploads (0x3,
+	 * 0xf, 0x3, 0x7; notes 20/25). If it isn't, the DSP didn't take the
+	 * 0x3a/0x3b setup: don't start a transfer into nothing.
+	 */
+	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
+	if (v == ~0U || !(v & BIT(chan))) {
+		dev_warn(chip->dev, "headphone profile: DSP channel %u not armed (0x%x); not sending\n",
+			 chan, v);
+		ret = -EIO;
+		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
+		goto free_chan;
+	}
 	xfer_stream_run(chip, HPEQ_SD, HPEQ_TAG, bdl_dma);
 	/*
 	 * Wait for our channel's start bit to come on, then to go off. 4 KB
@@ -1258,20 +1671,48 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	 * the channel: the transfer was cut and the DSP's DMA stalled (all
 	 * audio silent until a power-off, 2026-11-07).
 	 */
+	/*
+	 * Only VALID reads count (the register uses bits 0-11; 0x9000f
+	 * after a verb timeout was taken as "done" after 2 polls, the
+	 * stream was stopped mid-transfer and a half-written EQ went on:
+	 * right channel silent, left metallic, 2026-11-07 14:51:11).
+	 * Windows always saw the bit on for 5-9 polls (~12 ms).
+	 */
 	seen = 0;
 	for (t = 0; t < 300; t++) {
-		creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
+		if (creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v) < 0 ||
+		    (v & ~0xfffU)) {
+			bad++;
+			usleep_range(500, 1000);
+			continue;
+		}
 		if (t == 0)
 			v0 = v;
 		if (v & BIT(chan))
 			seen++;
-		else if (seen)
+		else if (seen >= 3)
 			break;
 		usleep_range(500, 1000);
 	}
-	xfer_stream_stop(chip, HPEQ_SD, HPEQ_TAG);
-	if (!seen || (v & BIT(chan)))
+	stopped = xfer_stream_stop(chip, HPEQ_SD, HPEQ_TAG);
+	if (seen < 3 || (v & BIT(chan)) || (v & ~0xfffU))
 		ret = -ETIMEDOUT;
+	/* any verb timeout during the upload: don't trust it, keep the EQ off */
+	if (!ret && chip->corb_timeouts != to0) {
+		dev_warn(chip->dev, "headphone profile: %u verb timeout(s) during the upload; not using it\n",
+			 chip->corb_timeouts - to0);
+		ret = -EIO;
+	}
+	/* read back the first and last word in Y memory (log only for now:
+	 * tells whether the image landed; chip address = Y base + 4 * word) */
+	if (!ret) {
+		creative_dsp_chipio_read(chip, 0x40000 + 4 * addr, &yfirst);
+		creative_dsp_chipio_read(chip, 0x40000 + 4 * (addr + HPEQ_WORDS - 1), &ylast);
+		dev_info(chip->dev, "headphone profile: Y read-back first 0x%08x (image 0x%08x), last 0x%08x (image 0x%08x)%s\n",
+			 yfirst, le32_to_cpu(((__le32 *)seg->data)[0]),
+			 ylast, le32_to_cpu(((__le32 *)seg->data)[HPEQ_WORDS - 1]),
+			 bad ? " (some status reads were bad)" : "");
+	}
 	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u)\n",
 		 name, HPEQ_WORDS, addr, chan, port,
 		 ret ? (seen ? "FAILED (still running)" : "FAILED (channel never started)") : "done",
@@ -1286,10 +1727,16 @@ unbind:
 inval:
 	creative_dsp_chipio_addr_invalidate();
 out:
-	if (buf)
-		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
-	if (bdl)
-		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
+	if (!stopped) {
+		/* the card may still read/write them: never free (small leak) */
+		dev_err(chip->dev, "headphone profile: transfer stream didn't stop; keeping its buffers\n");
+		ret = ret ?: -EIO;
+	} else {
+		if (buf)
+			dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
+		if (bdl)
+			dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
+	}
 	release_firmware(fw);
 	return ret;
 }
@@ -1388,7 +1835,9 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			if (scp_get_u32(chip, MASTERCONTROL, states[i].req,
 					&v) == 0 && v == states[i].val)
 				break;
-			msleep(20);
+			/* Windows: the first GET reads 1, the next ~110 ms
+			 * later reads 3 (15 of 15 captures) */
+			msleep(i == 0 ? 105 : 20);
 		}
 		dev_info(chip->dev,
 			 "boot handshake: 0x%02x=%u set ret=%d, DSP reports 0x%x after %u polls%s\n",
@@ -2181,7 +2630,17 @@ static int dspload_image(struct creative_chip *chip,
 	/* the MASTERCONTROL boot handshake straight after the run, as Windows */
 	{
 		int r = dsp_set_run_state(chip);
-		int hs = creative_dsp_boot_handshake(chip);
+		int hs;
+
+		/*
+		 * Windows waits 250 ms after starting the DSP before the first
+		 * handshake message (decompile FUN_0002859c:
+		 * KeDelayExecutionThread -2500000 = 250 ms; 251-266 ms of
+		 * silence in all 15 cold-boot captures). We sent it at once,
+		 * and the first bring-up failed on 5 of 13 boots (2026-11-07).
+		 */
+		msleep(250);
+		hs = creative_dsp_boot_handshake(chip);
 
 		chip->hs_done = 1;
 		chip->hs_ok = !hs;
@@ -2399,7 +2858,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 		}
 	}
 
-	ret = request_firmware(&fw, DESKTOP_EFX_FILE, chip->dev);
+	ret = ae9_request_fw(chip, &fw, DESKTOP_EFX_FILE, DESKTOP_EFX_SIZE);
 	if (ret < 0) {
 		dev_err(chip->dev, "firmware %s not found: %d\n",
 			DESKTOP_EFX_FILE, ret);
@@ -2535,7 +2994,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 		const struct firmware *fw2;
 		const struct ae9_dsp_image_seg *fls2;
 
-		if (request_firmware(&fw2, DESKTOP_EFX_FILE, chip->dev) == 0) {
+		if (ae9_request_fw(chip, &fw2, DESKTOP_EFX_FILE, DESKTOP_EFX_SIZE) == 0) {
 			fls2 = (const struct ae9_dsp_image_seg *)fw2->data;
 			if (!fls_image_check(chip, fw2, DESKTOP_EFX_FILE)) {
 				unsigned long t2;

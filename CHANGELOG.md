@@ -3,6 +3,45 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.10.1 (2026-11-07)
+Boots right every time, headphone profiles that hold up, and the head unit's rear RCA input. 🔌
+Pairs with [SbAe9-SBC v0.13.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.0](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fix: the DSP failed its first start on about half of cold boots**
+  (packaged installs). Loaded only by udev, the driver's firmware download
+  overlapped the rest of startup (network, VMs) and the DSP never answered;
+  the retry usually recovered, sometimes with no audio. Every package now
+  also installs `/usr/lib/modules-load.d/creative-ae9.conf`, so the driver
+  loads early again: 0 failures in 150 boots that way, against 11 in 26
+  without it. The DSP also gets 250 ms after it starts before the first
+  message, as Windows.
+- **New: "AE-9 Rear RCA In"** (`hw:AE9,3`): the head unit's rear RCA L/R
+  input as its own recording device, 24-bit, 44.1-192 kHz, recording
+  alongside the XLR mic. `config/ae9-rear-rca-in.conf` adds it as a
+  PipeWire source. No level control yet.
+- **Fix: headphone profiles could kill DSP mode** (silence, one dead
+  channel or static until a PSU power-off; Kaiba's report). The DSP's
+  replies are now read exactly as Windows reads them, and every upload is
+  checked before its EQ goes on: the address is asked twice, the DMA
+  channel must be free and armed, the transfer must really finish, and a
+  stalled command anywhere in it keeps the EQ off. A failed upload costs
+  that pick, never the audio. Picks are debounced: scrolling the list
+  uploads only the one you stop on.
+- **Fix: right-channel static after a bit-depth change in DSP mode**: the
+  router chip sometimes kept the old stream format; it's now checked and
+  repaired at every stream start.
+- **"Bass Redirect Sub Boost Switch"** replaces "Bass Redirect Sub Gain
+  Volume": the DSP setting is an on/off subwoofer boost (Creative's
+  SubwooferBoost), not a gain.
+- **DAC Filter "Default"** now also puts the Center/Sub and Rear DAC back
+  to fast rolloff (it stayed on slow after picking Slow).
+- **Firmware moves to `/lib/firmware/creative-ae9/`** (`/etc/firmware/...`
+  on Fedora Atomic): `ctefx-desktop.bin` in the firmware root is also the
+  AE-5/AE-7 file from linux-firmware (clashed on Arch). Run `sudo
+  ae9-get-firmware ...` again to install there; until then the old location
+  still works, and a root file that isn't the AE-9 image is refused with a
+  clear message instead of loaded.
+
 ## 0.10.0 (2026-11-07)
 Sound Blaster Command's speaker setup and headphone profiles. 🎧
 Pairs with [SbAe9-SBC v0.12.0](https://github.com/3xHelix/SbAe9-SBC) (Speaker Setup tab, Headphone Profile picker).

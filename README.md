@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-07, v0.10.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-07, v0.10.1):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -35,8 +35,8 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.10.0 pairs with SbAe9-SBC v0.12.0 (Speaker Setup tab,
-> Headphone Profile picker, DSP/Direct switch); older SbC versions still
+> Driver v0.10.1 pairs with SbAe9-SBC v0.13.0 (rear RCA input, Speaker
+> Setup tab, Headphone Profile picker, DSP/Direct switch); older SbC versions still
 > work, with fewer controls.
 
 ## Hardware / Environment
@@ -99,6 +99,74 @@ Packages: `creative-ae9` (boot setup, PipeWire profiles, `ae9-get-firmware`,
 `ae9-full-dump`) pulls in `akmod-creative-ae9` (the module).
 `sudo dnf remove creative-ae9 akmod-creative-ae9` takes it all out.
 
+### Ubuntu, Linux Mint, Pop!_OS: from the PPA (since 0.10.0)
+
+The Launchpad PPA `ppa:3xhelix/sbae9` has the DKMS package for Ubuntu
+24.04 LTS, 26.04 LTS and 26.10, and so for Linux Mint 22, Pop!_OS 24.04
+and the other Ubuntu-based desktops. New versions arrive with your normal
+updates. Tested by installing from the PPA on all three (kernels 6.8, 7.0
+and 7.3).
+
+```sh
+sudo add-apt-repository ppa:3xhelix/sbae9
+sudo apt install creative-ae9-dkms innoextract
+```
+
+Then the firmware (step 1) and a full power-off. `dkms status` shows the
+module per kernel.
+
+### Debian (and Ubuntu without the PPA): the .deb (since 0.10.0)
+
+Each release has `creative-ae9-dkms_<version>-1_all.deb` on its
+[GitHub release page](https://github.com/3xHelix/SbAe9-Drv/releases):
+the driver source for DKMS (rebuilt for every kernel you install, headers
+needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
+`ae9-full-dump`. Tested on Debian 13 (kernel 6.12) and Ubuntu 24.04
+(kernel 6.8) in containers.
+
+```sh
+sudo apt install ./creative-ae9-dkms_0.10.1-1_all.deb
+sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
+```
+
+Then the firmware (step 1) and a full power-off. `dkms status` shows the
+module per kernel; `sudo apt remove creative-ae9-dkms` takes it all out.
+Secure Boot: DKMS signs the module with a machine key. Ubuntu asks you to
+enroll it during the install (a password, then the blue MOK screen at the
+next boot); on Debian enroll it once with
+`sudo mokutil --import /var/lib/dkms/mok.pub` and reboot.
+`packaging/deb/build-deb.sh` builds the package from a source tree or
+release tarball.
+
+### openSUSE, RHEL / AlmaLinux / Rocky 10: from COPR (since 0.10.0)
+
+The same COPR repository as Fedora also builds the DKMS package for
+openSUSE Tumbleweed, openSUSE Leap 16 and RHEL / AlmaLinux / Rocky 10
+(with EPEL), so new versions arrive with your normal system updates. DKMS
+rebuilds the module for every kernel with headers. Tested on Tumbleweed
+(kernel 7.3) and AlmaLinux 10 (kernel 6.12).
+
+```sh
+# openSUSE Tumbleweed (Leap 16: write opensuse-leap-16.0 in both places of the URL)
+sudo zypper addrepo https://copr.fedorainfracloud.org/coprs/3xhelix/SbAe9-Drv/repo/opensuse-tumbleweed/3xhelix-SbAe9-Drv-opensuse-tumbleweed.repo
+sudo zypper --gpg-auto-import-keys install kernel-default-devel innoextract creative-ae9-dkms
+
+# RHEL / AlmaLinux / Rocky 10
+sudo dnf install epel-release dnf-plugins-core
+sudo dnf copr enable 3xhelix/SbAe9-Drv
+sudo dnf install kernel-devel innoextract creative-ae9-dkms
+```
+
+Then the firmware (step 1) and a full power-off. `dkms status` shows the
+module per kernel; removing `creative-ae9-dkms` takes it all out. Without
+the repository: each release also has
+`creative-ae9-dkms-<version>-1.noarch.rpm` on its
+[release page](https://github.com/3xHelix/SbAe9-Drv/releases)
+(`sudo zypper install --allow-unsigned-rpm ./creative-ae9-dkms-*.rpm` or
+`sudo dnf install ./creative-ae9-dkms-*.rpm`; no updates then).
+`packaging/creative-ae9-dkms.spec` builds it. (Fedora: use the packages
+above; this one conflicts with them.)
+
 ### 1. Firmware (and headphone profiles)
 
 The DSP firmware isn't in the repo or the packages: it's Creative's. The
@@ -130,7 +198,7 @@ By hand, from `CtxHda.sys`:
 ```sh
 python3 extract_firmware.py /path/to/CtxHda.sys ctefx-desktop.bin   # main DSP image
 python3 extract_overlay.py  /path/to/CtxHda.sys ctefx-ae9-overlay.bin
-sudo cp ctefx-desktop.bin ctefx-ae9-overlay.bin /lib/firmware/
+sudo install -Dm644 -t /lib/firmware/creative-ae9 ctefx-desktop.bin ctefx-ae9-overlay.bin
 ```
 
 and the headphone profiles from an unpacked installer (`innoextract
@@ -303,6 +371,14 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     record at the sender's rate (PipeWire runs at 48 kHz unless told
     otherwise). With nothing sending, recording fails at once and the
     kernel log says "no signal on the optical input".
+- Head unit rear RCA input (new in 0.10.1): the RCA L/R jacks on the back
+  of the head unit are their own capture device, `hw:AE9,3` ("AE-9 Rear RCA
+  In"), 24-bit, 44.1 to 192 kHz, recording alongside the XLR mic
+  (`arecord -D hw:AE9,3 -c 2 -r 48000 -f S32_LE rca.wav`). For PipeWire,
+  copy `config/ae9-rear-rca-in.conf` to `~/.config/pipewire/pipewire.conf.d/`
+  and run `systemctl --user restart pipewire`: an "AE-9 Rear RCA In" source
+  appears (never the default input). No level control yet: line-level
+  sources record around -25 dB below full scale.
 - What U Hear (new): records what the card plays, as its own capture
   device, `hw:AE9,2` ("AE-9 What U Hear"), 48 or 96 kHz (96 kHz since
   0.9.5, `wuh_96k`), next to the XLR mic and optical in
@@ -347,7 +423,7 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   Speaker setup (0.10.0; Direct Mode off, SBX on or off): "Bass Redirect
   Switch" sends the bass to the sub (x.1 configs), "Bass Redirect
   Crossover" (50-200 Hz, default 80; Windows' Tower is 80, Desktop 120) and
-  "Bass Redirect Sub Gain Volume" (-12..+12 dB); per speaker (Front L/R,
+  "Bass Redirect Sub Boost Switch" (subwoofer boost, on/off); per speaker (Front L/R,
   Center, Sub, Rear L/R) "Speaker Level ... Volume" (-12..+12 dB) and
   "Speaker Distance ..." (0-500 cm of delay, as Windows' calibration).
   "Headphone Profile" (0.10.0): Sound Blaster Command's 32 headphone curves
@@ -504,6 +580,7 @@ the apps that are playing; look it over before posting.
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 | `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
 | `config/ae9-what-u-hear.conf` | Optional PipeWire source for What U Hear (see "What U Hear") |
+| `config/ae9-rear-rca-in.conf` | Optional PipeWire source for the head unit's rear RCA input (see "Head unit rear RCA input") |
 | `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Head Unit Mic / Aux" |
 
 ## Module parameters
