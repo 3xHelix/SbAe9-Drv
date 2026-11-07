@@ -2266,9 +2266,7 @@ static void ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 		/* DAC 48/07: bits 7:5 filter, bit 0 mute. Keep the user's
 		 * "DAC Filter" choice through every replayed table. */
 		if (cmds[i][0] == 0x48 && cmds[i][1] == 0x07) {
-			if (chip->dac_filter)
-				val = (val & 0x1f) |
-				      (chip->dac_filter == 2 ? 0x20 : 0x00);
+			val = (val & 0x1f) | chip->dac_filter_bits;
 			chip->dac48_07 = val;
 		}
 		ca0113_cmd(chip, cmds[i][0], cmds[i][1], val, settle_us);

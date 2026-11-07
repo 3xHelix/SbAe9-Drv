@@ -218,7 +218,8 @@ struct creative_chip {
 	} xcap[2];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
-	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
+	unsigned int		dac_filter;	/* index into dac_filters[] */
+	u8			dac_filter_bits; /* reg 7 bits 7:5 for that filter */
 	u8			dac48_07;	/* last value written to DAC 48/07 */
 	struct creative_ae9_fx {		/* SBX effects, creative_ae9_fx.c */
 		bool		direct;		/* Windows' Direct Mode (default on) */

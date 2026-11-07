@@ -3064,32 +3064,46 @@ static const struct snd_kcontrol_new mic_level_control = {
 };
 
 /*
- * "DAC Filter": the ES9038's digital filter, as the Creative app sets it
- * (capture 2026-11-03): Fast = DAC 48/07 bits 7:5 = 000 and DAC 49/0e
- * bit 0 = 1; Slow = 001 and bit 0 = 0. "Default" leaves Windows' boot value
- * (48/07 = 0x80). The choice is kept in every later 48/07 write
- * (ca0113_list) and re-applied after a resume.
+ * "DAC Filter": the ES9038Q2M's digital filter.  Register 7 bits 7:5
+ * select it; 0x80 (Apodizing Fast) is Windows' boot filter.  These are
+ * the seven modes from the DarkNikGr driver, which wrote only 48/07 and
+ * preserved the lower bits (mute).  The 0x49/0x0e bit used by the old
+ * three-filter code is left as the stream start set it.
  */
+#define DAC_FILTER_MASK			0xe0
+#define DAC_FILTER_DEFAULT_INDEX	4	/* 0x80, Windows' boot filter */
+
+static const char * const dac_filter_names[] = {
+	"Linear Phase Fast Roll Off",
+	"Linear Phase Slow Roll Off",
+	"Minimum Phase Fast Roll Off",
+	"Minimum Phase Slow Roll Off",
+	"Apodizing Fast Roll Off",
+	"Corrected Minimum Phase Fast Roll Off",
+	"Brick Wall",
+};
+
+static const u8 dac_filter_values[] = {
+	0x00, 0x20, 0x40, 0x60, 0x80, 0xc0, 0xe0,
+};
+
 static void creative_ae9_dac_filter_apply(struct creative_chip *chip)
 {
-	u8 cmds[2][3];
+	u8 cmd[1][3];
 
-	if (!chip->corb_buf || !chip->dsp_done || !chip->dac_filter)
+	if (!chip->corb_buf || !chip->dsp_done)
 		return;
-	cmds[0][0] = 0x48;
-	cmds[0][1] = 0x07;
-	cmds[0][2] = chip->dac48_07;	/* ca0113_list puts the filter in */
-	cmds[1][0] = 0x49;
-	cmds[1][1] = 0x0e;
-	cmds[1][2] = chip->dac_filter == 1 ? 0x01 : 0x00;
-	creative_dsp_ca0113_replay_quiet(chip, (const u8 (*)[3])cmds, 2);
+	cmd[0][0] = 0x48;
+	cmd[0][1] = 0x07;
+	cmd[0][2] = (chip->dac48_07 & ~DAC_FILTER_MASK) |
+		    chip->dac_filter_bits;
+	creative_dsp_ca0113_replay_quiet(chip, (const u8 (*)[3])cmd, 1);
 }
 
 static int dac_filter_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
-	static const char * const names[] = { "Default", "Fast", "Slow" };
-
-	return snd_ctl_enum_info(ui, 1, 3, names);
+	return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(dac_filter_names),
+				 dac_filter_names);
 }
 
 static int dac_filter_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
@@ -3104,20 +3118,13 @@ static int dac_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = uv->value.enumerated.item[0];
-	u8 cmd[1][3] = { { 0x48, 0x07, 0 } };
 
-	if (v > 2 || v == chip->dac_filter)
+	if (v >= ARRAY_SIZE(dac_filter_values))
+		return -EINVAL;
+	if (v == chip->dac_filter)
 		return 0;
-	if (!v) {
-		/* back to Windows' boot filter (bits 7:5 = 100) */
-		chip->dac_filter = 0;
-		cmd[0][2] = (chip->dac48_07 & 0x1f) | 0x80;
-		if (chip->corb_buf && chip->dsp_done)
-			creative_dsp_ca0113_replay_quiet(chip,
-							 (const u8 (*)[3])cmd, 1);
-		return 1;
-	}
 	chip->dac_filter = v;
+	chip->dac_filter_bits = dac_filter_values[v];
 	creative_ae9_dac_filter_apply(chip);
 	return 1;
 }
@@ -3879,6 +3886,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	mutex_init(&chip->scp_mutex);
 	mutex_init(&chip->replay_mutex);
 	mutex_init(&chip->ca0113_mutex);
+	chip->dac_filter = DAC_FILTER_DEFAULT_INDEX;
+	chip->dac_filter_bits = dac_filter_values[DAC_FILTER_DEFAULT_INDEX];
 
 	pci_set_drvdata(pdev, chip);
 
