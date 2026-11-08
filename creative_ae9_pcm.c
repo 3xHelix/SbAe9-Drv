@@ -1550,8 +1550,13 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 	pcm->private_free = creative_ae9_xcap_pcm_free;
 	chip->xcap[i].chip = chip;
 	if (x->signal_pin) {
+#ifdef AE9_HAVE_HRTIMER_SETUP	/* Makefile: from the kernel's header */
 		hrtimer_setup(&chip->xcap[i].sil_timer, ae9_sil_tick, CLOCK_MONOTONIC,
 			      HRTIMER_MODE_REL_SOFT);
+#else		/* before 6.13 (Ubuntu 24.04: 6.8) */
+		hrtimer_init(&chip->xcap[i].sil_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+		chip->xcap[i].sil_timer.function = ae9_sil_tick;
+#endif
 		INIT_DELAYED_WORK(&chip->xcap[i].sense_work, ae9_sense_work);
 	}
 	strscpy(pcm->name, x->name, sizeof(pcm->name));

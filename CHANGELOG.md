@@ -3,6 +3,17 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.11.1 (2026-11-08)
+Builds everywhere again. 🔧
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **Fix: 0.11.0 didn't build on kernels before 6.13** (Ubuntu 24.04's 6.8;
+  DKMS installs failed): optical in's timer used a kernel call that's new
+  in 6.13. The build now checks the kernel's own headers and uses the call
+  it has (RHEL 10's 6.12 has the new one backported). Tested against 6.8,
+  6.12 and 7.2. No other changes; Fedora and Arch users on 0.11.0 don't
+  need it.
+
 ## 0.11.0 (2026-11-08)
 Safer headphone profiles, a DSP that stays in step, seven DAC filters and
 inputs that just show up. 🎛️

@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.11.0
+Version:        0.11.1
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,8 @@ done
 %{?akmod_install}
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1
+- Driver 0.11.1: builds on kernels before 6.13 again (Ubuntu 24.04, EPEL 10)
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1
 - Driver 0.11.0: safe headphone-profile uploads, EQ headroom, output switch
   fix in DSP mode, 7 DAC filters, optical in without a signal, What U Hear /

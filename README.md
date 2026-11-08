@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-08, v0.11.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-08, v0.11.1):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -36,7 +36,7 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.11.0 pairs with SbAe9-SBC v0.14.0 (the seven DAC filters,
+> Driver v0.11.x pairs with SbAe9-SBC v0.14.0 (the seven DAC filters,
 > optical in / What U Hear / rear RCA as the driver's own sources, a What U
 > Hear rate picker) and SbAe9-AudioMon v0.4.1; older SbC versions still
 > work, with fewer controls.
@@ -127,7 +127,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.11.0-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.11.1-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 

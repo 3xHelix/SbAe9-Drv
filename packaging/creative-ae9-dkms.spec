@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.11.0
+Version:        0.11.1
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -107,6 +107,8 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1
+- Driver 0.11.1: builds on kernels before 6.13 again (Ubuntu 24.04, EPEL 10)
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1
 - Driver 0.11.0: safe headphone-profile uploads, EQ headroom, output switch
   fix in DSP mode, 7 DAC filters, optical in without a signal, What U Hear /
