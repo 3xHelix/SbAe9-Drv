@@ -3,6 +3,22 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.11.3 (2026-11-08)
+One less way for the DSP to stop. 🛡️
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **Fix: a bad chip read could be written into the DSP's control
+  register**. When the DSP's command queue is full (and once at every
+  start), the driver reads the DSP's control register and, if the DSP
+  looks halted, writes it back to restart it. Reads of the card's chip
+  come back wrong now and then while audio plays (0.3-2.7% on two cards,
+  thanks DarkNik for the data), and one bad read was enough to write
+  garbage into the DSP's control: a likely cause of a DSP that stops until
+  a power-off. Now three reads must agree before anything is written; if
+  they don't, the register is left alone and the log says so.
+- `ae9-dsp-snapshot` marks registers that change only because of a bad
+  read as "one-off (likely a bad read)" instead of "moving".
+
 ## 0.11.2 (2026-11-08)
 More tools for your reports. 🧰
 Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.

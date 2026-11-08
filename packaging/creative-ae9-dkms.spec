@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.11.2
+Version:        0.11.3
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -111,6 +111,8 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.3-1
+- Driver 0.11.3: no DSP control write from a bad read; snapshot marks bad reads
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.2-1
 - Driver 0.11.2: ae9-dsp-snapshot and ae9-read-stress commands for reports
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1

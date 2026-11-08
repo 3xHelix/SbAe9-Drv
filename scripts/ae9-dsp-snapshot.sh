@@ -62,13 +62,37 @@ done
 echo "# AE-9 DSP snapshot $(date -Is), kernel $(uname -r), driver $(cat /sys/module/snd_hda_codec_creative_ae9/version 2>/dev/null)"
 echo "# $(dmesg | grep -oE 'Direct Mode (on|off), SBX (on|off)' | tail -1)"
 echo "# streams running: ${playing:-none}; router table: $([ "$router" = 1 ] && echo included || echo skipped)"
-moving=0
+# A register where one sample in the middle differs and all the others
+# agree (A A B A), or whose only other values are 0x0/0x1, is most likely a
+# bad read (chip reads glitch while audio plays, 0.3-2.7% on two cards), not
+# movement: marked "one-off". A change at the first or last sample (A A A B)
+# can be a slow counter stepping, so that counts as moving.
+moving=0; oneoff=0
 for a in "${addrs[@]}"; do
-	line="$a"; first=${v[$a,1]}; changed=0
+	line="$a"
+	declare -A cnt=()
 	for s in $(seq 1 $SAMPLES); do
 		line="$line ${v[$a,$s]}"
-		[ "${v[$a,$s]}" != "$first" ] && changed=1
+		cnt[${v[$a,$s]}]=$(( ${cnt[${v[$a,$s]}]:-0} + 1 ))
 	done
-	if [ $changed = 1 ]; then echo "$line  <- moving"; moving=$((moving + 1)); else echo "$line"; fi
+	top=0; mode=
+	for k in "${!cnt[@]}"; do
+		# on a tie, the steady value is the one that isn't 0x0/0x1
+		if [ ${cnt[$k]} -gt $top ] || { [ ${cnt[$k]} -eq $top ] && { [ "$mode" = 0x0 ] || [ "$mode" = 0x1 ]; }; }; then
+			top=${cnt[$k]}; mode=$k
+		fi
+	done
+	# the bad reads are mostly 0 or 1: deviations that are only 0x0/0x1
+	# from a steady value count as bad reads too (they come in bursts)
+	only01=1; for k in "${!cnt[@]}"; do [ "$k" = "$mode" ] || [ "$k" = 0x0 ] || [ "$k" = 0x1 ] || only01=0; done
+	if [ ${#cnt[@]} -eq 1 ]; then
+		echo "$line"
+	elif [ $SAMPLES -ge 3 ] && [ $top -ge 2 ] && { { [ ${#cnt[@]} -eq 2 ] && [ $top -eq $((SAMPLES - 1)) ] && \
+	     [ "${v[$a,1]}" = "$mode" ] && [ "${v[$a,$SAMPLES]}" = "$mode" ]; } || [ $only01 = 1 ]; }; then
+		echo "$line  <- one-off (likely a bad read)"; oneoff=$((oneoff + 1))
+	else
+		echo "$line  <- moving"; moving=$((moving + 1))
+	fi
+	unset cnt
 done
-echo "# $moving of ${#addrs[@]} registers moved over $SAMPLES samples"
+echo "# $moving of ${#addrs[@]} registers moved over $SAMPLES samples; $oneoff one-off (likely bad reads)"

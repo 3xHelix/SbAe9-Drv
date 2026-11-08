@@ -2161,15 +2161,46 @@ static int dsp_dma_stop(struct creative_chip *chip, unsigned int dma_chan)
 			1 << (dma_chan + DSPDMAC_CHNLSTART_DIS_LOBIT));
 }
 
+/*
+ * DBGCNTL read for a write-back: three reads must agree on the control
+ * bits (EXEC/SS/STATE, the low 16; the top half is a moving counter).
+ * ChipIO reads glitch while audio plays (0.3-2.7% on two cards, 2026-11-08:
+ * 0, 1, a neighbouring router entry, a stream format word). One bad read
+ * here was written straight back into the DSP's control register: 0x1e1c1
+ * (router entry 0x190034) reads as halt state 8 and became a 0x1e149
+ * write (note 58; suspect for the 2026-11-07 22:25 DSP halt). A real
+ * halt reads the same every time.
+ */
+static int dsp_dbgcntl_read_stable(struct creative_chip *chip, unsigned int *reg)
+{
+	unsigned int v[3] = { ~0U, ~0U, ~0U }, tries, i;
+
+	for (tries = 0; tries < 4; tries++) {
+		for (i = 0; i < 3; i++)
+			if (creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &v[i]) < 0)
+				break;
+		if (i == 3 && !((v[0] ^ v[1]) & 0xffff) && !((v[1] ^ v[2]) & 0xffff)) {
+			*reg = v[2];
+			return 0;
+		}
+	}
+	dev_warn_ratelimited(chip->dev, "DBGCNTL reads disagree (0x%08x 0x%08x 0x%08x): DSP run state left alone\n",
+			     v[0], v[1], v[2]);
+	return -EIO;
+}
+
 static int dsp_set_run_state(struct creative_chip *chip)
 {
 	unsigned int reg, halt_state;
 	int err;
 
-	err = creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &reg);
+	err = dsp_dbgcntl_read_stable(chip, &reg);
 	if (err < 0)
 		return err;
 	halt_state = (reg & DSP_DBGCNTL_STATE_MASK) >> DSP_DBGCNTL_STATE_LOBIT;
+	if (halt_state != 0)
+		dev_info(chip->dev, "DSP halt state %u (DBGCNTL 0x%08x): setting it running\n",
+			 halt_state, reg);
 	if (halt_state != 0) {
 		reg &= ~((halt_state << DSP_DBGCNTL_SS_LOBIT) &
 			 DSP_DBGCNTL_SS_MASK);
