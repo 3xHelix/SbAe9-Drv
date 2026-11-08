@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.11.1
+Version:        0.11.2
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -34,7 +34,7 @@ versions (IDT and ASMedia bridge).
 DKMS builds the module for every installed kernel that has its headers
 (openSUSE: kernel-default-devel; RHEL family: kernel-devel). Also installs
 the boot setup that hands the card to this driver, the PipeWire profile set,
-ae9-get-firmware and ae9-full-dump. The DSP firmware is Creative's and not
+ae9-get-firmware, ae9-full-dump, ae9-dsp-snapshot and ae9-read-stress. The DSP firmware is Creative's and not
 included: run ae9-get-firmware with Creative's AE-9 installer afterwards.
 
 %prep
@@ -56,6 +56,8 @@ install -D -m 644 config/creative-ae9.conf %{buildroot}/usr/share/alsa-card-prof
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}/usr/bin/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
+install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}/usr/bin/ae9-dsp-snapshot
+install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}/usr/bin/ae9-read-stress
 install -d %{buildroot}/usr/share/creative-ae9/examples
 install -m 644 extract_firmware.py extract_overlay.py extract_hpeq.py %{buildroot}/usr/share/creative-ae9/
 for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do
@@ -104,9 +106,13 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 /usr/bin/ae9-get-firmware
 /usr/bin/ae9-full-dump
+/usr/bin/ae9-dsp-snapshot
+/usr/bin/ae9-read-stress
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.2-1
+- Driver 0.11.2: ae9-dsp-snapshot and ae9-read-stress commands for reports
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1
 - Driver 0.11.1: builds on kernels before 6.13 again (Ubuntu 24.04, EPEL 10)
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1

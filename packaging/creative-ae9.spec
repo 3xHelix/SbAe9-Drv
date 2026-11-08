@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.11.1
+Version:        0.11.2
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -34,6 +34,7 @@ Everything around the AE-9 kernel module except the module itself:
   from your download of Creative's installer and installs them (also on
   read-only Fedora Atomic systems)
 - ae9-full-dump: the state dump for bug reports
+- ae9-dsp-snapshot, ae9-read-stress: DSP and chip-read checks for reports
 
 The firmware itself is Creative's and not included.
 
@@ -52,6 +53,8 @@ install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-pro
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
+install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}%{_bindir}/ae9-dsp-snapshot
+install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}%{_bindir}/ae9-read-stress
 install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
 install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
 install -D -m 644 extract_hpeq.py %{buildroot}%{_datadir}/%{name}/extract_hpeq.py
@@ -86,9 +89,13 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 %{_bindir}/ae9-get-firmware
 %{_bindir}/ae9-full-dump
+%{_bindir}/ae9-dsp-snapshot
+%{_bindir}/ae9-read-stress
 %{_datadir}/%{name}/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.2-1
+- Driver 0.11.2: ae9-dsp-snapshot and ae9-read-stress commands for reports
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1
 - Driver 0.11.1: builds on kernels before 6.13 again (Ubuntu 24.04, EPEL 10)
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1

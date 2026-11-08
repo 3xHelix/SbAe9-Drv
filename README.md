@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-08, v0.11.1):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-08, v0.11.2):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -127,7 +127,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.11.1-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.11.2-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -509,18 +509,33 @@ sudo systemctl start alsa-state; systemctl --user start pipewire.socket pipewire
 
 ### Reporting a problem
 
-`sudo scripts/ae9-full-dump.sh` saves everything the driver can read about
-the card (streams, controls, PipeWire, registers, the DSP's router, the
+`sudo ae9-full-dump` (from a source checkout: `sudo
+scripts/ae9-full-dump.sh`) saves everything the driver can read about the
+card (streams, controls, PipeWire, registers, the DSP's router, the
 driver's recent log) to `ae9-dump-<time>.txt` in the current directory,
-without changing anything. Take one while the problem is happening (and one
-when it's fine, if you can) and attach them to your report. It only names
-the apps that are playing; look it over before posting.
+without changing anything. Stop all audio first: while something plays it
+skips the chip readings, which can freeze the audio during playback. Take
+one while the problem is happening (and one when it's fine, if you can)
+and attach them to your report. It only names the apps that are playing;
+look it over before posting.
+
+Two more tools for volunteers (packaged since 0.11.2, read-only):
+
+- `sudo ae9-dsp-snapshot > snap.txt` samples the DSP's control and DMA
+  registers a few times and marks the ones that move: a working DSP's do,
+  a stuck one's may not. Most useful with music playing in DSP mode
+  (Direct Mode off): one on a good boot, one while the audio is broken,
+  before you power off.
+- `sudo ae9-read-stress > stress.txt` reads one chip register 300 times
+  and counts the answers: one value means clean reads, several mean some
+  came back wrong on your card.
+
+Both refuse to run while audio plays unless you add `--playing`: reading
+the card's chip during playback can freeze the audio until a full power-off
+(PSU switch; a reboot isn't enough). Only add it if that's OK.
 
 ### Known issues
 
-- Optical in: if the S/PDIF signal stops in the middle of a recording,
-  the recording stalls (the card sends nothing without a signal) until
-  the app gives up; start it again once the source is back.
 - Unloading and reloading the driver several times in a row can stall the
   DSP ("tail replay done: ... N failed", DBGCNTL 0x00003400 instead of
   0x004d0000): playback works but recording is dead (arecord EIO), and a

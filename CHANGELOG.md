@@ -3,6 +3,22 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.11.2 (2026-11-08)
+More tools for your reports. 🧰
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **New commands: `ae9-dsp-snapshot` and `ae9-read-stress`**, installed by
+  every package next to `ae9-full-dump`. The snapshot shows which of the
+  DSP's registers move (a working DSP's do, a stuck one's may not); the
+  stress test reads one chip register 300 times and counts wrong answers.
+  Both only read, and both refuse to run while audio plays unless you add
+  `--playing`: reading the chip during playback can freeze the audio until
+  a full power-off. With `--playing` the snapshot also skips the router
+  table. See "Reporting a problem" in the README.
+- `ae9-full-dump` is the command to use for dumps (the README said
+  `scripts/ae9-full-dump.sh`); stop audio first for the full picture.
+- No driver changes since 0.11.1.
+
 ## 0.11.1 (2026-11-08)
 Builds everywhere again. 🔧
 Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
