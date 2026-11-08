@@ -1497,7 +1497,7 @@ MODULE_PARM_DESC(src_reclock, "44.1/88.2 kHz: set the I2S to its 48 kHz clocks b
 /* 44.1/88.2 kHz: send Windows' extra DAC commands (see below). */
 static bool dac_441 = true;
 module_param(dac_441, bool, 0644);
-MODULE_PARM_DESC(dac_441, "44.1/88.2 kHz: send Windows' DAC commands 48/01 = 0xc1, 48/0b = 0x00, 0x20 (1 = yes, default; 0 = as before)");
+MODULE_PARM_DESC(dac_441, "44.1/88.2 kHz: send Windows' DAC commands 48/01 = 0xc1, 48/0b = 0x20 (1 = yes, default; 0 = as before)");
 
 static bool dac_start_skip = true;
 module_param(dac_start_skip, bool, 0644);
@@ -1549,16 +1549,18 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 				/*
 				 * 44.1/88.2 kHz: Windows sends 48/01 = 0xc1
 				 * (0xc0 for the 48 kHz family) and 48/0b =
-				 * 0x00 then 0x20 before 48/0a, at every such
-				 * start (all captures; 2026-11-05 01:59:56
-				 * and 02:00:18). Without them our 44.1 kHz
-				 * played garbled or silent.
+				 * 0x20 before 48/0a, at every such start
+				 * (all captures; 2026-11-05 01:59:56 and
+				 * 02:00:18). Without them our 44.1 kHz
+				 * played garbled or silent. Windows READS
+				 * 48/0b first (0x20c = 0x800003); that read
+				 * was decoded as "48/0b = 0x00" and sent as
+				 * a write until 2026-11-08 (25 of 25
+				 * captures: never a 0x00 write).
 				 */
 				if (fam441) {
-					static const u8 b0[3] = { 0x48, 0x0b, 0x00 };
 					static const u8 b20[3] = { 0x48, 0x0b, 0x20 };
 
-					memcpy(cmds[n++], b0, 3);
 					memcpy(cmds[n++], b20, 3);
 					c = cmds[n];
 					memcpy(c, ae9_cold_ca0113_pcm[i], 3);
@@ -1806,10 +1808,76 @@ static unsigned int warm_reset;
 module_param(warm_reset, uint, 0644);
 MODULE_PARM_DESC(warm_reset, "Windows' warm-DSP reset before download: 0=never (default), 1=if DSP reads dead, 2=always");
 
+/*
+ * Windows' two start-up checks, logged only (no behaviour change yet;
+ * memory windows-bringup-branches, notes 42/42v). The cold table holds
+ * Windows' own reads, so their answers are kept as the replay goes
+ * (review B2, note 56a: no extra verbs): (A) codec 1 AFG power state,
+ * F05 at index 384, before the AFG resets at 395/396; Windows wakes it
+ * and waits 2 s when the set state (bits 3:0) isn't D0. (B) 7 router
+ * XRAM bytes read at 776-794 (0x18c6 + idx * 0xd); bit 2 set in any ->
+ * Windows' recovery power cycle.
+ */
+#define AE9_BOOTCHK_F05		0x101f0500
+#define AE9_BOOTCHK_XRAM_N	7
+
+struct ae9_bootchk {
+	u32 f05;
+	bool f05_seen;
+	u16 addr;		/* XRAM address set by the 0x1157 0d/0e verbs */
+	int xram[AE9_BOOTCHK_XRAM_N];
+	unsigned int n;
+};
+
+static void ae9_bootchk_note(struct ae9_bootchk *c, u32 verb, u32 resp, int ret)
+{
+	static const u16 xram[AE9_BOOTCHK_XRAM_N] = {
+		0x18d3, 0x18e0, 0x18ed, 0x1914, 0x192e, 0x1948, 0x1955 };
+	unsigned int i;
+
+	if (verb == AE9_BOOTCHK_F05 && !c->f05_seen) {
+		c->f05 = ret < 0 ? ~0U : resp;
+		c->f05_seen = true;
+	} else if ((verb & 0xffffff00) == 0x11570d00) {
+		c->addr = (c->addr & 0xff00) | (verb & 0xff);
+	} else if ((verb & 0xffffff00) == 0x11570e00) {
+		c->addr = (c->addr & 0x00ff) | (verb & 0xff) << 8;
+	} else if (verb == 0x115f0700) {
+		for (i = 0; i < AE9_BOOTCHK_XRAM_N; i++)
+			if (c->addr == xram[i] && c->xram[i] == -2) {
+				c->xram[i] = ret < 0 ? -1 : (int)(resp & 0xff);
+				c->n++;
+			}
+	}
+}
+
+static void ae9_bootchk_log(struct creative_chip *chip, const struct ae9_bootchk *c)
+{
+	char buf[AE9_BOOTCHK_XRAM_N * 4 + 1];
+	unsigned int i, n = 0;
+	bool recover = false, unread = false;
+
+	for (i = 0; i < AE9_BOOTCHK_XRAM_N; i++) {
+		int v = c->xram[i];
+
+		if (v < 0)
+			unread = true;
+		else if (v & 4)
+			recover = true;
+		n += scnprintf(buf + n, sizeof(buf) - n, v < 0 ? " ??" : " %02x", v);
+	}
+	dev_info(chip->dev, "Windows' boot checks: codec 1 power 0x%x (%s), router XRAM%s (%s)\n",
+		 c->f05, !c->f05_seen || c->f05 == ~0U ? "unread" :
+		 (c->f05 & 0xf) ? "not D0: Windows wakes it + 2 s" : "D0",
+		 buf, recover ? "bit 2 set: Windows runs its recovery cycle" :
+		      unread ? "some unread" : "no recovery");
+}
+
 /* Replay the cold-boot pre-download verbs; via CORB once it is running. */
 static void creative_ae9_replay_cold(struct creative_chip *chip)
 {
 	unsigned int errs = 0;
+	struct ae9_bootchk chk = { .f05 = ~0U, .xram = { -2, -2, -2, -2, -2, -2, -2 } };
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(ae9_cold_prefw); i++) {
@@ -1838,10 +1906,12 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 
 		if (ret < 0)
 			errs++;
+		ae9_bootchk_note(&chk, ae9_cold_prefw[i], resp, ret);
 	}
 	creative_dsp_chipio_addr_invalidate();
 	dev_info(chip->dev, "cold_prefw: replayed %zu pre-download verbs (%u errors)\n",
 		 ARRAY_SIZE(ae9_cold_prefw), errs);
+	ae9_bootchk_log(chip, &chk);
 }
 
 /* Replay both codecs' captured init verbs (codec 2 first, as Windows). */
@@ -3195,32 +3265,59 @@ static const struct snd_kcontrol_new mic_level_control = {
 };
 
 /*
- * "DAC Filter": the ES9038's digital filter, as the Creative app sets it
- * (capture 2026-11-03): Fast = DAC 48/07 bits 7:5 = 000 and DAC 49/0e
- * bit 0 = 1; Slow = 001 and bit 0 = 0. "Default" leaves Windows' boot value
- * (48/07 = 0x80). The choice is kept in every later 48/07 write
- * (ca0113_list) and re-applied after a resume.
+ * "DAC Filter": the ES9038Q2M's digital filter.  Register 7 bits 7:5
+ * select it; 0x80 (Apodizing Fast) is Windows' boot filter.  The seven
+ * modes from the DarkNikGr driver (PR #2), with Creative's names. Each pick also sets the second DAC (SABRE9006A)
+ * register 14 "FIR Rolloff" (0x49/0x0e) bit 0: 0 only for Slow Roll Off,
+ * 1 (its power-on value) for the rest. Verified in a Windows capture of
+ * all seven, 2026-11-07 (capture 6, section 14; notes 33/33v): per click
+ * Windows reads and writes 48/07, then reads and writes 49/0e.
  */
+#define DAC_FILTER_MASK			0xe0
+/*
+ * Item 0 is the default, then the Creative app's order. The old control
+ * was Default/Fast/Slow; alsactl restores a saved name that no longer
+ * exists as item 0 (seen 2026-11-08: "Default" came back as item 0), so
+ * item 0 must be Windows' filter.
+ */
+#define DAC_FILTER_DEFAULT_INDEX	0	/* 0x80, Windows' boot filter */
+
+static const char * const dac_filter_names[] = {
+	"Apodizing Fast Roll Off",
+	"Fast Roll Off",
+	"Slow Roll Off",
+	"Fast Roll Off - Minimum Phase",
+	"Slow Roll Off - Minimum Phase",
+	"Hybrid Fast Roll Off",
+	"Brick Wall",
+};
+
+static const u8 dac_filter_values[] = {
+	0x80, 0x00, 0x20, 0x40, 0x60, 0xc0, 0xe0,
+};
+
+#define DAC_FILTER_SLOW_BITS		0x20	/* the one with 49/0e = 0 */
+
 static void creative_ae9_dac_filter_apply(struct creative_chip *chip)
 {
-	u8 cmds[2][3];
+	u8 cmd[2][3];
 
-	if (!chip->corb_buf || !chip->dsp_done || !chip->dac_filter)
+	if (!chip->corb_buf || !chip->dsp_done)
 		return;
-	cmds[0][0] = 0x48;
-	cmds[0][1] = 0x07;
-	cmds[0][2] = chip->dac48_07;	/* ca0113_list puts the filter in */
-	cmds[1][0] = 0x49;
-	cmds[1][1] = 0x0e;
-	cmds[1][2] = chip->dac_filter == 1 ? 0x01 : 0x00;
-	creative_dsp_ca0113_replay_quiet(chip, (const u8 (*)[3])cmds, 2);
+	cmd[0][0] = 0x48;
+	cmd[0][1] = 0x07;
+	cmd[0][2] = (chip->dac48_07 & ~DAC_FILTER_MASK) |
+		    chip->dac_filter_bits;
+	cmd[1][0] = 0x49;
+	cmd[1][1] = 0x0e;
+	cmd[1][2] = chip->dac_filter_bits == DAC_FILTER_SLOW_BITS ? 0x00 : 0x01;
+	creative_dsp_ca0113_replay_quiet(chip, (const u8 (*)[3])cmd, 2);
 }
 
 static int dac_filter_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
-	static const char * const names[] = { "Default", "Fast", "Slow" };
-
-	return snd_ctl_enum_info(ui, 1, 3, names);
+	return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(dac_filter_names),
+				 dac_filter_names);
 }
 
 static int dac_filter_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
@@ -3235,23 +3332,13 @@ static int dac_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = uv->value.enumerated.item[0];
-	/* 49/0e = SABRE9006A reg 14 "FIR Rolloff", bit 0: 1 fast (its
-	 * power-on default), 0 slow (datasheet p.14) */
-	u8 cmd[2][3] = { { 0x48, 0x07, 0 }, { 0x49, 0x0e, 0x01 } };
 
-	if (v > 2 || v == chip->dac_filter)
+	if (v >= ARRAY_SIZE(dac_filter_values))
+		return -EINVAL;
+	if (v == chip->dac_filter)
 		return 0;
-	if (!v) {
-		/* back to Windows' boot filter (bits 7:5 = 100), and the
-		 * second DAC back to fast (it stayed slow after Slow) */
-		chip->dac_filter = 0;
-		cmd[0][2] = (chip->dac48_07 & 0x1f) | 0x80;
-		if (chip->corb_buf && chip->dsp_done)
-			creative_dsp_ca0113_replay_quiet(chip,
-							 (const u8 (*)[3])cmd, 2);
-		return 1;
-	}
 	chip->dac_filter = v;
+	chip->dac_filter_bits = dac_filter_values[v];
 	creative_ae9_dac_filter_apply(chip);
 	return 1;
 }
@@ -3823,6 +3910,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 				return -ENODEV;
 		}
 
+		creative_ae9_fx_dsp_reset(chip);	/* fresh DSP: upload latch, first-failure log */
 		fret = creative_dsp_load_firmware(chip);
 		if (chip->rings_deferred && !chip->card_gone) {
 			/* the load failed before the stream finished */
@@ -4013,6 +4101,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	mutex_init(&chip->scp_mutex);
 	mutex_init(&chip->replay_mutex);
 	mutex_init(&chip->ca0113_mutex);
+	chip->dac_filter = DAC_FILTER_DEFAULT_INDEX;
+	chip->dac_filter_bits = dac_filter_values[DAC_FILTER_DEFAULT_INDEX];
 
 	pci_set_drvdata(pdev, chip);
 

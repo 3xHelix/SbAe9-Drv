@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.10.1
+Version:        0.11.0
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -53,6 +53,7 @@ install -D -m 644 config/ae9-override.conf %{buildroot}/usr/lib/modprobe.d/ae9-o
 install -D -m 644 config/ae9-omit.conf %{buildroot}/usr/lib/dracut/dracut.conf.d/ae9-omit.conf
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}/usr/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}/usr/bin/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
 install -d %{buildroot}/usr/share/creative-ae9/examples
@@ -98,11 +99,18 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir /usr/share/alsa-card-profile/mixer
 %dir /usr/share/alsa-card-profile/mixer/profile-sets
 /usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+%dir /usr/share/wireplumber
+%dir /usr/share/wireplumber/wireplumber.conf.d
+/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 /usr/bin/ae9-get-firmware
 /usr/bin/ae9-full-dump
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1
+- Driver 0.11.0: safe headphone-profile uploads, EQ headroom, output switch
+  fix in DSP mode, 7 DAC filters, optical in without a signal, What U Hear /
+  Rear RCA In / Optical In as card-profile sources, -36 dB start volume
 * Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.1-1
 - Driver 0.10.1: early module load (modules-load.d), Rear RCA In, reliable
   headphone profiles, firmware in creative-ae9/, Sub Boost switch

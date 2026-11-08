@@ -17,6 +17,7 @@
 // audio path (HDA stream -> DAC node 0x02 -> DSP -> output) actually works.
 //
 
+#include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
@@ -553,7 +554,14 @@ static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 		if (status != VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
 			return 0;
 		if (!kicked) {
-			/* Un-halt the 8051 so it resumes draining the queue */
+			unsigned int dbg = ~0U;
+
+			/* Un-halt the 8051 so it resumes draining the queue.
+			 * Logged: this writes DBGCNTL, a suspect in the one
+			 * Linux DSP halt (2026-11-07 22:25, note 52d). */
+			creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
+			dev_warn_ratelimited(chip->dev, "DSP command queue full (DBGCNTL 0x%08x): kicking the DSP's run state\n",
+					     dbg);
 			dsp_set_run_state(chip);
 			kicked = 1;
 		}
@@ -884,6 +892,23 @@ static int dspio_scp(struct creative_chip *chip, int mod_id, int src_id,
 	mutex_lock(&chip->scp_mutex);
 	ret = dspio_scp_unlocked(chip, mod_id, src_id, req, dir, data, len,
 				 reply, reply_len);
+	/*
+	 * The first failed message since the DSP started, in full: later
+	 * failures are usually knock-on effects, the first one says how it
+	 * began (note 52d: the DSP core halted, the replies were fine).
+	 */
+	if (ret < 0 && ret != -ENODEV && !chip->scp_fail_logged) {
+		unsigned int dbg = ~0U, sts;
+
+		chip->scp_fail_logged = true;
+		sts = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
+		creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
+		creative_dsp_chipio_addr_invalidate();
+		dev_warn(chip->dev, "DSP: first failed message since start: %s mid 0x%02x src 0x%02x req 0x%02x (%u data words) -> %d; DSPIO status 0x%x, DBGCNTL 0x%08x, verb timeouts %u, replies announced %d/read %u\n",
+			 dir == SCP_GET ? "GET" : "SET", mod_id, src_id, req,
+			 len / 4, ret, sts, dbg, chip->corb_timeouts,
+			 atomic_read(&chip->scp_unsol), chip->scp_unsol_done);
+	}
 	mutex_unlock(&chip->scp_mutex);
 	return ret;
 }
@@ -1505,13 +1530,97 @@ out:
  * Copying Windows' 0x40000002 armed channel 2, one of the playback's,
  * while ours was 4: all audio stalled until a power-off (2026-11-07).
  * The caller turns "use speaker EQ" on after.
- * Caller holds replay_mutex; a playback may be running (its DSP DMA
- * channels keep going, so only our channel's bit is waited on).
+ * Caller holds replay_mutex. The caller waits for the streams to stop
+ * first (hp_live_upload=0, fx.c); with it on, a playback may be running
+ * (its DSP DMA channels keep going, so only our channel's bit is waited on).
+ *
+ * Returns 0 when the image is in Y memory (read back), -EREMOTEIO when it
+ * failed after GET 0x3a/0x3b armed (or may have armed) the DSP's DMA: the
+ * DSP's state is unknown then, so the caller stops uploading until the
+ * next bring-up. Any other error: nothing was armed, a retry is safe.
  */
 #define HPEQ_SD		0x120	/* stream descriptor 5, as Windows */
 #define HPEQ_TAG	2
 #define HPEQ_WORDS	1024
 #define HPEQ_3B_YMEM	BIT(30)	/* 0x3b word 1: the target is Y memory */
+
+static int dsp_dma_stop(struct creative_chip *chip, unsigned int dma_chan);
+
+/* Every stream descriptor with RUN set (bit n = SD n; GCAP 0x6400: 4 in,
+ * 6 out). Our own transfer streams count too, but none runs between uploads. */
+u32 creative_ae9_streams_running(struct creative_chip *chip)
+{
+	u32 mask = 0;
+	unsigned int n;
+
+	if (!chip->hda_regs || chip->card_gone)
+		return 0;
+	for (n = 0; n < 10; n++)
+		if (readl(chip->hda_regs + 0x80 + n * 0x20 + AZX_REG_SD_CTL) &
+		    SD_CTL_DMA_START)
+			mask |= BIT(n);
+	return mask;
+}
+
+/*
+ * After a failed upload that got as far as GET 0x3a/0x3b: the channel
+ * may sit armed on our port. Freeing it like that left an armed DSP DMA
+ * channel behind (note 54; Kaiba 2026-11-08: the next uploads didn't land
+ * and the DSP's output stayed chopped until a power-off). Stop it first.
+ */
+static bool hpeq_chnlstart(struct creative_chip *chip, u32 *v)
+{
+	unsigned int k;
+
+	for (k = 0; k < 2; k++) {
+		*v = ~0U;
+		if (creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, v) >= 0 &&
+		    !(*v & ~0xfffU))
+			return true;	/* a valid read: bits 0-11 only */
+	}
+	return false;
+}
+
+/* Returns true when the channel is off (safe to free with its port), false
+ * when it may still be armed: then both stay allocated until the next
+ * bring-up (note 54: a leak beats a live channel on a reused port). */
+static bool hpeq_disarm(struct creative_chip *chip, unsigned int chan)
+{
+	u32 v, after;
+
+	if (!hpeq_chnlstart(chip, &v)) {
+		dev_warn(chip->dev, "headphone profile: DSP channel %u state unreadable; keeping it allocated\n",
+			 chan);
+		return false;
+	}
+	if (!(v & BIT(chan)))
+		return true;
+	dsp_dma_stop(chip, chan);
+	usleep_range(1000, 1500);
+	if (!hpeq_chnlstart(chip, &after) || (after & BIT(chan))) {
+		dev_warn(chip->dev, "headphone profile: DSP DMA channel %u won't stop (CHNLSTART 0x%x -> 0x%x); keeping it allocated\n",
+			 chan, v, after);
+		return false;
+	}
+	dev_warn(chip->dev, "headphone profile: stopped DSP DMA channel %u (CHNLSTART 0x%x -> 0x%x)\n",
+		 chan, v, after);
+	return true;
+}
+
+/*
+ * The port answer is a bit mask of the ports handed out. Every upload
+ * that read back right got two neighbouring ports: 0x300 (Joe), 0x30
+ * (Kaiba), 0x3 (the boot overlay, Windows too). Both single-port
+ * answers (0x10, 0x1; Kaiba 2026-11-08) never landed.
+ */
+static bool hpeq_port_ok(unsigned int port)
+{
+	return port && port != ~0U && hweight32(port) == 2 && (port & (port >> 1));
+}
+
+/* Words checked after an upload. Word 0 isn't one: Apple Earphone's reads
+ * 0 on two cards with the rest in place; it's logged only. */
+static const u16 hpeq_check_words[] = { 1, 147, 293, 439, 585, 731, 877, 1023 };
 
 int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 {
@@ -1523,8 +1632,9 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	u32 addr = ~0U, chan = ~0U, r, v = 0, v0 = 0, a3a[2], a3b[2], zero = 0, busy = ~0U;
 	bool stopped = true;
 	unsigned int to0, bad = 0;
-	u32 yfirst = 0, ylast = 0;
-	unsigned int port, rl, i, t, seen;
+	u32 yfirst = 0, ylast = 0, port2 = ~0U;
+	unsigned int port, rl, i, t, seen, match = 0, unread = 0;
+	bool rb_bad = false, leak = false;
 	int ret;
 
 	if (!chip->dsp_done || chip->card_gone)
@@ -1597,18 +1707,29 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	 * channel and the DSP died. A data word of 0 can't be caught by its
 	 * value, so check it against what the card says is busy.
 	 */
-	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &busy);
+	if (!hpeq_chnlstart(chip, &busy)) {
+		/* can't tell which channels are the playback's (review B9) */
+		dev_err(chip->dev, "headphone profile: DSP channel state unreadable (0x%x); not uploading\n",
+			busy);
+		ret = -EIO;
+		goto unbind;
+	}
 	ret = scp_get_u32(chip, MASTERCONTROL, 0x0a, &chan);
-	if (!ret && chan <= 7 && busy != ~0U && (busy & BIT(chan))) {
+	if (!ret && chan <= 7 && (busy & BIT(chan))) {
 		/* not ours to free: whatever we really got stays allocated
 		 * until the next bring-up (a leak beats freeing the playback's) */
-		dev_err(chip->dev, "headphone profile: DSP gave channel %u, which is busy (0x%x); not uploading\n",
-			chan, busy);
+		chip->hp_leaks++;
+		dev_err(chip->dev, "headphone profile: DSP gave channel %u, which is busy (0x%x); not uploading (%u channel(s) lost so far)\n",
+			chan, busy, chip->hp_leaks);
 		ret = -EBUSY;
 		goto unbind;
 	}
 	if (ret || chan > 7) {
-		dev_err(chip->dev, "headphone profile: no DSP DMA channel (ret %d, 0x%x)\n", ret, chan);
+		/* the DSP may have handed one out that we never saw: it stays
+		 * allocated until the next bring-up (the DSP has 8) */
+		chip->hp_leaks++;
+		dev_err(chip->dev, "headphone profile: no DSP DMA channel (ret %d, 0x%x; %u channel(s) lost so far)\n",
+			ret, chan, chip->hp_leaks);
 		ret = ret ?: -EBUSY;
 		goto unbind;
 	}
@@ -1619,8 +1740,14 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 		msleep(5);
 		port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
 	}
-	if (port == 0 || port == ~0U) {
-		dev_err(chip->dev, "headphone profile: no ChipIO port (0x%x)\n", port);
+	/* twice, and the two must agree: one bad read here sends the DMA to
+	 * the wrong port */
+	if (hpeq_port_ok(port))
+		port2 = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
+	if (!hpeq_port_ok(port) || port2 != port) {
+		dev_err(chip->dev, "headphone profile: ChipIO port 0x%x (again 0x%x) isn't a port pair; not uploading\n",
+			port, port2);
+		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
 		ret = -EBUSY;
 		goto free_chan;
 	}
@@ -1643,10 +1770,13 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 		ret = dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b, sizeof(a3b), &r, &rl);
 	}
 	if (ret) {
-		dev_warn(chip->dev, "headphone profile: the DSP didn't confirm the transfer (0x3a/0x3b, %d); not sending\n",
-			 ret);
-		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
-		goto free_chan;
+		/* the DSP may have taken 0x3a and/or 0x3b anyway (note 54:
+		 * it did, only the reply was lost) */
+		dev_warn(chip->dev, "headphone profile: the DSP didn't confirm the transfer (0x3a/0x3b, %d; chan %u, port 0x%x); not sending\n",
+			 ret, chan, port);
+		leak = !hpeq_disarm(chip, chan);
+		ret = -EREMOTEIO;
+		goto free_port;
 	}
 	/*
 	 * Windows reads the channel's DMA state back before RUN, and the
@@ -1654,13 +1784,12 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	 * 0xf, 0x3, 0x7; notes 20/25). If it isn't, the DSP didn't take the
 	 * 0x3a/0x3b setup: don't start a transfer into nothing.
 	 */
-	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
-	if (v == ~0U || !(v & BIT(chan))) {
-		dev_warn(chip->dev, "headphone profile: DSP channel %u not armed (0x%x); not sending\n",
-			 chan, v);
-		ret = -EIO;
-		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
-		goto free_chan;
+	if (!hpeq_chnlstart(chip, &v) || !(v & BIT(chan))) {
+		dev_warn(chip->dev, "headphone profile: DSP channel %u not armed (0x%x, port 0x%x); not sending\n",
+			 chan, v, port);
+		leak = !hpeq_disarm(chip, chan);
+		ret = -EREMOTEIO;
+		goto free_port;
 	}
 	xfer_stream_run(chip, HPEQ_SD, HPEQ_TAG, bdl_dma);
 	/*
@@ -1703,24 +1832,69 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 			 chip->corb_timeouts - to0);
 		ret = -EIO;
 	}
-	/* read back the first and last word in Y memory (log only for now:
-	 * tells whether the image landed; chip address = Y base + 4 * word) */
+	if (ret)
+		leak = !hpeq_disarm(chip, chan);
+	/*
+	 * Read words back from Y memory (chip address = Y base + 4 * word).
+	 * "done" with the wrong data in place happened 5 times in one session
+	 * (Kaiba, 2026-11-08: all 0, the previous profile's last word, a
+	 * single-port upload) and the EQ went on anyway. Every checked word
+	 * must match; a word that won't read is tried once more.
+	 */
 	if (!ret) {
 		creative_dsp_chipio_read(chip, 0x40000 + 4 * addr, &yfirst);
-		creative_dsp_chipio_read(chip, 0x40000 + 4 * (addr + HPEQ_WORDS - 1), &ylast);
-		dev_info(chip->dev, "headphone profile: Y read-back first 0x%08x (image 0x%08x), last 0x%08x (image 0x%08x)%s\n",
+		for (i = 0; i < ARRAY_SIZE(hpeq_check_words); i++) {
+			unsigned int w = hpeq_check_words[i], k;
+			u32 want = le32_to_cpu(((__le32 *)seg->data)[w]), got = ~want;
+			bool ok = false, wrong = false;
+
+			/* two tries; one good read that differs = wrong (B5) */
+			for (k = 0; k < 2 && !ok; k++) {
+				got = ~want;
+				if (creative_dsp_chipio_read(chip, 0x40000 + 4 * (addr + w), &got) < 0)
+					continue;
+				if (got == want)
+					ok = true;
+				else
+					wrong = true;
+			}
+			if (ok)
+				match++;
+			else if (!wrong)
+				unread++;
+			if (w == HPEQ_WORDS - 1)
+				ylast = got;
+		}
+		dev_info(chip->dev, "headphone profile: Y read-back %u/%zu words match%s (first 0x%08x, image 0x%08x; last 0x%08x, image 0x%08x)%s\n",
+			 match, ARRAY_SIZE(hpeq_check_words),
+			 unread ? " (some unreadable)" : "",
 			 yfirst, le32_to_cpu(((__le32 *)seg->data)[0]),
 			 ylast, le32_to_cpu(((__le32 *)seg->data)[HPEQ_WORDS - 1]),
 			 bad ? " (some status reads were bad)" : "");
+		rb_bad = match != ARRAY_SIZE(hpeq_check_words);
+		if (rb_bad)
+			ret = unread == ARRAY_SIZE(hpeq_check_words) - match ?
+			      -EIO : -EREMOTEIO;
+	} else {
+		ret = -EREMOTEIO;
 	}
 	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u)\n",
 		 name, HPEQ_WORDS, addr, chan, port,
-		 ret ? (seen ? "FAILED (still running)" : "FAILED (channel never started)") : "done",
+		 !ret ? "done" : rb_bad ? "FAILED (read-back differs)" :
+		 seen ? "FAILED (still running)" : "FAILED (channel never started)",
 		 t, v0, v, seen);
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
+free_port:
+	if (!leak)
+		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
 free_chan:
 	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00);
-	scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);	/* free the channel */
+	if (!leak) {
+		scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);	/* free the channel */
+	} else {
+		chip->hp_leaks++;
+		dev_warn(chip->dev, "headphone profile: DSP channel %u and port 0x%x left allocated (%u lost so far)\n",
+			 chan, port, chip->hp_leaks);
+	}
 	goto inval;
 unbind:
 	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00);
@@ -1730,7 +1904,8 @@ out:
 	if (!stopped) {
 		/* the card may still read/write them: never free (small leak) */
 		dev_err(chip->dev, "headphone profile: transfer stream didn't stop; keeping its buffers\n");
-		ret = ret ?: -EIO;
+		/* armed and possibly still moving: not a "retry is safe" case (B3) */
+		ret = -EREMOTEIO;
 	} else {
 		if (buf)
 			dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
@@ -2725,9 +2900,7 @@ static void ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 		/* DAC 48/07: bits 7:5 filter, bit 0 mute. Keep the user's
 		 * "DAC Filter" choice through every replayed table. */
 		if (cmds[i][0] == 0x48 && cmds[i][1] == 0x07) {
-			if (chip->dac_filter)
-				val = (val & 0x1f) |
-				      (chip->dac_filter == 2 ? 0x20 : 0x00);
+			val = (val & 0x1f) | chip->dac_filter_bits;
 			chip->dac48_07 = val;
 		}
 		ca0113_cmd(chip, cmds[i][0], cmds[i][1], val, settle_us);

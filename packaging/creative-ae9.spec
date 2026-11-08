@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.10.1
+Version:        0.11.0
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -49,6 +49,7 @@ install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-overr
 install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
 install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
@@ -80,11 +81,18 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
 %{_prefix}/lib/modules-load.d/creative-ae9.conf
 %{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+%dir %{_datadir}/wireplumber
+%dir %{_datadir}/wireplumber/wireplumber.conf.d
+%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 %{_bindir}/ae9-get-firmware
 %{_bindir}/ae9-full-dump
 %{_datadir}/%{name}/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1
+- Driver 0.11.0: safe headphone-profile uploads, EQ headroom, output switch
+  fix in DSP mode, 7 DAC filters, optical in without a signal, What U Hear /
+  Rear RCA In / Optical In as card-profile sources, -36 dB start volume
 * Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.1-1
 - Driver 0.10.1: early module load (modules-load.d), Rear RCA In, reliable
   headphone profiles, firmware in creative-ae9/, Sub Boost switch

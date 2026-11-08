@@ -10,6 +10,8 @@
 //
 
 #include <linux/dma-mapping.h>
+#include <linux/hrtimer.h>
+#include <linux/math64.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -727,6 +729,17 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 /* prepare — program BDL and stream registers			  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A headphone profile upload (fx.c) checks that no stream runs, then
+ * holds replay_mutex for ~100 ms. A stream prepared in between waits for
+ * it here instead of starting under the upload (review B11, note 56a).
+ */
+static void ae9_wait_hp_upload(struct creative_chip *chip)
+{
+	mutex_lock(&chip->replay_mutex);
+	mutex_unlock(&chip->replay_mutex);
+}
+
 static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
@@ -738,6 +751,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	dma_addr_t addr;
 	int i;
 
+	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
 
 	/* Build BDL entries (keep as fallback) */
@@ -1028,6 +1042,7 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
+	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
 
 	memset(chip->cap_bdl, 0, CREATIVE_CAP_BDL_MAX * 16);
@@ -1283,6 +1298,11 @@ static int creative_ae9_xcap_hw_free(struct snd_pcm_substream *substream)
 	unsigned int i = ae9_xcap_idx(substream);
 	const struct ae9_xcap *x = &ae9_xcaps[i];
 
+	if (x->signal_pin) {
+		chip->xcap[i].sil_running = false;
+		hrtimer_cancel(&chip->xcap[i].sil_timer);
+		cancel_delayed_work_sync(&chip->xcap[i].sense_work);
+	}
 	ae9_xcap_verb(chip, x, x->nid, 0x706, 0, NULL);	/* off the stream */
 	creative_ae9_xcap_bdl_free(chip, i);
 	return snd_pcm_lib_free_pages(substream);
@@ -1306,17 +1326,25 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
-	/* Optical: with no S/PDIF signal the codec sends nothing and the
-	 * stream never moves (a read just times out with an I/O error): say
-	 * so instead. Pin sense bit 31 is set while a signal comes in. */
+	ae9_wait_hp_upload(chip);
+	/*
+	 * Optical: with no S/PDIF signal the codec sends nothing and the
+	 * stream never moves. That used to fail here (-EIO), which also made
+	 * PipeWire drop the source. Now the recording runs as silence on a
+	 * timer until a signal comes in (pin sense bit 31), then restarts on
+	 * the real stream (sense_work, an xrun PipeWire recovers from).
+	 */
 	if (x->signal_pin) {
 		u32 sense = 0;
 
-		if (ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
-		    !(sense & 0x80000000)) {
+		st->no_signal = ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
+				!(sense & 0x80000000);
+		if (st->no_signal) {
 			dev_info_ratelimited(chip->dev,
-				"optical in: no signal on the optical input (connect a source, then record)\n");
-			return -EIO;
+				"optical in: no signal; recording silence until one comes in\n");
+			memset(runtime->dma_area, 0, snd_pcm_lib_buffer_bytes(substream));
+			st->sil_period = ns_to_ktime(div_u64((u64)runtime->period_size * NSEC_PER_SEC,
+							     runtime->rate));
 		}
 	}
 	creative_ae9_stream_reset(chip, base);
@@ -1356,18 +1384,40 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
-	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
+	unsigned int i = ae9_xcap_idx(substream);
+	const struct ae9_xcap *x = &ae9_xcaps[i];
+	struct ae9_xcap_state *st = &chip->xcap[i];
+	unsigned int base = x->base;
+	bool sil = x->signal_pin && st->no_signal;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		creative_ae9_stream_start(chip, base);
+		if (sil) {
+			st->sil_t0 = ktime_get();
+			st->sil_running = true;
+			hrtimer_start(&st->sil_timer, st->sil_period, HRTIMER_MODE_REL_SOFT);
+		} else {
+			creative_ae9_stream_start(chip, base);
+		}
+		if (x->signal_pin) {
+			st->last_lpib = ~0U;
+			queue_delayed_work(chip->wq, &st->sense_work, HZ);
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		creative_ae9_stream_stop(chip, base);
+		if (sil) {
+			/* atomic here: no waiting; the tick checks sil_running */
+			st->sil_running = false;
+			hrtimer_try_to_cancel(&st->sil_timer);
+		} else {
+			creative_ae9_stream_stop(chip, base);
+		}
+		if (x->signal_pin)
+			cancel_delayed_work(&st->sense_work);
 		break;
 	default:
 		return -EINVAL;
@@ -1375,12 +1425,80 @@ static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cm
 	return 0;
 }
 
+/* Silence clock: one period per tick, as the stream's interrupt would. */
+static enum hrtimer_restart ae9_sil_tick(struct hrtimer *t)
+{
+	struct ae9_xcap_state *st = container_of(t, struct ae9_xcap_state, sil_timer);
+	struct snd_pcm_substream *ss = st->substream;
+
+	if (!ss || !st->sil_running)
+		return HRTIMER_NORESTART;
+	snd_pcm_period_elapsed(ss);
+	if (!st->sil_running)
+		return HRTIMER_NORESTART;
+	hrtimer_forward_now(t, st->sil_period);
+	return HRTIMER_RESTART;
+}
+
+/*
+ * Optical in, once a second while it records: a signal came in during
+ * silence, or the signal went (or the stream stopped moving) during a real
+ * recording -> an xrun; PipeWire (or the app) prepares again, and prepare
+ * picks the mode. Process context: the sense read is one codec-2 verb.
+ */
+static void ae9_sense_work(struct work_struct *w)
+{
+	struct ae9_xcap_state *st = container_of(to_delayed_work(w),
+						 struct ae9_xcap_state, sense_work);
+	struct creative_chip *chip = st->chip;
+	struct snd_pcm_substream *ss = st->substream;
+	const struct ae9_xcap *x = &ae9_xcaps[0];
+	u32 sense = 0, lpib;
+	bool sig, restart = false;
+
+	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING)
+		return;		/* stopped: the next start queues this again */
+	if (chip->card_gone ||
+	    ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) < 0)
+		goto again;
+	sig = sense & 0x80000000;
+	if (st->no_signal && sig) {
+		dev_info(chip->dev, "optical in: signal came in; restarting the recording on it\n");
+		restart = true;
+	} else if (!st->no_signal) {
+		lpib = readl(chip->hda_regs + x->base + AZX_REG_SD_LPIB);
+		if (!sig || lpib == st->last_lpib) {
+			dev_info(chip->dev, "optical in: %s; recording silence until a signal comes in\n",
+				 sig ? "the stream stopped moving" : "signal lost");
+			restart = true;
+		}
+		st->last_lpib = lpib;
+	}
+	if (restart) {
+		snd_pcm_stop_xrun(ss);
+		return;		/* the next start queues this again */
+	}
+again:
+	queue_delayed_work(chip->wq, &st->sense_work, HZ);
+}
+
 static snd_pcm_uframes_t
 creative_ae9_xcap_pointer(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
-	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
+	unsigned int i = ae9_xcap_idx(substream);
+	unsigned int base = ae9_xcaps[i].base;
+	struct ae9_xcap_state *st = &chip->xcap[i];
 	unsigned int pos;
+
+	if (ae9_xcaps[i].signal_pin && st->no_signal) {
+		/* from elapsed time, not whole periods: PipeWire's timer
+		 * scheduling reads the position between periods */
+		u64 ns = ktime_to_ns(ktime_sub(ktime_get(), st->sil_t0));
+		u64 frames = mul_u64_u32_div(ns, substream->runtime->rate, NSEC_PER_SEC);
+
+		return do_div(frames, substream->runtime->buffer_size);
+	}
 
 	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
@@ -1430,6 +1548,12 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 	}
 	pcm->private_data = chip;
 	pcm->private_free = creative_ae9_xcap_pcm_free;
+	chip->xcap[i].chip = chip;
+	if (x->signal_pin) {
+		hrtimer_setup(&chip->xcap[i].sil_timer, ae9_sil_tick, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL_SOFT);
+		INIT_DELAYED_WORK(&chip->xcap[i].sense_work, ae9_sense_work);
+	}
 	strscpy(pcm->name, x->name, sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &creative_ae9_xcap_ops);
 	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV, chip->dev,

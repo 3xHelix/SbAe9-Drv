@@ -66,6 +66,15 @@ for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0; do printf '%-6s %s\n
 sec "Card registers (BAR2, the ones the driver logs at bring-up)"
 for o in 0x4 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
+# ChipIO reads go through codec 1 one verb at a time; hundreds of them
+# (the router scan) while audio plays killed codec 1 on 2026-11-07 22:30
+# (CORB timeouts, IOMMU faults, PSU cycle needed). Skip them while any AE-9
+# stream runs; ALLOW_PLAYING_CHIPIO=1 forces them.
+playing=$(grep -ls "^state: RUNNING" /proc/asound/AE9/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
+if [ -n "$playing" ] && [ "${ALLOW_PLAYING_CHIPIO:-0}" != 1 ]; then
+sec "ChipIO sections skipped"
+echo "skipped: AE-9 stream(s) running ($playing). Stop playback and dump again for them."
+else
 sec "ChipIO: I2S clocks, stream setup, SRC, router apply"
 for a in 0x189000 0x189004 0x189008 0x189024 0x189028 0x18b008 0x18a020 0x18a024 0x18a028 0x19042c; do
 	printf '%-9s %s\n' "$a" "$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')"
@@ -114,6 +123,8 @@ for i in $(seq 0 127); do
 	[ -n "$v" ] && [ "$v" != 0x0 ] && printf '%s %-8s %02x -> %02x  state %d%s\n' "$a" "$v" \
 		$((v & 0xff)) $(((v >> 8) & 0xff)) $(((v >> 16) & 3)) "$note"
 done
+
+fi
 
 sec "Codec converter state (GET verbs; replies in the log section below)"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')

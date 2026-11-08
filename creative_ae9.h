@@ -18,6 +18,7 @@
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
 #include <sound/core.h>
 #include <sound/hda_register.h>
 
@@ -57,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.10.1"
+#define CREATIVE_AE9_DRV_VERSION	"0.11.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -215,10 +216,22 @@ struct creative_chip {
 		void		*bdl;
 		dma_addr_t	bdl_dma;
 		size_t		bdl_size;
+		/* optical in only: with no S/PDIF signal the stream never
+		 * moves, so a timer plays the recording as silence instead
+		 * ("silence clock"), and sense_work watches the signal */
+		struct creative_chip *chip;
+		bool		no_signal;	/* prepared without a signal */
+		bool		sil_running;
+		struct hrtimer	sil_timer;
+		ktime_t		sil_t0;
+		ktime_t		sil_period;
+		struct delayed_work sense_work;
+		u32		last_lpib;
 	} xcap[3];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
-	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
+	unsigned int		dac_filter;	/* index into dac_filters[] */
+	u8			dac_filter_bits; /* reg 7 bits 7:5 for that filter */
 	u8			dac48_07;	/* last value written to DAC 48/07 */
 	struct creative_ae9_fx {		/* SBX effects, creative_ae9_fx.c */
 		bool		direct;		/* Windows' Direct Mode (default on) */
@@ -238,6 +251,10 @@ struct creative_chip {
 		u16		spk_dist[6];	/* cm of delay */
 		u8		hp_profile;	/* headphone profile (fx.c), 0 = off */
 		u8		hp_loaded;	/* profile the DSP holds, 0 = none */
+		bool		hp_on;		/* "use speaker EQ" (0x1f) last sent on */
+		bool		hp_blocked;	/* an upload failed after the DSP's DMA was
+						 * armed: no more until the next bring-up */
+		bool		hp_waiting;	/* upload waits for the streams to stop */
 		bool		scout;
 		bool		dead;		/* DSP stopped answering */
 		unsigned int	fails;
@@ -277,6 +294,8 @@ struct creative_chip {
 	unsigned long		hp_last;	/* jiffies of the last profile upload */
 	unsigned int		corb_timeouts;	/* verb timeouts so far (corb.c) */
 	unsigned int		hp_tries;	/* failed uploads in a row */
+	unsigned int		hp_leaks;	/* DSP DMA channels we couldn't free (this bring-up) */
+	bool			scp_fail_logged;	/* first failed DSP message logged (this bring-up) */
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
 	int			dsp_done;
@@ -451,6 +470,7 @@ extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 	} while (0)
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
 int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name);
+u32 creative_ae9_streams_running(struct creative_chip *chip);
 void creative_ae9_corb_scan_unsol(struct creative_chip *chip);
 int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
 			   unsigned int req, unsigned int count, unsigned int wait_us);
@@ -458,6 +478,7 @@ void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
+void creative_ae9_fx_dsp_reset(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_fx_output_changed(struct creative_chip *chip);
 void creative_ae9_fx_hp_work(struct work_struct *w);

@@ -7,12 +7,13 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-07, v0.10.1):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-08, v0.11.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
 > to 24-bit/192 kHz), in is its own recording device. What U Hear records
-> what the card plays.
+> what the card plays. The head unit's rear RCA input, What U Hear and
+> optical in show up in PipeWire as their own sources.
 > The ACM head unit shows the volume; its knob sets the volume, a press
 > mutes, a medium hold switches between the card's RCA outputs and the
 > head unit's headphone jacks, and a long hold toggles the knob light. The SBX button
@@ -35,8 +36,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.10.1 pairs with SbAe9-SBC v0.13.0 (rear RCA input, Speaker
-> Setup tab, Headphone Profile picker, DSP/Direct switch); older SbC versions still
+> Driver v0.11.0 pairs with SbAe9-SBC v0.14.0 (the seven DAC filters,
+> optical in / What U Hear / rear RCA as the driver's own sources, a What U
+> Hear rate picker) and SbAe9-AudioMon v0.4.1; older SbC versions still
 > work, with fewer controls.
 
 ## Hardware / Environment
@@ -125,7 +127,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.10.1-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.11.0-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -349,9 +351,15 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   the desktop microphone slider moves it (100% = +9 dB). Mic Gain stays
   separate. Phantom power is the 48V button on the head unit's front panel;
   the driver doesn't need to do anything.
-- DAC filter: `amixer -c AE9 sset 'DAC Filter' Default|Fast|Slow` (the
-  ES9038's fast or slow roll-off, as the Creative app sets it; Default keeps
-  Windows' startup filter). Kept across sleep/resume.
+- DAC filter (seven since 0.11.0, thanks to DarkNikGr): the ES9038's
+  digital filters with the Creative app's names: Apodizing Fast Roll Off
+  (Windows' startup filter, the default), Fast Roll Off, Slow Roll Off,
+  Fast Roll Off - Minimum Phase, Slow Roll Off - Minimum Phase, Hybrid Fast
+  Roll Off, Brick Wall (`amixer -c AE9 sset 'DAC Filter' 'Brick Wall'`).
+  Set the way the Creative app sets them, both DACs included; they apply in
+  Direct Mode too. Kept across sleep/resume. (Before 0.11.0 the choices
+  were Default/Fast/Slow; a saved old choice comes back as the default
+  once.)
 - Optical (S/PDIF, new): both ways, stereo, on the card's optical jacks.
   - Out plays what the main output plays, whenever it's stereo at 24-bit
     (the default "PCM Bit Depth") up to 192 kHz. It's silent at 32-bit,
@@ -363,35 +371,33 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     (`amixer -c AE9 cset name='Optical Out Playback Switch' off`).
   - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1 to
     192 kHz, so it records alongside the XLR mic
-    (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). For PipeWire,
-    copy `config/ae9-optical-in.conf` to
-    `~/.config/pipewire/pipewire.conf.d/` and run
-    `systemctl --user restart pipewire`: an "AE-9 Optical In" source
-    appears (never the default input). S/PDIF input can't resample, so
-    record at the sender's rate (PipeWire runs at 48 kHz unless told
-    otherwise). With nothing sending, recording fails at once and the
-    kernel log says "no signal on the optical input".
+    (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). In PipeWire
+    it's the "Optical In" source of the AE-9's card profile (since 0.11.0;
+    nothing to copy). S/PDIF input can't resample, so record at the
+    sender's rate (PipeWire runs at 48 kHz unless told otherwise). With
+    nothing sending it records silence (since 0.11.0; it used to fail);
+    plugging the cable in or pulling it while recording restarts the
+    recording once, on the signal or on silence.
 - Head unit rear RCA input (new in 0.10.1): the RCA L/R jacks on the back
   of the head unit are their own capture device, `hw:AE9,3` ("AE-9 Rear RCA
   In"), 24-bit, 44.1 to 192 kHz, recording alongside the XLR mic
-  (`arecord -D hw:AE9,3 -c 2 -r 48000 -f S32_LE rca.wav`). For PipeWire,
-  copy `config/ae9-rear-rca-in.conf` to `~/.config/pipewire/pipewire.conf.d/`
-  and run `systemctl --user restart pipewire`: an "AE-9 Rear RCA In" source
-  appears (never the default input). No level control yet: line-level
-  sources record around -25 dB below full scale.
+  (`arecord -D hw:AE9,3 -c 2 -r 48000 -f S32_LE rca.wav`). In PipeWire
+  it's the "Rear RCA In" source of the AE-9's card profile (since 0.11.0;
+  nothing to copy). No level control yet: line-level sources record
+  around -25 dB below full scale.
 - What U Hear (new): records what the card plays, as its own capture
   device, `hw:AE9,2` ("AE-9 What U Hear"), 48 or 96 kHz (96 kHz since
   0.9.5, `wuh_96k`), next to the XLR mic and optical in
-  (`arecord -D hw:AE9,2 -c 2 -r 96000 -f S32_LE out.wav`). The PipeWire
-  config below records at 48 kHz; change its `audio.rate` to 96000 for
-  96 kHz. It
+  (`arecord -D hw:AE9,2 -c 2 -r 96000 -f S32_LE out.wav`). It
   works in Direct Mode and through the DSP; with SBX off it's the stream
   exactly as sent (a test tone comes back level-exact on both channels).
-  For PipeWire, copy `config/ae9-what-u-hear.conf` to
-  `~/.config/pipewire/pipewire.conf.d/` and run
-  `systemctl --user restart pipewire`: an "AE-9 What U Hear" source
-  appears (never the default input), for recording or streaming the
-  card's own output.
+  In PipeWire it's the "What U Hear" source of the AE-9's card profile
+  (since 0.11.0; nothing to copy), for recording or streaming the card's
+  own output; it runs at PipeWire's rate (48 or 96 kHz; SbAe9-SBC can pin
+  it). Upgrading from 0.10.x: if you copied `ae9-what-u-hear.conf`,
+  `ae9-rear-rca-in.conf` or `ae9-optical-in.conf` into
+  `~/.config/pipewire/pipewire.conf.d/`, delete them, or each source shows
+  up twice.
 - 5.1 (new in 0.6.7): pick "Analog Surround 5.1 Output" for the AE-9 in
   the desktop's sound settings (needs step 4). Front L/R come out of the
   card's RCA jacks, center and LFE out of its 3.5 mm C/Sub jack, rear L/R
@@ -578,10 +584,9 @@ the apps that are playing; look it over before posting.
 | `config/` | Boot binding (udev rule, modprobe hook, dracut omit) and optional module options |
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
-| `config/ae9-optical-in.conf` | Optional PipeWire source for the optical input (see "Optical") |
-| `config/ae9-what-u-hear.conf` | Optional PipeWire source for What U Hear (see "What U Hear") |
-| `config/ae9-rear-rca-in.conf` | Optional PipeWire source for the head unit's rear RCA input (see "Head unit rear RCA input") |
-| `config/61-ae9-names.conf` | Optional desktop name for the recording input, "AE-9 Head Unit Mic / Aux" |
+| `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources for optical in, What U Hear and the rear RCA input. Since 0.11.0 the card profile opens them; don't copy these any more |
+| `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear", "AE-9 Optical In" |
+| `config/50-ae9-safe-volume.conf` | Installed by the packages (WirePlumber): the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (100% is the head unit at 0.0 dB) |
 
 ## Module parameters
 

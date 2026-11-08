@@ -167,7 +167,7 @@ static const struct ae9_bar2_op ae9_sw_to_sp[79] = {
 };
 
 /* ae9_shutdown_a: 23:53:33.350-23:53:33.720 */
-static const struct ae9_bar2_op ae9_shutdown_a[39] = {
+static const struct ae9_bar2_op ae9_shutdown_a[36] = {
 	{'S', 0, 0, 0, 6, {0xf0, 0x52, 0x02, 0xcc, 0xdd, 0xf7}},
 	{'V', 0, 0, 0x11571017, 0, {0}},
 	{'V', 0, 0, 0x11570d24, 0, {0}},
@@ -183,10 +183,8 @@ static const struct ae9_bar2_op ae9_shutdown_a[39] = {
 	{'V', 0, 0, 0x11570e07, 0, {0}},
 	{'W', 2, 0x320, 0x1, 0, {0}},
 	{'V', 0, 0, 0x11572483, 0, {0}},
-	{'C', 0, 0x48, 0x0700, 0, {0}},
 	{'C', 0, 0x48, 0x0701, 0, {0}},
 	{'C', 0, 0x49, 0x0a07, 0, {0}},
-	{'C', 0, 0x48, 0x0700, 0, {0}},
 	{'C', 0, 0x48, 0x0701, 0, {0}},
 	{'C', 0, 0x49, 0x0a07, 0, {0}},
 	{'W', 2, 0x320, 0x4, 0, {0}},
@@ -198,7 +196,6 @@ static const struct ae9_bar2_op ae9_shutdown_a[39] = {
 	{'C', 0, 0x48, 0x1400, 0, {0}},
 	{'C', 0, 0x48, 0x0fff, 0, {0}},
 	{'C', 0, 0x48, 0x10ff, 0, {0}},
-	{'C', 0, 0x48, 0x0700, 0, {0}},
 	{'C', 0, 0x48, 0x0701, 0, {0}},
 	{'C', 0, 0x48, 0x0e0a, 0, {0}},
 	{'C', 0, 0x49, 0x02ff, 0, {0}},
@@ -210,7 +207,7 @@ static const struct ae9_bar2_op ae9_shutdown_a[39] = {
 };
 
 /* ae9_shutdown_b: 23:53:44.330-23:53:44.407 */
-static const struct ae9_bar2_op ae9_shutdown_b[21] = {
+static const struct ae9_bar2_op ae9_shutdown_b[20] = {
 	{'V', 0, 0, 0x20170504, 0, {0}},
 	{'V', 0, 0, 0x11170700, 0, {0}},
 	{'V', 0, 0, 0x11270700, 0, {0}},
@@ -228,7 +225,6 @@ static const struct ae9_bar2_op ae9_shutdown_b[21] = {
 	{'V', 0, 0, 0x11070700, 0, {0}},
 	{'V', 0, 0, 0x10179300, 0, {0}},
 	{'V', 0, 0, 0x10179453, 0, {0}},
-	{'C', 0, 0x48, 0x0700, 0, {0}},
 	{'C', 0, 0x48, 0x0701, 0, {0}},
 	{'C', 0, 0x49, 0x0a07, 0, {0}},
 	{'V', 0, 0, 0x10170504, 0, {0}},

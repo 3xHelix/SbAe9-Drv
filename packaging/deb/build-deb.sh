@@ -43,6 +43,7 @@ install -Dm644 "$SRC/config/ae9-modules-load.conf" "$R/usr/lib/modules-load.d/cr
 # PipeWire profile set (stereo duplex + 5.1)
 install -Dm644 "$SRC/config/89-ae9-pipewire.rules" "$R/usr/lib/udev/rules.d/89-ae9-pipewire.rules"
 install -Dm644 "$SRC/config/creative-ae9.conf" "$R/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf"
+install -Dm644 "$SRC/config/50-ae9-safe-volume.conf" "$R/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf"
 # tools
 install -Dm755 "$SRC/scripts/ae9-get-firmware.sh" "$R/usr/bin/ae9-get-firmware"
 install -Dm755 "$SRC/scripts/ae9-full-dump.sh" "$R/usr/bin/ae9-full-dump"

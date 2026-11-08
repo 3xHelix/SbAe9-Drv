@@ -3,6 +3,58 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.11.0 (2026-11-08)
+Safer headphone profiles, a DSP that stays in step, seven DAC filters and
+inputs that just show up. 🎛️
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fix: picking a headphone profile could still break DSP mode** until a
+  power-off (chopped "8-bit" sound or silence; Kaiba's report and ours).
+  Most bad uploads happened while audio played, so a profile now loads only
+  when nothing is playing or recording: picked during a song, it loads a
+  few seconds after you pause. Every upload is also checked from end to
+  end: the DSP's DMA port must be a proper pair, 8 words are read back from
+  DSP memory and must match the profile (a mismatch keeps the profile off),
+  a half-armed transfer is stopped before its channel is freed, and a
+  failure after the DSP was set up stops further uploads until the next
+  start, instead of retrying blindly. `hp_live_upload=1` brings back
+  uploads during playback.
+- **Fix: the "metallic" sound with a headphone profile and the EQ both
+  on**. On a hot signal the two boosts overload the DSP (Windows does the
+  same); while both are on, the DSP now gets the EQ pre-gain 12 dB lower,
+  but not below -12 dB. The slider keeps your value. `eq_headroom=0` turns
+  this off.
+- **Fix: half-speed, buzzing audio after a speakers/headphones switch in
+  DSP mode**. Windows' switch sequence left the DSP in its own state; the
+  driver now sends the whole effects setup again after every switch.
+- **New: seven DAC filters** (thanks DarkNikGr!), with the Creative app's
+  names: Apodizing Fast Roll Off (Windows' startup filter, the default),
+  Fast Roll Off, Slow Roll Off, Fast Roll Off - Minimum Phase, Slow Roll
+  Off - Minimum Phase, Hybrid Fast Roll Off, Brick Wall. Set the way the
+  Creative app sets them, second DAC included. A saved old
+  Default/Fast/Slow comes back as the default once.
+- **Fix: the DAC got stray writes of 0 at every boot, every shutdown and
+  every 44.1/88.2 kHz start**: Windows' register *reads* had been taken
+  for writes of 0 when its startup was decoded. They're gone (25 Windows
+  captures agree), and the filter you picked now survives every DAC setup
+  the driver sends (an output switch used to put it on Fast Roll Off).
+- **New: optical in records without a signal**. With nothing plugged in it
+  records silence instead of failing; plugging the cable in or pulling it
+  while recording restarts the recording once, on the signal or on
+  silence.
+- **New: Rear RCA In, What U Hear and Optical In are sources out of the
+  box**: the card profile opens them, nothing to copy. Upgrading: delete
+  `ae9-what-u-hear.conf`, `ae9-rear-rca-in.conf` and `ae9-optical-in.conf`
+  from `~/.config/pipewire/pipewire.conf.d/` if you copied them, or each
+  source shows up twice. `config/61-ae9-names.conf` (optional) names them.
+- **New: a safe start volume**. PipeWire's output volume is the head
+  unit's volume (100% = 0.0 dB); the packages now make WirePlumber start
+  the AE-9 at -36 dB, the driver's boot volume, whenever it has no saved
+  volume for the output.
+- More in the log for bug reports: the first failed DSP message after each
+  start in full, DSP queue-full recoveries, and Windows' two startup checks
+  (codec power state, router recovery bytes).
+
 ## 0.10.1 (2026-11-07)
 Boots right every time, headphone profiles that hold up, and the head unit's rear RCA input. 🔌
 Pairs with [SbAe9-SBC v0.13.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.0](https://github.com/3xHelix/SbAe9-AudioMon).
