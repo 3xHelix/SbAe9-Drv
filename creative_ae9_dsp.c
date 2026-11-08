@@ -21,6 +21,7 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
 #include <sound/hda_register.h>
@@ -1618,9 +1619,10 @@ static bool hpeq_port_ok(unsigned int port)
 	return port && port != ~0U && hweight32(port) == 2 && (port & (port >> 1));
 }
 
-/* Words checked after an upload. Word 0 isn't one: Apple Earphone's reads
- * 0 on two cards with the rest in place; it's logged only. */
-static const u16 hpeq_check_words[] = { 1, 147, 293, 439, 585, 731, 877, 1023 };
+/* Words checked after an upload. Word 0 was left out because Apple
+ * Earphone's read 0 on two cards; that was the cut-short transfer (note
+ * 60): with the fixed end check it reads right (2026-11-08), so it's back. */
+static const u16 hpeq_check_words[] = { 0, 1, 147, 293, 439, 585, 731, 877, 1023 };
 
 int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 {
@@ -1635,6 +1637,7 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	u32 yfirst = 0, ylast = 0, port2 = ~0U;
 	unsigned int port, rl, i, t, seen, match = 0, unread = 0;
 	bool rb_bad = false, leak = false;
+	u32 lpib = 0, matched = 0;
 	int ret;
 
 	if (!chip->dsp_done || chip->card_gone)
@@ -1807,21 +1810,40 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	 * right channel silent, left metallic, 2026-11-07 14:51:11).
 	 * Windows always saw the bit on for 5-9 polls (~12 ms).
 	 */
+	/*
+	 * A read only counts if the channels busy before the upload are still
+	 * set: a glitched read of 0 (they happen, note 58) took "our bit off"
+	 * for the end of the transfer and the stream was stopped after ~4 ms
+	 * of the ~11 the 4 KB need (Kaiba: HD 280 Pro 3 of 3, Joe: P5,
+	 * ATH-M50; note 60). Done = our bit off in 2 valid reads in a row,
+	 * at least 11 ms after RUN, and the stream past the whole buffer.
+	 */
 	seen = 0;
-	for (t = 0; t < 300; t++) {
-		if (creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v) < 0 ||
-		    (v & ~0xfffU)) {
-			bad++;
+	{
+		u32 others = busy & ~BIT(chan);
+		ktime_t t_run = ktime_get();
+		unsigned int off = 0;
+
+		for (t = 0; t < 300; t++) {
+			if (creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v) < 0 ||
+			    (v & ~0xfffU) || (v & others) != others) {
+				bad++;
+				usleep_range(500, 1000);
+				continue;
+			}
+			if (t == 0)
+				v0 = v;
+			if (v & BIT(chan)) {
+				seen++;
+				off = 0;
+			} else if (seen >= 3 && ++off >= 2 &&
+				   ktime_ms_delta(ktime_get(), t_run) >= 11 &&
+				   readl(chip->hda_regs + HPEQ_SD + AZX_REG_SD_LPIB) >= HPEQ_WORDS * 4) {
+				break;
+			}
 			usleep_range(500, 1000);
-			continue;
 		}
-		if (t == 0)
-			v0 = v;
-		if (v & BIT(chan))
-			seen++;
-		else if (seen >= 3)
-			break;
-		usleep_range(500, 1000);
+		lpib = readl(chip->hda_regs + HPEQ_SD + AZX_REG_SD_LPIB);
 	}
 	stopped = xfer_stream_stop(chip, HPEQ_SD, HPEQ_TAG);
 	if (seen < 3 || (v & BIT(chan)) || (v & ~0xfffU))
@@ -1858,8 +1880,10 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 				else
 					wrong = true;
 			}
-			if (ok)
+			if (ok) {
 				match++;
+				matched |= BIT(i);
+			}
 			else if (!wrong)
 				unread++;
 			if (w == HPEQ_WORDS - 1)
@@ -1872,6 +1896,13 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 			 ylast, le32_to_cpu(((__le32 *)seg->data)[HPEQ_WORDS - 1]),
 			 bad ? " (some status reads were bad)" : "");
 		rb_bad = match != ARRAY_SIZE(hpeq_check_words);
+		if (rb_bad) {
+			/* a cut transfer can leave the channel waiting for the
+			 * rest: stop it before it's freed (note 60) */
+			leak = !hpeq_disarm(chip, chan);
+			dev_warn(chip->dev, "headphone profile: words matched 0x%03x (bit n = check word n), stream at %u of %u bytes\n",
+				 matched, lpib, HPEQ_WORDS * 4);
+		}
 		if (rb_bad)
 			ret = unread == ARRAY_SIZE(hpeq_check_words) - match ?
 			      -EIO : -EREMOTEIO;

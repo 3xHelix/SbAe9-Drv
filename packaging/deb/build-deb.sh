@@ -49,6 +49,7 @@ install -Dm755 "$SRC/scripts/ae9-get-firmware.sh" "$R/usr/bin/ae9-get-firmware"
 install -Dm755 "$SRC/scripts/ae9-full-dump.sh" "$R/usr/bin/ae9-full-dump"
 install -Dm755 "$SRC/scripts/ae9-dsp-snapshot.sh" "$R/usr/bin/ae9-dsp-snapshot"
 install -Dm755 "$SRC/scripts/ae9-read-stress.sh" "$R/usr/bin/ae9-read-stress"
+install -Dm755 "$SRC/scripts/ae9-optical-passthrough" "$R/usr/bin/ae9-optical-passthrough"
 install -d "$R/usr/share/creative-ae9/examples"
 install -m 644 "$SRC"/extract_firmware.py "$SRC"/extract_overlay.py "$SRC"/extract_hpeq.py "$R/usr/share/creative-ae9/"
 for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do

@@ -444,7 +444,11 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 			}
 		}
 	}
-	fx_hp_set_locked(chip, want && fx->hp_loaded == fx->hp_profile, log);
+	/* while a new pick waits for a pause, the profile already loaded stays
+	 * on (Kaiba: it went off at once, audibly); the upload turns "use
+	 * speaker EQ" off itself before it writes, and a failure leaves it off */
+	fx_hp_set_locked(chip, want && fx->hp_loaded &&
+			 (fx->hp_loaded == fx->hp_profile || st == HP_WAIT), log);
 	return st;
 }
 
@@ -1075,6 +1079,19 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
  * 2.1) becomes 5.1; back on a 2-channel stream, 5.1 becomes 2.1. 4.0 and
  * 4.1 are the user's choice and stay. Mixers and SbAe9-SBC get notified.
  */
+void creative_ae9_fx_spk_follow_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w),
+						  struct creative_chip, spk_follow_work);
+	struct snd_pcm_substream *ss = chip->playback_substream;
+
+	/* only a stream that's still there and running */
+	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING ||
+	    ss->runtime->channels != chip->spk_follow_ch)
+		return;
+	creative_ae9_fx_spk_follow(chip, chip->spk_follow_ch);
+}
+
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels)
 {
 	struct creative_ae9_fx *fx = &chip->fx;

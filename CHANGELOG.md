@@ -3,6 +3,31 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.0 (2026-11-08)
+A second output: optical gets its own stream. 💿
+Pairs with [SbAe9-SBC v0.15.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out on Playback > Digital, passthrough status) and [SbAe9-AudioMon v0.4.2](https://github.com/3xHelix/SbAe9-AudioMon) (kit 0.3.8).
+
+- **New: separate optical output** (thanks DarkNikGr!). PCM device 4,
+  `hw:AE9,4`, "Optical Out" in PipeWire: its own stream at 44.1-192 kHz,
+  16-bit or 24-bit. While nothing plays to it, the optical jack mirrors the
+  main output as before, so nothing changes for you unless you use it.
+  Dolby Digital / DTS passthrough to a receiver with
+  `ae9-optical-passthrough movie.mkv` (sets the S/PDIF "non-audio" bit
+  while it plays; `iecset` controls it by hand).
+- **Fix: headphone-profile uploads could be cut short**. A glitched status
+  read ended the transfer after ~4 ms of the ~11 it needs, leaving part of
+  the old profile in place. 0.11 caught it (the profile stayed off and
+  further uploads were blocked; thanks Kaiba for the report), and now it
+  doesn't happen: the transfer has to really finish. The read-back now
+  checks 9 words.
+- **A profile picked during playback no longer switches the current one
+  off** while it waits for a pause.
+- **Quieter login**: Speaker Config doesn't flip between 5.1 and 2.1 while
+  PipeWire probes the card any more.
+- **`scripts/dkms-install.sh` builds for every installed kernel with
+  headers**, not only the running one (a kernel update without a reboot
+  could leave no driver for the next boot).
+
 ## 0.11.3 (2026-11-08)
 One less way for the DSP to stop. 🛡️
 Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.

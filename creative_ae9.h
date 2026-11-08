@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.11.3"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.0"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -208,6 +208,16 @@ struct creative_chip {
 	bool			spdif_out;	/* "Optical Out Playback Switch" */
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
+	struct mutex		spdif_mutex;	/* the 0x05 binding (main and optical prepare) */
+	u8			spdif_aes[4];	/* "IEC958 Playback Default" (AES0-3) */
+	/* separate optical playback PCM (PCM device 4) */
+	struct snd_pcm_substream *opt_substream;
+	void			*opt_bdl_raw;
+	void			*opt_bdl;
+	dma_addr_t		opt_bdl_dma;
+	size_t			opt_bdl_size;
+	unsigned int		opt_period_size;
+	u16			opt_format;	/* SD_FMT of the open optical stream, 0 none */
 	/* extra capture devices (creative_ae9_pcm.c): [0] optical in (PCM
 	 * device 1), [1] What U Hear (device 2), [2] rear RCA in (device 3) */
 	struct ae9_xcap_state {
@@ -291,6 +301,8 @@ struct creative_chip {
 	 */
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
 	struct delayed_work	hp_work;	/* headphone profile upload, debounced (fx.c) */
+	struct delayed_work	spk_follow_work;	/* Speaker Config follows the stream, debounced */
+	unsigned int		spk_follow_ch;	/* channels of the prepared playback */
 	unsigned long		hp_last;	/* jiffies of the last profile upload */
 	unsigned int		corb_timeouts;	/* verb timeouts so far (corb.c) */
 	unsigned int		hp_tries;	/* failed uploads in a row */
@@ -449,6 +461,7 @@ u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
 void creative_ae9_cap_irq(struct creative_chip *chip);
 void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
+void creative_ae9_opt_irq(struct creative_chip *chip);
 extern unsigned int ae9_sentinel_clear;
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
@@ -483,6 +496,7 @@ void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_fx_output_changed(struct creative_chip *chip);
 void creative_ae9_fx_hp_work(struct work_struct *w);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
+void creative_ae9_fx_spk_follow_work(struct work_struct *w);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
 void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);

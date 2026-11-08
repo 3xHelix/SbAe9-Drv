@@ -28,6 +28,7 @@
 #include <sound/pcm.h>
 #include <sound/hda_register.h>
 
+#include <sound/asoundef.h>
 #include "creative_ae9.h"
 #include "creative_ae9_init_verbs.h"
 #include "creative_ae9_cold_verbs.h"
@@ -4101,6 +4102,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	mutex_init(&chip->scp_mutex);
 	mutex_init(&chip->replay_mutex);
 	mutex_init(&chip->ca0113_mutex);
+	mutex_init(&chip->spdif_mutex);
+	chip->spdif_aes[0] = IEC958_AES0_CON_NOT_COPYRIGHT;	/* as 0x70d COPY */
 	chip->dac_filter = DAC_FILTER_DEFAULT_INDEX;
 	chip->dac_filter_bits = dac_filter_values[DAC_FILTER_DEFAULT_INDEX];
 
@@ -4126,6 +4129,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	 */
 	INIT_DELAYED_WORK(&chip->dsp_switch_work, creative_ae9_dsp_switch_work);
 	INIT_DELAYED_WORK(&chip->hp_work, creative_ae9_fx_hp_work);
+	INIT_DELAYED_WORK(&chip->spk_follow_work, creative_ae9_fx_spk_follow_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
@@ -4295,8 +4299,17 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 	if (intsts & 0x8)
 		creative_ae9_xcap_irq(chip, 2);
 
-	/* Acknowledge stream interrupts and notify ALSA of period completion */
-	if (intsts & AZX_INT_ALL_STREAM & ~0xf) {
+	/* separate optical playback: stream descriptor 6 (0x140, bit 6) */
+	if (intsts & BIT(6))
+		creative_ae9_opt_irq(chip);
+
+	/*
+	 * Main playback: its own descriptor's bit only (0x100 = bit 4). This
+	 * used to take any output-stream bit as the main stream's, which the
+	 * optical stream's interrupts would have hit too. The firmware and
+	 * headphone-profile transfers (SD4/SD5) set no INTCTL bit.
+	 */
+	if (intsts & BIT((chip->playback_stream_base - 0x80) / 0x20)) {
 		u8 sd_sts = readb(chip->hda_regs +
 				  chip->playback_stream_base + AZX_REG_SD_STS);
 		if (sd_sts & SD_INT_COMPLETE) {
@@ -4384,6 +4397,7 @@ static void creative_ae9_stop_works(struct creative_chip *chip)
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
 	cancel_delayed_work_sync(&chip->hp_work);
+	cancel_delayed_work_sync(&chip->spk_follow_work);
 }
 
 /* Reboot / power-off: same as Windows shutting down. */
@@ -4453,6 +4467,7 @@ static int creative_ae9_suspend(struct device *dev)
 	cancel_delayed_work_sync(&chip->acm_work);
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
 	cancel_delayed_work_sync(&chip->hp_work);
+	cancel_delayed_work_sync(&chip->spk_follow_work);
 	creative_ae9_streams_down(chip);
 	chip->dsp_active = false;
 	chip->suspended = true;
@@ -4479,6 +4494,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	int ret = -EIO;
 
 	chip->dac_start_key = 0;	/* the card lost power */
+	chip->spdif_out_sent = 0;	/* and the boot replay reset 0x05 */
 
 	/* the boot replay brings the head unit up on speakers */
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;

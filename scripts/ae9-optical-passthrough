@@ -1,0 +1,57 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Play a file's audio to the AE-9 optical output as a Dolby Digital or DTS
+# bitstream (IEC61937), straight to the hardware PCM (hw:AE9,4).
+# (DarkNikGr; non-audio bit and sink hand-back by 3xHelix)
+#
+#   ae9-optical-passthrough FILE [hw:AE9,4]
+#
+# AC-3 and DTS are passed through; anything else (AAC, FLAC, PCM...) is
+# encoded to Dolby Digital 5.1 640 kbps / 48 kHz. Sets the S/PDIF
+# "non-audio" bit while it plays (driver 0.12+: "IEC958 Playback Default"
+# on PCM device 4), so receivers don't play the bitstream as PCM noise, and
+# clears it again at the end. mpv can't do this: it appends AES0..AES3 to
+# the ALSA device and the raw hw device rejects them.
+# Needs ffmpeg, ffprobe, aplay, iecset (alsa-utils).
+set -u
+file=${1:?usage: ae9-optical-passthrough FILE [hw:AE9,4]}
+dev=${2:-hw:AE9,4}
+card=${dev#hw:}; card=${card%%,*}
+
+codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$file")
+rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$file")
+
+# PipeWire's optical sink (card profile: alsa_output.*optical_out; or the
+# old drop-in's alsa_output.ae9_optical) holds the PCM: suspend it, and
+# give it back at the end
+sinks=$(pactl list sinks short 2>/dev/null | awk '$2 ~ /optical_out$|^alsa_output\.ae9_optical$/ {print $2}')
+# the card's number for iecset (amixer can't write IEC958 controls: it
+# silently leaves them as they are)
+cardno=$(awk -v id="$card" '$2 == "["id {print $1; exit}' /proc/asound/cards)
+iec() {	# non-audio on (1) or off (0): iecset "audio off" = AES0 non-audio bit
+	if ! command -v iecset >/dev/null || [ -z "$cardno" ] ||
+	   ! iecset -c "$cardno" audio "$([ "$1" = 1 ] && echo off || echo on)" >/dev/null 2>&1; then
+		echo "note: couldn't set the S/PDIF non-audio bit (needs iecset from alsa-utils and driver 0.12+): receivers must detect the bitstream themselves" >&2
+	fi
+}
+cleanup() {
+	iec 0
+	for s in $sinks; do pactl suspend-sink "$s" 0 >/dev/null 2>&1; done
+}
+trap cleanup EXIT INT TERM
+for s in $sinks; do pactl suspend-sink "$s" 1 >/dev/null 2>&1; done
+sleep 1
+iec 1
+
+case "$codec" in
+  ac3|dts)
+    echo "$codec $rate Hz: passing through" >&2
+    ffmpeg -v error -i "$file" -map 0:a:0 -c:a copy -f spdif - \
+      | aplay -D "$dev" -f S16_LE -c 2 -r "$rate" -q
+    ;;
+  *)
+    echo "${codec:-?}: encoding to Dolby Digital 5.1 640k/48k" >&2
+    ffmpeg -v error -i "$file" -map 0:a:0 -vn -c:a ac3 -b:a 640k -ar 48000 -ac 6 -f spdif - \
+      | aplay -D "$dev" -f S16_LE -c 2 -r 48000 -q
+    ;;
+esac

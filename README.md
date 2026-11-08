@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-08, v0.11.3):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-08, v0.12.0):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out mirrors the main output (stereo, up
@@ -36,10 +36,10 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.11.x pairs with SbAe9-SBC v0.14.0 (the seven DAC filters,
-> optical in / What U Hear / rear RCA as the driver's own sources, a What U
-> Hear rate picker) and SbAe9-AudioMon v0.4.1; older SbC versions still
-> work, with fewer controls.
+> Driver v0.12.0 pairs with SbAe9-SBC v0.15.0 (the separate optical
+> output on Playback > Digital, passthrough status) and SbAe9-AudioMon
+> v0.4.2; v0.11.x paired with SbAe9-SBC v0.14.0 and AudioMon v0.4.1. Older
+> SbC versions still work, with fewer controls.
 
 ## Hardware / Environment
 
@@ -127,7 +127,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.11.3-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.0-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -369,6 +369,15 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     (those set the card's analog output). Your receiver sets the level.
     "Optical Out Playback Switch" turns it off
     (`amixer -c AE9 cset name='Optical Out Playback Switch' off`).
+  - Separate optical output (new in 0.12.0, thanks DarkNikGr): PCM device
+    4, `hw:AE9,4` ("AE-9 Optical Out"; the "Optical Out" output in
+    PipeWire), its own stream at 44.1-192 kHz, 16-bit or 24-bit in 32.
+    While something plays to it, the optical jack carries that instead of
+    the mirror; when it stops (PipeWire closes it a few seconds later),
+    the mirror comes back. Dolby Digital / DTS passthrough to a receiver:
+    `ae9-optical-passthrough movie.mkv` (needs ffmpeg; it sets the S/PDIF
+    "non-audio" bit while it plays: `iecset -c <card> audio off`, the
+    "IEC958 Playback Default" control on device 4).
   - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1 to
     192 kHz, so it records alongside the XLR mic
     (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). In PipeWire

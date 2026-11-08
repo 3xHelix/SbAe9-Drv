@@ -6,8 +6,9 @@
 # the matching kernel-devel package must be installed, as dnf does).
 #
 #   sudo scripts/dkms-install.sh            install this source tree's version
-#                                            for the running kernel (and any
-#                                            kernels given as arguments)
+#                                            for every installed kernel with
+#                                            headers (always incl. the running
+#                                            one), or only the kernels given
 #   sudo scripts/dkms-install.sh --remove   take the driver out of DKMS
 #   scripts/dkms-install.sh --check         show how the driver is installed
 #                                            and every copy of it (no changes)
@@ -80,24 +81,43 @@ cp "$SRC"/Makefile "$SRC"/creative_ae9*.c "$SRC"/creative_ae9*.h "$SRC"/ca0132_r
 sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$VER\"/" "$SRC/dkms.conf" > "$DEST/dkms.conf"
 dkms add -m "$NAME" -v "$VER"
 
-for k in "$(uname -r)" "$@"; do
+# Every installed kernel with headers, not just the running one: the old
+# version was just removed from all of them, and after a kernel update
+# without a reboot (running kernel's headers gone) building only for
+# `uname -r` left no driver for the next boot (Kaiba, 2026-11-08).
+if [ $# -gt 0 ]; then
+	kernels=("$@")
+else
+	kernels=("$(uname -r)")
+	for d in /lib/modules/*/; do
+		k=$(basename "$d")
+		[ "$k" = "$(uname -r)" ] || [ ! -e "$d/build" ] || kernels+=("$k")
+	done
+fi
+built=0
+for k in "${kernels[@]}"; do
 	if [ ! -d "/lib/modules/$k/build" ]; then
-		echo "skipping $k: no kernel headers (sudo dnf install kernel-devel-$k)" >&2
+		echo "skipping $k: no kernel headers (install that kernel's headers / kernel-devel)" >&2
 		continue
 	fi
 	rm -f "/lib/modules/$k/extra/$NAME.ko"	# the hand-copied one
-	dkms build -m "$NAME" -v "$VER" -k "$k"
-	dkms install -m "$NAME" -v "$VER" -k "$k" --force
+	# one failed kernel doesn't stop the others
+	if dkms build -m "$NAME" -v "$VER" -k "$k" && dkms install -m "$NAME" -v "$VER" -k "$k" --force; then
+		built=$((built + 1))
+	else
+		echo "WARNING: the build for $k failed; the other kernels go on" >&2
+	fi
 done
 dkms status -m "$NAME"
-# make sure the running kernel really has it now
+[ "$built" -gt 0 ] || { echo "ERROR: built for no kernel; don't reboot until this is fixed" >&2; exit 1; }
+# the running kernel may have lost its headers to an update: then the
+# kernel you boot next is what matters
 if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
-	echo "ERROR: $NAME isn't installed for $(uname -r); don't reboot until this is fixed" >&2
-	exit 1
+	echo "note: not installed for the running kernel $(uname -r) (no headers?); built for: ${kernels[*]}" >&2
 fi
-echo "done: $NAME $VER is in DKMS ($(modinfo -k "$(uname -r)" -n "$NAME"));"
+echo "done: $NAME $VER is in DKMS, built for $built kernel(s);"
 echo "new kernels get it built automatically. Reboot to load it."
-for k in "$(uname -r)" "$@"; do
+for k in "${kernels[@]}"; do
 	if [ "$(copies "$k" | wc -l)" -gt 1 ]; then
 		echo "WARNING: more than one copy of the module for $k:" >&2
 		copies "$k" | sed 's/^/  /' >&2
