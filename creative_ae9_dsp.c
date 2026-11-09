@@ -3459,12 +3459,18 @@ static void cv_set(struct creative_chip *chip, int mid, int req, u32 val)
 	usleep_range(2000, 3000);
 }
 
+/*
+ * The mic 1 mode (Windows' LineMic1Config apply, CtxHda FUN_00026f44):
+ * 0x80/0x00 = 1.0 "mono mic into the voice processor" with the mic
+ * connections at 16 kHz, 3.0 "mono mic, no voice processor" at 96 kHz (the
+ * boot value). Voice Clarity off used to leave 1.0 with 96 kHz connections:
+ * the hardware mic monitor then sounded crunchy (2026-11-09 uv1i A2).
+ */
 static void cv_conns(struct creative_chip *chip, bool on)
 {
 	chipio_set_conn_rate(chip, MEM_CONNID_MICIN1, on ? SR_16_000 : SR_96_000);
 	chipio_set_conn_rate(chip, MEM_CONNID_MICOUT1, on ? SR_16_000 : SR_96_000);
-	if (on)
-		cv_set(chip, 0x80, 0x00, FLOAT_ONE);
+	cv_set(chip, 0x80, 0x00, on ? FLOAT_ONE : 0x40400000 /* 3.0 */);
 }
 
 /* Recording start/stop with Voice Clarity on: the voice processor in
@@ -3481,6 +3487,8 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 	u32 st = 0;
 
 	if (on) {
+		if (chip->cv.mon_used && !chip->cv.monitor)
+			dev_warn_ratelimited(chip->dev, "Voice Clarity: the mic monitor was used since the card started; the DSP now records Voice Clarity right only while the monitor is on (left low, right empty). Power the PC off to clear it, or use a software monitor with Voice Clarity\n");
 		cv_conns(chip, true);
 		cv_set(chip, 0x80, 0x05, FLOAT_ONE);
 		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);	/* Windows' status read */
@@ -3503,6 +3511,28 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 	chip->cv.route_on = on;
 	dev_info(chip->dev, "Voice Clarity: voice processor %s the recording (0x80/0x3d = 0x%x)\n",
 		 on ? "in" : "out of", st);
+}
+
+/* Teardown (sleep, reboot, unload): the voice processor out of the mic
+ * path, ~30 ms after the ADC unbind as at a recording stop, and the mic
+ * connections back to 96 kHz (Voice Clarity off), so nothing of it is
+ * left in the DSP or the router for the next start. */
+void creative_ae9_cv_down(struct creative_chip *chip)
+{
+	bool conns = AE9_CV_WANT(chip) || chip->cv.route_on;
+
+	if (!chip->dsp_done)
+		return;
+	if (chip->cv.route_on) {
+		msleep(30);
+		creative_ae9_cv_route(chip, false);
+	}
+	if (conns) {
+		mutex_lock(&chip->replay_mutex);
+		cv_conns(chip, false);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&chip->replay_mutex);
+	}
 }
 
 /* Send the whole Voice Clarity state, in Windows' order: the master
@@ -3665,6 +3695,12 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 			     chip->cv.monitor ? FLOAT_ONE : FLOAT_ZERO);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
+	if (chip->cv.monitor && !chip->cv.mon_used) {
+		chip->cv.mon_used = true;
+		if (chip->cv.mon_used_kc)
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+				       &chip->cv.mon_used_kc->id);
+	}
 	/*
 	 * The mic reaches the DSP only while ADC 0x07 is bound (2026-11-08:
 	 * monitor with playback only was silent, with a recording open it
@@ -3704,6 +3740,31 @@ static int mic_monitor_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *u
 	return 1;
 }
 
+/*
+ * Read-only: the hardware mic monitor has been on since the DSP was last
+ * loaded (power-up, wake). Once it has, the DSP firmware feeds Voice
+ * Clarity's right channel only while the monitor is on: with it off, Voice
+ * Clarity recordings get the left channel ~20 dB low and no right channel
+ * (2026-11-09, UVFindings1.md). Nothing but a DSP reload clears it; Windows
+ * never turns this monitor on. SbAe9-SBC reads this to warn / use its
+ * software Listen with Voice Clarity.
+ */
+static int mic_monitor_used_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->cv.mon_used;
+	return 0;
+}
+
+static const struct snd_kcontrol_new mic_monitor_used_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Mic Monitor Used Since Power-up",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = mic_monitor_used_get,
+};
+
 static const struct snd_kcontrol_new mic_monitor_control = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Mic Monitor Playback Switch",
@@ -3716,6 +3777,12 @@ static const struct snd_kcontrol_new mic_monitor_control = {
 int creative_ae9_cv_controls_add(struct creative_chip *chip)
 {
 	snd_ctl_add(chip->card, snd_ctl_new1(&mic_monitor_control, chip));
+	{
+		struct snd_kcontrol *kc = snd_ctl_new1(&mic_monitor_used_control, chip);
+
+		if (kc && !snd_ctl_add(chip->card, kc))	/* frees kc on error */
+			chip->cv.mon_used_kc = kc;
+	}
 	/* Creative's names (Sound Blaster Command > Recording) */
 	static const char * const names[6] = {
 		"Voice Clarity Capture Switch",

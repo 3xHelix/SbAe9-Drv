@@ -3,6 +3,46 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.3 (2026-11-09)
+Fixes from a full code review of 0.12.1 and 0.12.2, all tested on a card. 🔧
+Pairs with [SbAe9-SBC v0.17.1](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity never uses the card's mic monitor) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fixed: a bad custom headphone profile name could stop the driver
+  loading.** `ae9-hp-profile` now checks names the way the driver does (up
+  to 40 bytes, so fewer letters with accents), sets the running driver
+  first and saves the setting only if the driver took it. The driver skips
+  a bad entry with a warning instead of refusing to load.
+- **Fixed: a re-installed or removed custom profile kept playing the old
+  filter.** The new file now loads by itself once nothing plays (a removed
+  one switches off); "pick Off, then it again" is no longer needed.
+- **Fixed: on headphones, speaker settings reached the headphones.** Speaker
+  levels, distances, bass redirection, crossover and sub gain changed while
+  on headphones (Virtual 7.1) are now stored and sent when you switch back
+  to speakers. Speaker Config follows the stream on headphones again, so a
+  5.1 stream plays discrete 5.1 when you switch to speakers mid-stream.
+- **Fixed: the mic monitor played at Windows' default gain** (+9 dB) after
+  turning it on or after a recording, instead of your Capture Volume.
+- **Fixed: starting a recording while the mic monitor is on** moved the mic
+  route under a bound input (scrambled or wrong-rate recordings possible).
+- **Fixed: sleep, reboot and unload** now release the monitor's hold on the
+  mic and take Voice Clarity out of the mic path; after a wake, Voice
+  Clarity and the monitor come back by themselves (they stayed off).
+- **Fixed: the hardware mic monitor sounded crunchy after Voice Clarity had
+  been used** (the DSP's mic mode stayed on the voice processor's).
+- **Fixed: `ae9-hp-profile` on Fedora Atomic** (installs under
+  `/etc/firmware`, no Python crash), and the per-rate headroom script and
+  `60-ae9-headroom.conf` now only touch the analog output (they could pick
+  the optical output and cut a passthrough stream).
+- **New: "Mic Monitor Used Since Power-up"** (read-only). Known issue,
+  found in this review: once the card's hardware mic monitor has been on
+  since the PC started, Voice Clarity recordings made with it off come out
+  wrong (left channel quiet, right channel empty) until the PC is powered
+  off. It's in the card's DSP firmware; Windows never turns this monitor on,
+  so Creative never met it. SbAe9-SBC v0.17.1 uses its software Listen
+  while Voice Clarity is on and warns before mixing the two; the driver
+  logs a warning when it happens. Plain recordings are not affected.
+- README: the What U Hear 5.1 profile wording is clearer.
+
 ## 0.12.2 (2026-11-09)
 Everything on Sound Blaster Command's list. 🎙️🎧
 Pairs with [SbAe9-SBC v0.17.0](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity, Voice Morphing, mic monitor and virtualization pages, the optical out selector) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).

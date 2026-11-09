@@ -1800,6 +1800,11 @@ void creative_ae9_cap_replay(struct creative_chip *chip, bool start)
 		creative_ae9_verb_block_replay(chip, start_blk,
 					       ARRAY_SIZE(start_blk), false,
 					       "capture: record start block");
+		/* the level block above is Windows' captured gain (+9 dB):
+		 * the user's level after it, at every bind (a recording or
+		 * the mic monitor's hold) */
+		if (chip->mic_level != 99)
+			creative_ae9_mic_level_apply(chip);
 	} else {
 		creative_ae9_verb_block_replay(chip, ae9_cap_stop,
 					       ARRAY_SIZE(ae9_cap_stop), false,
@@ -4052,6 +4057,12 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		}
 
 		creative_ae9_fx_dsp_reset(chip);	/* fresh DSP: upload latch, first-failure log */
+		if (chip->cv.mon_used) {		/* and the monitor's side effect gone */
+			chip->cv.mon_used = false;
+			if (chip->cv.mon_used_kc)
+				snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+					       &chip->cv.mon_used_kc->id);
+		}
 		fret = creative_dsp_load_firmware(chip);
 		if (chip->rings_deferred && !chip->card_gone) {
 			/* the load failed before the stream finished */
@@ -4495,10 +4506,13 @@ static void creative_ae9_streams_down(struct creative_chip *chip)
 {
 	if (!chip->corb_buf || !chip->dsp_done)
 		return;
-	if (chip->cap_start_sent) {
+	/* a recording, or the mic monitor's hold of ADC 0x07 (no recording) */
+	if (chip->cap_start_sent || chip->cv.mon_bound) {
 		creative_ae9_cap_replay(chip, false);
 		chip->cap_start_sent = 0;
+		chip->cv.mon_bound = false;
 	}
+	creative_ae9_cv_down(chip);	/* Voice Clarity's route and mic connections */
 	if (chip->dsp_active)
 		creative_ae9_dsp_mode(chip, false);	/* streams 0x18, 0x05 off */
 }
@@ -4562,8 +4576,9 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 	if (!chip)
 		return;
 
-	creative_ae9_stop_works(chip);
+	/* fx_remove first: after it an hp_custom write can't queue hp_work */
 	creative_ae9_fx_remove(chip);
+	creative_ae9_stop_works(chip);
 	debugfs_remove_recursive(chip->dbg_dir);
 	g_dbg_chip = NULL;
 	vlog_bar0 = vlog_bar2 = NULL;
@@ -4642,10 +4657,6 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	chip->cv.route_on = false;	/* the bring-up came back with the plain route */
 	chip->cv.sent_voicefx = chip->cv.sent_miceq = -1;	/* and the DSP's defaults */
 	chip->cv.mon_bound = false;	/* and ADC 0x07 unbound */
-	if (chip->cv.on)
-		creative_ae9_cv_apply(chip);
-	if (chip->cv.monitor)
-		creative_ae9_mic_monitor_apply(chip);
 
 	/* the boot replay brings the head unit up on speakers */
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;
@@ -4708,6 +4719,13 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	if (chip->mic_level != 99)
 		creative_ae9_mic_level_apply(chip);
 	creative_ae9_dac_filter_apply(chip);
+	/* Voice Clarity and the mic monitor: the bring-up reset the DSP to
+	 * its defaults, so only now (before it, dsp_done was 0 and nothing
+	 * was sent) */
+	if (chip->cv.on)
+		creative_ae9_cv_apply(chip);
+	if (chip->cv.monitor)
+		creative_ae9_mic_monitor_apply(chip);
 	creative_ae9_fx_defer(chip);
 
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);

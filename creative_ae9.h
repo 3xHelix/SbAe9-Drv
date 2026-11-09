@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.2"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.3"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -263,6 +263,7 @@ struct creative_chip {
 		u16		spk_dist[6];	/* cm of delay */
 		u8		hp_profile;	/* headphone profile (fx.c), 0 = off */
 		u8		hp_loaded;	/* profile the DSP holds, 0 = none */
+		unsigned int	hp_loaded_gen;	/* its custom slot's version then */
 		bool		hp_on;		/* "use speaker EQ" (0x1f) last sent on */
 		bool		hp_blocked;	/* an upload failed after the DSP's DMA was
 						 * armed: no more until the next bring-up */
@@ -286,6 +287,11 @@ struct creative_chip {
 		int		sent_miceq;
 		bool		monitor;	/* "Mic Monitor": the DSP mixes the mic into the output */
 		bool		mon_bound;	/* ADC 0x07 bound for the monitor, no recording */
+		/* the monitor has been on since this DSP load: from then on the
+		 * DSP feeds Voice Clarity's right channel only while it is on
+		 * (firmware side effect; Windows never turns it on) */
+		bool		mon_used;
+		struct snd_kcontrol *mon_used_kc;
 	} cv;
 
 	/* debugfs */
@@ -508,6 +514,7 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip);
 void creative_ae9_fx_remove(struct creative_chip *chip);
 void creative_ae9_cv_apply(struct creative_chip *chip);
 void creative_ae9_cv_route(struct creative_chip *chip, bool on);
+void creative_ae9_cv_down(struct creative_chip *chip);
 int creative_ae9_cv_controls_add(struct creative_chip *chip);
 void creative_ae9_mic_monitor_apply(struct creative_chip *chip);
 /* Windows routes the voice processor in only while an effect is on; the

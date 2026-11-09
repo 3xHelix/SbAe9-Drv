@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.2
+Version:        0.12.3
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -98,6 +98,11 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.3-1
+- Driver 0.12.3: code-review fixes (custom headphone profiles, speaker setup
+  on headphones, mic monitor and Voice Clarity lifecycle, scripts); mic
+  monitor / Voice Clarity known issue flagged ("Mic Monitor Used Since
+  Power-up")
 * Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.2-1
 - Driver 0.12.2: Voice Clarity, Voice Morphing and Mic EQ on the DSP, mic
   monitoring, headphone and line-out virtualization, custom headphone

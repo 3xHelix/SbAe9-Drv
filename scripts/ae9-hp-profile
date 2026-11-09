@@ -15,8 +15,8 @@ its own name, in SbAe9-SBC too.
 
   sudo ae9-hp-profile add "Beyerdynamic DT 990 Pro" DT990
         all in one: fetch AutoEQ's correction, make the filter, install it
-        as /lib/firmware/creative-ae9/hp/DT990.bin, listed as
-        "Beyerdynamic DT 990 Pro"
+        as /lib/firmware/creative-ae9/hp/DT990.bin (/etc/firmware/... on
+        Fedora Atomic), listed as "Beyerdynamic DT 990 Pro"
   ae9-hp-profile fetch "Beyerdynamic DT 990 Pro"      download the correction (CSV)
   ae9-hp-profile make "Beyerdynamic DT 990 Pro.csv" dt990.bin
   sudo ae9-hp-profile install dt990.bin DT990 "Beyerdynamic DT 990 Pro"
@@ -26,14 +26,16 @@ its own name, in SbAe9-SBC too.
 
 The key (DT990) is the file name: letters, digits, "-", "_" or ".", up to
 24 characters, not one of Creative's. The name is what the list shows (up
-to 40 characters). The slots are kept in /etc/modprobe.d/creative-ae9-hp.conf
-and set in the running driver at once.
+to 40 bytes: 40 plain letters, fewer with accents or symbols). The slots are
+set in the running driver first, then kept in
+/etc/modprobe.d/creative-ae9-hp.conf for the next boot.
 
 Then pick it in SbAe9-SBC or with
   amixer -c AE9 cset name='Headphone Profile' 'Beyerdynamic DT 990 Pro'
 It works like Creative's profiles: with the output on headphones and Direct
-Mode off, and it loads once nothing has played for a few seconds. To load a
-new file for a profile that's already picked, pick "Off" and then it again.
+Mode off, and it loads once nothing has played for a few seconds. A new
+file for a profile that's already picked loads by itself the same way
+(driver 0.12.3 or later; older ones: pick another profile, then it again).
 
 The CSV can also be your own: two columns, frequency (Hz) and gain (dB), or
 AutoEQ's result file (its "equalization" column). The filter never boosts:
@@ -47,6 +49,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -56,10 +59,11 @@ TAPS = 512           # per channel; linear phase around tap 256 (taps 1..511)
 HALF = 255
 GRID = 8192          # design grid (FFT size)
 CHIP_ADDR = 0x40000
-FW_DIR = '/lib/firmware/creative-ae9/hp'
+HP_SUB = 'creative-ae9/hp'
 CONF = '/etc/modprobe.d/creative-ae9-hp.conf'
 PARAM = '/sys/module/snd_hda_codec_creative_ae9/parameters/hp_custom'
 SLOTS = 4
+NAME_MAX = 40        # bytes (UTF-8), as the driver counts
 CREATIVE_KEYS = {k.lower() for k in (
     'AKGM220 IP3EP IP5EP ATHM50 HS50 CTAVNA CTAVNG CTAVNL CTAVNL2 CTEP3NC '
     'CTFATGHS CTFlex OUTLIER OUTLIERB CTSBINF SXFIAIR SXFIAIRC EMUTEAK WALNUT '
@@ -82,6 +86,43 @@ AUTOEQ_DIRS = [
 def die(msg):
     print(f'ae9-hp-profile: {msg}', file=sys.stderr)
     sys.exit(1)
+
+
+def atomic():
+    return not os.environ.get('AE9_FW_DEST') and os.path.exists('/run/ostree-booted')
+
+
+def fw_dir():
+    """Where profiles are installed, as ae9-get-firmware does it: AE9_FW_DEST,
+    /etc/firmware on Fedora Atomic (/lib is read-only there), else
+    /lib/firmware."""
+    root = os.environ.get('AE9_FW_DEST') or \
+        ('/etc/firmware' if atomic() else '/lib/firmware')
+    return os.path.join(root, HP_SUB)
+
+
+def fw_dirs():
+    """Every place the kernel may load a profile from, in its order (only
+    AE9_FW_DEST's when that is set: tests and image builds stay in it)."""
+    if os.environ.get('AE9_FW_DEST'):
+        return [fw_dir()]
+    roots = ['/etc/firmware', '/lib/firmware/updates',
+             '/usr/lib/firmware/updates', '/lib/firmware', '/usr/lib/firmware']
+    out = []
+    for r in roots:
+        if r:
+            d = os.path.join(r, HP_SUB)
+            if d not in out:
+                out.append(d)
+    return out
+
+
+def find_bin(key):
+    for d in fw_dirs():
+        p = os.path.join(d, f'{key}.bin')
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def fetch(name, out=None):
@@ -243,53 +284,122 @@ def show(path):
         print('      ' + ' '.join(f'{g:+5.1f}' for g in r))
 
 
-def read_slots():
-    """[(key, name) or None] * SLOTS, from the config file."""
+def key_ok(key):
+    return re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,23}', key) is not None
+
+
+def name_problem(name):
+    """Why the driver would refuse this name (None if it's fine). The driver
+    counts bytes, not letters, and trims spaces at both ends, where it
+    takes the byte 0xA0 for one too (the end of "à" or "Š" in UTF-8)."""
+    if not name:
+        return 'empty'
+    if any(c in name for c in ';="') or not name.isprintable():
+        return 'has ; = " or a control character'
+    b = name.encode('utf-8')
+    if len(b) > NAME_MAX:
+        return f'{len(b)} bytes, the most is {NAME_MAX} (accented letters and symbols take 2-3 each)'
+    if b[-1] == 0xA0:
+        return 'ends in a letter the driver would cut (like "à" or "Š"); add a letter after it'
+    return None
+
+
+def slot_ok(s):
+    return key_ok(s[0]) and name_problem(s[1]) is None
+
+
+def parse_slots(val):
+    """[(key, name) or None] * SLOTS from an hp_custom value, as the driver
+    parses it (a bad entry leaves its slot empty)."""
     slots = [None] * SLOTS
+    for n, ent in enumerate(val.strip().split(';')[:SLOTS]):
+        ent = ent.strip()
+        if not ent:
+            continue
+        k, _, v = ent.partition('=')
+        k = k.strip()
+        v = v.strip() if _ else k
+        if slot_ok((k, v)):
+            slots[n] = (k, v)
+    return slots
+
+
+def read_slots():
+    """[(key, name) or None] * SLOTS, from the config file. Entries the
+    driver wouldn't take (written by an older version) are dropped."""
     try:
         txt = open(CONF).read()
     except FileNotFoundError:
-        return slots
+        return [None] * SLOTS
     m = re.search(r'hp_custom="([^"]*)"', txt)
-    if m:
-        for n, ent in enumerate(m.group(1).split(';')[:SLOTS]):
-            if '=' in ent:
-                k, v = ent.split('=', 1)
-                slots[n] = (k.strip(), v.strip())
+    if not m:
+        return [None] * SLOTS
+    raw = [e for e in m.group(1).split(';')[:SLOTS]]
+    slots = parse_slots(m.group(1))
+    for n, ent in enumerate(raw):
+        if ent.strip() and not slots[n]:
+            print(f'note: slot {n + 1} ("{ent.strip()}") isn\'t valid for the driver; it\'s dropped')
     return slots
 
 
 def write_slots(slots):
+    """Set the slots in the running driver, then (only if it took them)
+    save them for the next boot."""
+    for s in slots:
+        if s and not slot_ok(s):        # never save what the driver refuses
+            die(f'"{s[0]}={s[1]}": not valid for the driver')
     val = ';'.join(f'{s[0]}={s[1]}' if s else '' for s in slots).rstrip(';')
-    try:
-        with open(CONF, 'w') as f:
-            f.write('# Written by ae9-hp-profile: the AE-9\'s custom headphone profiles\n'
-                    '# (slot = position; KEY loads /lib/firmware/creative-ae9/hp/KEY.bin)\n'
-                    f'options snd-hda-codec-creative-ae9 hp_custom="{val}"\n')
-    except PermissionError:
-        die(f'no permission to write {CONF}; run it with sudo')
     if os.path.exists(PARAM):
+        try:
+            old = open(PARAM).read().strip()
+        except OSError:
+            old = None
         try:
             with open(PARAM, 'w') as f:
                 f.write(val)
+        except PermissionError:
+            die(f'no permission to write {PARAM}; run it with sudo')
         except OSError as e:
-            print(f'note: the running driver didn\'t take it ({e}); it applies at the next boot')
+            die(f'the running driver refused it ({e}); nothing was saved')
+        try:
+            got = parse_slots(open(PARAM).read())
+        except OSError:
+            got = None
+        if got is not None and got != slots:
+            if old is not None:             # driver 0.12.3+ skips bad entries
+                try:
+                    with open(PARAM, 'w') as f:
+                        f.write(old)
+                except OSError:
+                    pass
+            die('the running driver didn\'t take every slot (see dmesg); nothing was saved')
     else:
         print('note: the driver isn\'t loaded (or is older than 0.12.2); applies at the next boot')
+    try:
+        with open(CONF, 'w') as f:
+            f.write('# Written by ae9-hp-profile: the AE-9\'s custom headphone profiles\n'
+                    f'# (slot = position; KEY loads firmware {HP_SUB}/KEY.bin)\n'
+                    f'options snd-hda-codec-creative-ae9 hp_custom="{val}"\n')
+    except PermissionError:
+        die(f'no permission to write {CONF}; run it with sudo')
+    except OSError as e:
+        die(f'can\'t write {CONF} ({e}); the running driver has it until the next boot')
 
 
 def check_key(key, name):
-    if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,23}', key):
+    if not key_ok(key):
         die(f'key "{key}": letters, digits, "-", "_" or ".", up to 24 characters')
     if key.lower() in CREATIVE_KEYS:
         die(f'key "{key}" is taken by one of Creative\'s profiles; pick another')
-    if not name or len(name) > 40 or any(c in name for c in ';="\n') or not name.isprintable():
-        die(f'name "{name}": 1 to 40 characters, without ; = or "')
+    why = name_problem(name)
+    if why:
+        die(f'name "{name}": {why}')
 
 
 def install(path, key, name=None):
     read_bin(path)
-    name = name or key
+    key = key.strip()
+    name = (name or key).strip()
     check_key(key, name)
     slots = read_slots()
     n = next((i for i, s in enumerate(slots) if s and s[0].lower() == key.lower()), None)
@@ -297,18 +407,32 @@ def install(path, key, name=None):
         n = next((i for i, s in enumerate(slots) if not s), None)
     if n is None:
         die('all 4 custom slots are in use (ae9-hp-profile list); remove one first')
-    dst = os.path.join(FW_DIR, f'{key}.bin')
+    d = fw_dir()
+    dst = os.path.join(d, f'{key}.bin')
     try:
-        os.makedirs(FW_DIR, exist_ok=True)
+        os.makedirs(d, exist_ok=True)
         shutil.copyfile(path, dst)
         os.chmod(dst, 0o644)
     except PermissionError:
         die(f'no permission to write {dst}; run it with sudo')
+    except OSError as e:
+        die(f'can\'t write {dst} ({e.strerror})')
+    if shutil.which('restorecon'):          # SELinux label for the firmware loader
+        subprocess.run(['restorecon', '-F', dst], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
     slots[n] = (key, name)
     write_slots(slots)
     print(f'{dst}: installed as "{name}" (custom slot {n + 1}). Pick it in SbAe9-SBC or with\n'
           f"  amixer -c AE9 cset name='Headphone Profile' '{name}'\n"
-          '(if it was already picked: pick "Off", then it again, to load the new file)')
+          '(if it was already picked, the new file loads by itself once nothing plays)')
+    if atomic():
+        try:
+            active = 'firmware_class.path=/etc/firmware' in open('/proc/cmdline').read().split()
+        except OSError:
+            active = True
+        if not active:
+            print('note: the kernel option firmware_class.path=/etc/firmware isn\'t active yet; '
+                  'run ae9-get-firmware once and reboot')
 
 
 def remove(key):
@@ -316,22 +440,26 @@ def remove(key):
     n = next((i for i, s in enumerate(slots) if s and s[0].lower() == key.lower()), None)
     if n is None:
         die(f'"{key}" is not installed (ae9-hp-profile list)')
+    key = slots[n][0]
     slots[n] = None
     write_slots(slots)
-    try:
-        os.remove(os.path.join(FW_DIR, f'{key}.bin'))
-    except FileNotFoundError:
-        pass
-    except PermissionError:
-        die('no permission; run it with sudo')
+    for d in fw_dirs():
+        try:
+            os.remove(os.path.join(d, f'{key}.bin'))
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            die('no permission; run it with sudo')
+        except OSError:
+            pass                            # read-only location (not ours)
     print(f'removed "{key}" (slot {n + 1} shows "Custom {n + 1}" again)')
 
 
 def list_slots():
     for n, s in enumerate(read_slots()):
         if s:
-            f = os.path.join(FW_DIR, f'{s[0]}.bin')
-            print(f'slot {n + 1}: {s[1]}  ({f}{"" if os.path.exists(f) else ", MISSING"})')
+            f = find_bin(s[0])
+            print(f'slot {n + 1}: {s[1]}  ({f or os.path.join(fw_dir(), s[0] + ".bin") + ", MISSING"})')
         else:
             print(f'slot {n + 1}: empty ("Custom {n + 1}")')
 

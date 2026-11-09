@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-09, v0.12.2):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-09, v0.12.3):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -40,9 +40,10 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.2 pairs with SbAe9-SBC v0.17.0 (Voice Clarity, Voice
-> Morphing, mic monitor and virtualization pages, the "Optical out plays"
-> selector) and SbAe9-AudioMon v0.4.4; v0.12.1 paired with SbAe9-SBC
+> Driver v0.12.3 (code-review fixes) pairs with SbAe9-SBC v0.17.1 and
+> SbAe9-AudioMon v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
+> Clarity, Voice Morphing, mic monitor and virtualization pages, the
+> "Optical out plays" selector); v0.12.1 paired with SbAe9-SBC
 > v0.16.1 and AudioMon v0.4.3. Older
 > SbC versions still work, with fewer controls.
 
@@ -132,7 +133,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.2-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.3-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -392,6 +393,12 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   monitoring (the desktop's "Listen", a pw-loopback) still works, with a
   short delay; if you set a PipeWire headroom, use the per-rate one (see
   "Low latency").
+  Don't mix it with Voice Clarity: once this monitor has been on since the
+  PC started, Voice Clarity recordings made with it off come out wrong
+  (left quiet, right empty) until the PC is powered off (a DSP firmware
+  quirk; Windows never turns this monitor on). Use a software monitor with
+  Voice Clarity, as SbAe9-SBC 0.17.1 does. "Mic Monitor Used Since
+  Power-up" (read-only, 0.12.3) shows whether it has been on.
 - DAC filter (seven since 0.11.0, thanks to DarkNikGr): the ES9038's
   digital filters with the Creative app's names: Apodizing Fast Roll Off
   (Windows' startup filter, the default), Fast Roll Off, Slow Roll Off,
@@ -452,7 +459,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   (since 0.11.0; nothing to copy), for recording or streaming the card's
   own output; it runs at PipeWire's rate (48 or 96 kHz; SbAe9-SBC can pin
   it). With the 5.1 output profile ("Analog Surround 5.1 Output + Analog
-  Stereo Input") it records all six channels instead (since 0.12.1:
+  Stereo Input": one 5.1 output to your speakers, plus the card's usual
+  stereo input for the mic; nothing is mixed together) it records the six
+  channels your speakers get, instead of a stereo copy (since 0.12.1:
   "What U Hear" source with node name `...what_u_hear_51`, FL FR FC LFE RL
   RR; `arecord -D hw:AE9,2 -c 6 ...`), e.g. for an AC-3 encoder; the
   stereo profiles keep the stereo source. Upgrading from 0.10.x: if you copied `ae9-what-u-hear.conf`,
@@ -504,7 +513,8 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   measurement of your headphones by `ae9-hp-profile` (AutoEQ's
   corrections, thousands of models), listed under their own names:
   `sudo ae9-hp-profile add "Beyerdynamic DT 990 Pro" DT990` fetches the
-  correction, saves `/lib/firmware/creative-ae9/hp/DT990.bin` and lists it
+  correction, saves `/lib/firmware/creative-ae9/hp/DT990.bin`
+  (`/etc/firmware/...` on Fedora Atomic) and lists it
   as "Beyerdynamic DT 990 Pro" (in SbAe9-SBC too); empty slots show as
   "Custom 1" to "Custom 4". Pick it there or with
   `amixer -c AE9 cset name='Headphone Profile' 'Beyerdynamic DT 990 Pro'`.
@@ -513,9 +523,10 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   (`ae9-hp-profile --help` explains them; your own CSV of
   frequency and gain works too). The slots live in
   `/etc/modprobe.d/creative-ae9-hp.conf` (`hp_custom`) and change in the
-  running driver at once. A profile loads once nothing has played for a
-  few seconds; to load a new file for a profile already picked, pick "Off"
-  and then it again. They never boost (the DSP stage clips), so they play
+  running driver at once (names: up to 40 bytes, so fewer letters with
+  accents). A profile loads once nothing has played for a few seconds; a
+  new file for a profile already picked loads by itself the same way
+  (0.12.3). They never boost (the DSP stage clips), so they play
   a few dB quieter.
   Works on speakers and headphones, across sleep and reboots. With Direct
   Mode off, a new stream after boot, wake or a switch made while stopped
@@ -653,6 +664,9 @@ the card's chip during playback can freeze the audio until a full power-off
 
 ### Known issues
 
+- Mic monitor and Voice Clarity (since 0.12.2): after the card's mic
+  monitor has been on, Voice Clarity recordings with it off are wrong
+  until a power-off. See "Mic monitoring" above.
 - Unloading and reloading the driver several times in a row can stall the
   DSP ("tail replay done: ... N failed", DBGCNTL 0x00003400 instead of
   0x004d0000): playback works but recording is dead (arecord EIO), and a

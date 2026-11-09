@@ -1475,12 +1475,21 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	/* Voice Clarity: the voice processor in BEFORE Windows' start block
 	 * binds the ADC (Windows: format, route, bind; it never moves the mic
 	 * route while 0x07 is bound - unicorn router report, 25 captures) */
-	if (!chip->cap_start_sent && AE9_CV_WANT(chip) && !chip->cv.route_on)
+	/* the mic monitor holds 0x07 bound (no recording until now): the
+	 * recording takes it over. Unbind first, as cv_apply does, so the
+	 * route and the new format never land on a bound ADC */
+	if (!chip->cap_start_sent && chip->cv.mon_bound) {
+		u32 resp;
+
+		creative_ae9_corb_send_verb_sync(chip, 0x10770600, &resp);
+		msleep(20);	/* Windows: ~20 ms after the unbind */
+		chip->cv.mon_bound = false;
+	}
+	if (!chip->cap_start_sent && AE9_CV_WANT(chip) && !chip->cv.route_on) {
 		creative_ae9_cv_route(chip, true);
+	}
 	if (!chip->cap_start_sent) {
-		creative_ae9_cap_replay(chip, true);
-		if (chip->mic_level != 99)
-			creative_ae9_mic_level_apply(chip);
+		creative_ae9_cap_replay(chip, true);	/* + the user's mic level */
 		chip->cap_start_sent = 1;
 		ae9_dbg(chip, "capture prepare: SD_FMT=0x%04x\n",
 			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));

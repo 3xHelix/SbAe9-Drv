@@ -37,18 +37,32 @@ want_for() {	# headroom for a rate: the first tier at or above it
 	echo "$last"
 }
 
-# the AE-9 output node (stereo or 5.1 profile): "id name headroom", where
-# headroom is what PipeWire uses now (while open)
+# the AE-9 analog output node (stereo or 5.1 profile): "id name headroom",
+# where headroom is what PipeWire uses now (while open). Since 0.12 the
+# optical output is an AE-9 sink too, so match the analog one by name
+# (as 61-ae9-names.conf does); without the card profile set, take the
+# first AE-9 sink that isn't the optical one.
 node_info() {
 	pw-dump 2>/dev/null | python3 -I -c '
-import json, sys
+import json, re, sys
 try:
+    best = None
     for o in json.load(sys.stdin):
         p = (o.get("info") or {}).get("props") or {}
-        if (p.get("alsa.driver_name") == "snd_hda_codec_creative_ae9"
-                and p.get("media.class") == "Audio/Sink"):
-            print(o["id"], p.get("node.name"), p.get("api.alsa.headroom", "-"))
+        if (p.get("alsa.driver_name") != "snd_hda_codec_creative_ae9"
+                or p.get("media.class") != "Audio/Sink"):
+            continue
+        name = p.get("node.name") or ""
+        if re.search(r"[.]optical_out$", name):
+            continue
+        row = (o["id"], name, p.get("api.alsa.headroom", "-"))
+        if re.search(r"[.]analog-(stereo|surround-51)$", name):
+            best = row
             break
+        if best is None:
+            best = row
+    if best:
+        print(*best)
 except Exception:
     pass'
 }

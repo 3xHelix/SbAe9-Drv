@@ -222,6 +222,17 @@ static const struct { const char *key, *name; } hp_profiles[] = {
 	{ "custom4",	"Custom 4" },
 };
 
+/*
+ * Headphone profile picks are debounced. Each upload is a few hundred
+ * commands to the card; seven in 3 s (a fast scroll through the list)
+ * choked the command ring, the DSP's DMA arm reply was lost and the DSP
+ * stopped answering until a power-off (2026-11-07, 12:42:34). So: upload
+ * only the pick still standing after HP_SETTLE_MS, at most one upload per
+ * HP_GAP_MS, and retry once an upload that failed before arming anything.
+ */
+#define HP_SETTLE_MS	700
+#define HP_GAP_MS	2000
+
 #define HP_CUSTOM	4
 #define HP_CUSTOM0	(ARRAY_SIZE(hp_profiles) - HP_CUSTOM)
 #define HP_KEY_MAX	24
@@ -231,6 +242,10 @@ static struct {
 	char key[HP_KEY_MAX + 1], name[HP_NAME_MAX + 1];
 } hp_custom_slot[HP_CUSTOM];
 static char hp_custom_val[HP_CUSTOM * (HP_KEY_MAX + HP_NAME_MAX + 2) + 1];
+/* bumped each time a slot is (re)written: a loaded custom profile whose
+ * slot changed since (new key, or a new file under the same key) is
+ * loaded again */
+static unsigned int hp_custom_gen[HP_CUSTOM];
 static DEFINE_MUTEX(hp_custom_lock);
 static struct creative_chip *hp_custom_chip;	/* for the names' change event */
 static struct snd_kcontrol *hp_custom_kc;
@@ -245,27 +260,33 @@ static bool hp_key_ok(const char *k)
 	return true;
 }
 
-/* "KEY=Name;KEY=Name;;KEY=Name": slot by position, empty = unused */
+/*
+ * "KEY=Name;KEY=Name;;KEY=Name": slot by position, empty = unused. A bad
+ * entry is skipped (its slot stays empty) with a warning, never an error:
+ * an error here at load time would stop the whole driver loading (no sound
+ * card) because of one name in /etc/modprobe.d. ae9-hp-profile reads the
+ * value back to see what was taken.
+ */
 static int hp_custom_set(const char *val, const struct kernel_param *kp)
 {
 	typeof(hp_custom_slot) s = {};
+	struct creative_chip *chip;
 	char *buf, *p, *ent;
 	unsigned int n = 0;
-	int ret = 0;
 
-	if (strlen(val) >= sizeof(hp_custom_val))
-		return -ENOSPC;
 	buf = kstrdup(val, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 	p = strim(buf);
-	while (p && !ret) {
+	while (p) {
 		char *eq;
 
 		ent = strsep(&p, ";");
 		ent = strim(ent);
 		if (n >= HP_CUSTOM) {
-			ret = *ent ? -E2BIG : 0;
+			if (*ent)
+				pr_warn("creative-ae9: hp_custom: only %d slots; \"%s\" ignored\n",
+					HP_CUSTOM, ent);
 			continue;
 		}
 		if (*ent) {
@@ -276,7 +297,9 @@ static int hp_custom_set(const char *val, const struct kernel_param *kp)
 			eq = eq ? strim(eq) : ent;
 			if (strlen(ent) > HP_KEY_MAX || !hp_key_ok(ent) ||
 			    strlen(eq) > HP_NAME_MAX || !*eq) {
-				ret = -EINVAL;
+				pr_warn("creative-ae9: hp_custom: slot %u (\"%.*s\"): key 1-%d of A-Z a-z 0-9 _ - ., name 1-%d bytes; slot left empty\n",
+					n + 1, HP_KEY_MAX, ent, HP_KEY_MAX, HP_NAME_MAX);
+				n++;
 				continue;
 			}
 			strscpy(s[n].key, ent, sizeof(s[n].key));
@@ -285,9 +308,10 @@ static int hp_custom_set(const char *val, const struct kernel_param *kp)
 		n++;
 	}
 	kfree(buf);
-	if (ret)
-		return ret;
 	mutex_lock(&hp_custom_lock);
+	for (n = 0; n < HP_CUSTOM; n++)
+		if (s[n].key[0] || hp_custom_slot[n].key[0])
+			hp_custom_gen[n]++;
 	memcpy(hp_custom_slot, s, sizeof(s));
 	hp_custom_val[0] = '\0';	/* the same, tidied: "KEY=Name;;KEY=Name" */
 	for (n = 0; n < HP_CUSTOM; n++) {
@@ -299,9 +323,17 @@ static int hp_custom_set(const char *val, const struct kernel_param *kp)
 			scnprintf(hp_custom_val + l, sizeof(hp_custom_val) - l, "%s=%s",
 				  s[n].key, s[n].name);
 	}
-	if (hp_custom_chip && hp_custom_kc)	/* SbAe9-SBC & co. re-read the names */
-		snd_ctl_notify(hp_custom_chip->card, SNDRV_CTL_EVENT_MASK_INFO,
+	chip = hp_custom_chip;
+	if (chip && hp_custom_kc)	/* SbAe9-SBC & co. re-read the names */
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_INFO,
 			       &hp_custom_kc->id);
+	/* a picked custom profile whose slot changed loads again (or goes
+	 * off if its file is gone); hp_work checks, uploads only when idle.
+	 * Queued under the lock: creative_ae9_fx_remove clears the chip
+	 * before the remove path cancels the work. */
+	if (chip)
+		mod_delayed_work(chip->wq, &chip->hp_work,
+				 msecs_to_jiffies(HP_SETTLE_MS));
 	mutex_unlock(&hp_custom_lock);
 	return 0;
 }
@@ -323,12 +355,15 @@ static const struct kernel_param_ops hp_custom_ops = {
 module_param_cb(hp_custom, &hp_custom_ops, NULL, 0644);
 MODULE_PARM_DESC(hp_custom, "Custom headphone profiles, by slot: \"KEY=Name;KEY=Name;...\" (up to 4; slot N loads creative-ae9/hp/<KEY>.bin and shows Name); written by ae9-hp-profile");
 
-/* firmware key (hp/<key>.bin) and shown name of profile e */
-static void hp_profile_id(unsigned int e, char *key, size_t klen,
-			  char *name, size_t nlen)
+/* firmware key (hp/<key>.bin), shown name and slot version (custom
+ * slots; 0 for Creative's) of profile e */
+static void hp_profile_id_gen(unsigned int e, char *key, size_t klen,
+			      char *name, size_t nlen, unsigned int *gen)
 {
 	unsigned int c = e - HP_CUSTOM0;
 
+	if (gen)
+		*gen = 0;
 	if (e < HP_CUSTOM0) {
 		if (key)
 			strscpy(key, hp_profiles[e].key ?: "", klen);
@@ -337,6 +372,8 @@ static void hp_profile_id(unsigned int e, char *key, size_t klen,
 		return;
 	}
 	mutex_lock(&hp_custom_lock);
+	if (gen)
+		*gen = hp_custom_gen[c];
 	if (key)
 		strscpy(key, hp_custom_slot[c].key[0] ? hp_custom_slot[c].key :
 			hp_profiles[e].key, klen);
@@ -344,6 +381,26 @@ static void hp_profile_id(unsigned int e, char *key, size_t klen,
 		strscpy(name, hp_custom_slot[c].name[0] ? hp_custom_slot[c].name :
 			hp_profiles[e].name, nlen);
 	mutex_unlock(&hp_custom_lock);
+}
+
+static void hp_profile_id(unsigned int e, char *key, size_t klen,
+			  char *name, size_t nlen)
+{
+	hp_profile_id_gen(e, key, klen, name, nlen, NULL);
+}
+
+/* the DSP holds the picked profile, as it is now (a custom slot may have
+ * been rewritten since it was loaded) */
+static bool fx_hp_current(const struct creative_ae9_fx *fx)
+{
+	unsigned int gen;
+
+	if (fx->hp_loaded != fx->hp_profile)
+		return false;
+	if (fx->hp_loaded < HP_CUSTOM0)
+		return true;
+	hp_profile_id_gen(fx->hp_loaded, NULL, 0, NULL, 0, &gen);
+	return gen == fx->hp_loaded_gen;
 }
 
 void creative_ae9_fx_remove(struct creative_chip *chip)
@@ -452,17 +509,6 @@ static u32 spk_delay_val(const struct creative_ae9_fx *fx, unsigned int i)
 	return fx->direct ? 0 : fx_f32(fx->spk_dist[i], SOUND_CM_S);
 }
 
-/*
- * Headphone profile picks are debounced. Each upload is a few hundred
- * commands to the card; seven in 3 s (a fast scroll through the list)
- * choked the command ring, the DSP's DMA arm reply was lost and the DSP
- * stopped answering until a power-off (2026-11-07, 12:42:34). So: upload
- * only the pick still standing after HP_SETTLE_MS, at most one upload per
- * HP_GAP_MS, and retry once an upload that failed before arming anything.
- */
-#define HP_SETTLE_MS	700
-#define HP_GAP_MS	2000
-
 /* EQ is in the DSP's path: Direct Mode off, SBX on, EQ on. */
 static bool fx_eq_live(const struct creative_ae9_fx *fx)
 {
@@ -564,9 +610,11 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 	char name[64];
 	int ret;
 
-	if (!want || fx->hp_loaded == fx->hp_profile)
+	bool cur = fx_hp_current(fx);
+
+	if (!want || cur)
 		fx->hp_waiting = false;
-	if (want && fx->hp_loaded != fx->hp_profile) {
+	if (want && !cur) {
 		if (fx->hp_blocked || fx->dead) {
 			st = HP_BLOCKED;
 		} else if (fx_hp_must_wait(chip)) {
@@ -579,11 +627,15 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 		} else {
 			fx->hp_waiting = false;
 			char key[HP_KEY_MAX + 1];
+			unsigned int gen;
 
-			hp_profile_id(fx->hp_profile, key, sizeof(key), NULL, 0);
+			/* the slot's version as of this key: a rewrite during
+			 * the upload makes it load again */
+			hp_profile_id_gen(fx->hp_profile, key, sizeof(key), NULL, 0, &gen);
 			snprintf(name, sizeof(name), "creative-ae9/hp/%s.bin", key);
 			ret = creative_dsp_hpeq_upload(chip, name);
 			fx->hp_loaded = ret ? 0 : fx->hp_profile;
+			fx->hp_loaded_gen = gen;
 			st = ret ? HP_RETRY : HP_LOADED;
 			if (ret == -EREMOTEIO) {
 				fx_hp_block(chip, "the upload failed after the DSP's DMA was set up");
@@ -785,6 +837,42 @@ static void fx_live_one(struct creative_chip *chip, u8 req, u32 val)
 	fx_live_end(chip);
 }
 
+/*
+ * Speaker setup in headphone mode (Virtual 7.1): Windows' headphone block
+ * sets levels, delays, config and bass redirect itself, so the speaker
+ * setup (Speaker Config, levels, distances, bass redirect, crossover, sub
+ * gain) is only stored there, and goes to the DSP with the full apply at
+ * the switch back to speakers (or Headphone Virtualization off). Checked
+ * under replay_mutex: the follow work and the heartbeat's output switch
+ * can run at the same time.
+ */
+static void fx_live_spk_one(struct creative_chip *chip, u8 req, u32 val)
+{
+	fx_live_begin(chip);
+	if (!fx_hp_virt(chip))
+		fx_send(chip, FX_MID_OUT, req, val, true);
+	fx_live_end(chip);
+}
+
+/* Speaker Config changed: the whole profile again (config + full range,
+ * as Windows), except in headphone mode (above) */
+static void fx_apply_spk(struct creative_chip *chip)
+{
+	bool sent = false;
+
+	if (!fx_ready(chip))
+		return;
+	mutex_lock(&chip->replay_mutex);
+	if (!fx_hp_virt(chip)) {
+		fx_apply_all_locked(chip);
+		creative_dsp_chipio_addr_invalidate();
+		sent = true;
+	}
+	mutex_unlock(&chip->replay_mutex);
+	if (!sent)
+		dev_info(chip->dev, "Speaker Config stored; sent when the output is speakers\n");
+}
+
 /* The DSP routing was set up again (switch to DSP mode, bring-up): its
  * "use speaker EQ" is off until the profile block sends it. */
 static void creative_ae9_fx_hp_reset(struct creative_chip *chip)
@@ -892,7 +980,7 @@ void creative_ae9_fx_hp_work(struct work_struct *w)
 		queue_delayed_work(chip->wq, &chip->hp_work, next - jiffies);
 		return;
 	}
-	upload = fx->hp_profile && fx->hp_loaded != fx->hp_profile &&
+	upload = fx->hp_profile && !fx_hp_current(fx) &&
 		 chip->hu_output && !fx->hp_blocked;
 	/* waiting for the streams to stop: look again later, no DSP traffic */
 	if (upload && fx->hp_waiting && fx_hp_must_wait(chip)) {
@@ -1202,7 +1290,7 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			return 0;
 		fx->spk = e;
 		if (!fx->direct && !chip->dsp_switch_pending)
-			fx_apply_all(chip);	/* speaker config + full range, as Windows */
+			fx_apply_spk(chip);	/* speaker config + full range, as Windows */
 		return 1;
 	case K_REDIR:
 		if (!!v == fx->bass_redirect)
@@ -1210,9 +1298,11 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		fx->bass_redirect = !!v;
 		if (fx_live_spk(chip)) {
 			fx_live_begin(chip);
-			fx_send(chip, FX_MID_OUT, 0x15, fx_f32(fx->bass_redirect, 1), true);
-			if (fx->bass_redirect)
-				fx_send_redirect(chip, true);
+			if (!fx_hp_virt(chip)) {
+				fx_send(chip, FX_MID_OUT, 0x15, fx_f32(fx->bass_redirect, 1), true);
+				if (fx->bass_redirect)
+					fx_send_redirect(chip, true);
+			}
 			fx_live_end(chip);
 		}
 		return 1;
@@ -1223,7 +1313,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		fx->xover = v;
 		if (fx_live_spk(chip) && fx->bass_redirect) {
 			fx_live_begin(chip);
-			__fx_send(chip, FX_MID_OUT, 0x16, fx_f32(v, 1), true, true);
+			if (!fx_hp_virt(chip))
+				__fx_send(chip, FX_MID_OUT, 0x16, fx_f32(v, 1), true, true);
 			fx_live_end(chip);
 		}
 		return 1;
@@ -1234,7 +1325,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		fx->sub_gain = v;
 		if (fx_live_spk(chip) && fx->bass_redirect) {
 			fx_live_begin(chip);
-			__fx_send(chip, FX_MID_OUT, 0x1e, fx_f32(v, 1), true, true);
+			if (!fx_hp_virt(chip))
+				__fx_send(chip, FX_MID_OUT, 0x1e, fx_f32(v, 1), true, true);
 			fx_live_end(chip);
 		}
 		return 1;
@@ -1244,7 +1336,7 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			return 0;
 		fx->spk_level[i] = v;
 		if (fx_live_spk(chip))
-			fx_live_one(chip, 0x21 + i, spk_level_val(fx, i));
+			fx_live_spk_one(chip, 0x21 + i, spk_level_val(fx, i));
 		return 1;
 	case K_SPKDIST:
 		v = clamp_t(long, v, 0, SPK_DIST_MAX);
@@ -1252,7 +1344,7 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			return 0;
 		fx->spk_dist[i] = v;
 		if (fx_live_spk(chip))
-			fx_live_one(chip, 0x31 + i, spk_delay_val(fx, i));
+			fx_live_spk_one(chip, 0x31 + i, spk_delay_val(fx, i));
 		return 1;
 	case K_HPPROF:
 		if (e >= ARRAY_SIZE(hp_profiles) || e == fx->hp_profile)
@@ -1306,8 +1398,10 @@ void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channel
 	struct creative_ae9_fx *fx = &chip->fx;
 	unsigned int want = fx->spk, i;
 
-	if (!ae9_surround || fx_hp_virt(chip))
-		return;	/* headphone mode: the DSP downmixes 5.1 itself */
+	/* in headphone mode too: the value is stored (the DSP downmixes 5.1
+	 * itself there) and sent at the switch back to speakers */
+	if (!ae9_surround)
+		return;
 	if (channels == 6 && spk_idx(fx) <= 1)
 		want = 4;		/* 5.1 */
 	else if (channels == 2 && spk_idx(fx) == 4)
@@ -1318,7 +1412,7 @@ void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channel
 	dev_info(chip->dev, "Speaker Config %s (follows the %u-channel stream)\n",
 		 spk_names[want], channels);
 	if (!fx->direct && !chip->dsp_switch_pending)
-		fx_apply_all(chip);
+		fx_apply_spk(chip);
 	for (i = 0; i < fx->nkc; i++)
 		if (PV_K(fx->kc[i]->private_value) == K_SPK)
 			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
