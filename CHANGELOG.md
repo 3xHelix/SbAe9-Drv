@@ -3,6 +3,47 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.4 (2026-11-09)
+Restarts and Voice Clarity, the Windows way. 🔁
+Pairs with [SbAe9-SBC v0.17.1](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon). Thanks to Kaiba for the Voice Clarity report that found two of these.
+
+- **Fixed: restarting the driver without a power cut could break the
+  card.** Reloading the driver (or a warm reboot) got riskier each time:
+  the 5th or 6th restart since the last power-off could leave the DSP
+  stalled or the card dark until a PSU power-off. Our unload left the
+  card's DSP codec in a deep sleep and the next start reset it without
+  waking it. Now the driver restarts the card the way Windows does:
+  light sleep at unload, wake + 2 s before the reset, Windows' recovery
+  cycle when the analog outputs report a failed ramp, a 1.5 s settle, and
+  the DSP firmware always downloaded. 6 restarts in a row on one power-up
+  came up clean.
+- **Fixed: Voice Morphing and Noise Reduction recordings stalled the DSP
+  at their start** (every Voice Morphing start, about a third with Noise
+  Reduction), and a DSP message could get lost there: once a loud
+  distorted take (Kaiba). Recordings now start in Windows' order, and the
+  mic level settings go to the DSP once per start-up instead of at every
+  recording.
+- **Fixed: switching Voice Clarity off during a recording** left it
+  limited to 8 kHz until the recording was reopened (Kaiba). It now goes
+  back to the full-band path at once, as Windows does.
+- **Fixed: a short crunch when the card's mic monitor switches on.** The
+  mic is now bound before the DSP mixes it in.
+- **New: a failed DSP start retries the way Windows does** (reset the DSP,
+  0.5 s, download again, up to 3 times) before the heavier full restart;
+  tested with a forced download failure and a forced handshake failure,
+  both recovered on the second download.
+- **New: a DSP that halts itself is never set running again.** The driver
+  stops talking to it and logs what to do (a short sleep or a power-off),
+  instead of nudging a wiped DSP back into a state that left the card
+  dark at the next start.
+- **New: a short sleep resets a stuck card.** `sudo rtcwake -m mem -s 25`
+  (suspend to RAM for 25 s) cuts the card's power like a PSU power-off
+  does; try it before reaching for the PSU switch.
+- Fixed: the head unit's rear RCA input offered 176.4 kHz, which its
+  converter doesn't support; it now offers 44.1, 48, 88.2, 96 and 192 kHz.
+- The log now says when a DSP message had to be written into a busy
+  queue (it used to happen silently).
+
 ## 0.12.3 (2026-11-09)
 Fixes from a full code review of 0.12.1 and 0.12.2, all tested on a card. 🔧
 Pairs with [SbAe9-SBC v0.17.1](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity never uses the card's mic monitor) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).

@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-09, v0.12.3):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-09, v0.12.4):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -40,8 +40,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.3 (code-review fixes) pairs with SbAe9-SBC v0.17.1 and
-> SbAe9-AudioMon v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
+> Driver v0.12.4 (restarts and Voice Clarity as Windows) and v0.12.3
+> (code-review fixes) pair with SbAe9-SBC v0.17.1 and SbAe9-AudioMon
+> v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
 > Clarity, Voice Morphing, mic monitor and virtualization pages, the
 > "Optical out plays" selector); v0.12.1 paired with SbAe9-SBC
 > v0.16.1 and AudioMon v0.4.3. Older
@@ -133,7 +134,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.3-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.4-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -444,7 +445,8 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     recording once, on the signal or on silence.
 - Head unit rear RCA input (new in 0.10.1): the RCA L/R jacks on the back
   of the head unit are their own capture device, `hw:AE9,3` ("AE-9 Rear RCA
-  In"), 24-bit, 44.1 to 192 kHz, recording alongside the XLR mic
+  In"), 24-bit, 44.1, 48, 88.2, 96 or 192 kHz (not 176.4: its converter
+  doesn't offer it, so 0.12.4 no longer does either), recording alongside the XLR mic
   (`arecord -D hw:AE9,3 -c 2 -r 48000 -f S32_LE rca.wav`). In PipeWire
   it's the "Rear RCA In" source of the AE-9's card profile (since 0.11.0;
   nothing to copy). No level control yet: line-level sources record
@@ -667,12 +669,16 @@ the card's chip during playback can freeze the audio until a full power-off
 - Mic monitor and Voice Clarity (since 0.12.2): after the card's mic
   monitor has been on, Voice Clarity recordings with it off are wrong
   until a power-off. See "Mic monitoring" above.
-- Unloading and reloading the driver several times in a row can stall the
-  DSP ("tail replay done: ... N failed", DBGCNTL 0x00003400 instead of
-  0x004d0000): playback works but recording is dead (arecord EIO), and a
-  warm reboot doesn't clear it. Power off at the PSU for ~30 s to recover.
-  Reboot instead of reloading where you can. The log line `DSP health:`
-  after each startup warns when this has happened.
+- Reloading the driver (or a warm reboot) used to get riskier with each
+  restart until the DSP stalled ("tail replay done: ... N failed",
+  recording dead): the card was left in a deep sleep that the next start
+  never woke from. Since 0.12.4 the driver restarts the card the way
+  Windows does (light sleep at unload, wake + 2 s, Windows' recovery
+  cycle when needed): 6 restarts in a row on one power-up came up clean.
+  If the card is ever stuck anyway (`DSP health:` warns), try a short
+  sleep before powering off: `sudo rtcwake -m mem -s 25` (suspend to RAM
+  for 25 s) cuts the card's power like a power-off does; otherwise power
+  off at the PSU for ~30 s.
 - Even a clean reload (no failures, `DSP health: ok`) can leave recording
   silent: the stream runs but every sample is zero. A reboot fixes it.
 - A very small PipeWire quantum (64) can drop out under heavy CPU load
@@ -783,8 +789,16 @@ what's left is tuning and diagnostics:
   ALSA controls "Head Unit Playback Volume" / "Head Unit Playback Switch"
   (always on since 0.9.5; the old `post_windows=0` path is gone).
   `hu_master` (1) names the volume/mute "Master" for desktop sync;
-  `warm_reset` (0) replays Windows' warm-DSP reset block before the
-  download (1 = when the DSP reads dead, 2 = always; experimental);
+  `warm_reset` (1) Windows' codec recovery cycle before the DSP download
+  when a ramp status byte reads failed, as Windows (0.12.4; 0 = never,
+  2 = always);
+  `dsp_soft_tries` (3) DSP downloads per bring-up when one fails, with
+  Windows' DSP_INIT + 0.5 s between them (0.12.4; 1 = no soft retry);
+  `dsp_fail_inject` (test only, clears itself) fails the next DSP load
+  once (1 = download, 2 = handshake) to exercise that retry;
+  `vc_quiet_ms` (0, writable at runtime) holds DSP messages this long
+  after Voice Clarity routes the mic in (0.12.4; not needed since the
+  start follows Windows' order);
   `resume_tries` (3) / `resume_delay_ms` (2000) bring-up retries;
   `pcm_stop_block` (1, writable at runtime) send Windows' playback stop
   block at stream release; 0 skips it (experiment for the rare silent

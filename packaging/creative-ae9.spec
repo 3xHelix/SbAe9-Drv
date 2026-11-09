@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.3
+Version:        0.12.4
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -98,6 +98,11 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.4-1
+- Driver 0.12.4: warm restarts as Windows (wake + recovery cycle), Voice
+  Clarity starts in Windows' order (no DSP stall), Voice Clarity off goes
+  back to full band, mic monitor crunch fixed, Windows' DSP load retry,
+  rear RCA without 176.4 kHz
 * Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.3-1
 - Driver 0.12.3: code-review fixes (custom headphone profiles, speaker setup
   on headphones, mic monitor and Voice Clarity lifecycle, scripts); mic

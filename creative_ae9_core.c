@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/delay.h>
+#include <linux/reboot.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/debugfs.h>
@@ -1776,35 +1777,65 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 	}
 }
 
-/* Windows' record start (+ capture level) or stop block, from the XLR
- * recording capture (creative_ae9_cap_verbs.h). */
+/*
+ * Windows' record start, from the XLR recording capture
+ * (creative_ae9_cap_verbs.h), in Windows' order:
+ * - the level block (node 0x07 amps + 18 messages to module 0x37), once
+ *   per DSP load: Windows sends it once per stream setup (1-2 bursts per
+ *   capture session against 8-15 ADC binds), never at a recording start;
+ *   then the user's level (it overrides the block's +9 dB). A later level
+ *   change sends itself (mic_level_put), the playback start block's 0x37
+ *   messages re-apply it (pcm prepare).
+ * - 0x96/0x3a = 0, node 0x07 format, the F10 01 read;
+ * - route_vc: the voice processor in (Voice Clarity), then Windows' 60 ms
+ *   (creative_ae9_cv_route). Windows routes in after the format and binds
+ *   51-66 ms later with no DSP message in between (18 recording starts
+ *   in 4 captures, e.g. 2026-11-05 21:31); we used to route in first and send the
+ *   18 level messages + the start block's message within 1 ms of it: the
+ *   DSP's command queue read full (queue-full kicks, lost level messages);
+ * - the ADC bind (0x10770610).
+ */
+void creative_ae9_cap_start(struct creative_chip *chip, bool route_vc)
+{
+	/* Windows' start block sets node 0x07 to its 48 kHz format
+	 * (0x10720031) and then binds it (0x10770610). The codec takes
+	 * the rate at the bind, so the recording's own format goes in
+	 * that slot, before the bind: changing it after left a 96 kHz
+	 * recording getting 48 kHz-rate data (2026-11-06). */
+	u32 start_blk[ARRAY_SIZE(ae9_cap_start)];
+	size_t i, n = ARRAY_SIZE(ae9_cap_start);
+
+	if (!chip->corb_buf)
+		return;
+	for (i = 0; i < n; i++)
+		start_blk[i] = ae9_cap_start[i] == 0x10720031 && chip->cap_format ?
+			       0x10720000 | chip->cap_format : ae9_cap_start[i];
+	if (!chip->cap_level_sent) {
+		creative_ae9_verb_block_replay(chip, ae9_cap_level,
+					       ARRAY_SIZE(ae9_cap_level), false,
+					       "capture: level block");
+		chip->cap_level_sent = true;
+		if (chip->mic_level != 99)
+			creative_ae9_mic_level_apply(chip);
+	}
+	/* the block ends with the bind: everything before it, then the route */
+	if (WARN_ON_ONCE((start_blk[n - 1] & 0xffffff0f) != 0x10770600))
+		route_vc = false;
+	creative_ae9_verb_block_replay(chip, start_blk, n - 1, false,
+				       "capture: record start block");
+	if (route_vc)
+		creative_ae9_cv_route(chip, true);
+	creative_ae9_verb_block_replay(chip, &start_blk[n - 1], 1, false,
+				       "capture: ADC bind");
+}
+
+/* Windows' record start (no Voice Clarity route) or stop block */
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start)
 {
 	if (!chip->corb_buf)
 		return;
 	if (start) {
-		/* Windows' start block sets node 0x07 to its 48 kHz format
-		 * (0x10720031) and then binds it (0x10770610). The codec takes
-		 * the rate at the bind, so the recording's own format goes in
-		 * that slot, before the bind: changing it after left a 96 kHz
-		 * recording getting 48 kHz-rate data (2026-11-06). */
-		u32 start_blk[ARRAY_SIZE(ae9_cap_start)];
-		size_t i;
-
-		for (i = 0; i < ARRAY_SIZE(ae9_cap_start); i++)
-			start_blk[i] = ae9_cap_start[i] == 0x10720031 && chip->cap_format ?
-				       0x10720000 | chip->cap_format : ae9_cap_start[i];
-		creative_ae9_verb_block_replay(chip, ae9_cap_level,
-					       ARRAY_SIZE(ae9_cap_level), false,
-					       "capture: level block");
-		creative_ae9_verb_block_replay(chip, start_blk,
-					       ARRAY_SIZE(start_blk), false,
-					       "capture: record start block");
-		/* the level block above is Windows' captured gain (+9 dB):
-		 * the user's level after it, at every bind (a recording or
-		 * the mic monitor's hold) */
-		if (chip->mic_level != 99)
-			creative_ae9_mic_level_apply(chip);
+		creative_ae9_cap_start(chip, false);
 	} else {
 		creative_ae9_verb_block_replay(chip, ae9_cap_stop,
 					       ARRAY_SIZE(ae9_cap_stop), false,
@@ -1813,14 +1844,24 @@ void creative_ae9_cap_replay(struct creative_chip *chip, bool start)
 }
 
 /*
- * warm_reset: Windows' warm-DSP reset block (creative_ae9_warm_verbs.h),
- * which Windows sends before the download only when the DSP had been
- * running: 0 never, 1 when the DSP reads "dead" (0x801c = 0, as after our
- * shutdown or a failed start; a cold card reads junk there), 2 always.
+ * warm_reset: Windows' codec recovery cycle (CtxHda FUN_0001e0c0, the
+ * verbs in creative_ae9_warm_verbs.h), run before the download when any of
+ * the 7 analog ramp status bytes (Dac1-3, PortA, PortBOut, PortD, PortG)
+ * reads "ramp failed" (bit 2): what a card that was running shows (every
+ * warm re-start, never after a power-off). Windows does it every time;
+ * we skipped it, and each warm re-start got riskier until the DSP broke
+ * (2026-11-09: 0/34 bad on the 1st warm re-start, 50 % from the 6th;
+ * .tmp/unicorn/reprobe/SUMMARY.md). 0 never, 1 as Windows (default),
+ * 2 always.
  */
-static unsigned int warm_reset;
+static unsigned int warm_reset = 1;
 module_param(warm_reset, uint, 0644);
-MODULE_PARM_DESC(warm_reset, "Windows' warm-DSP reset before download: 0=never (default), 1=if DSP reads dead, 2=always");
+MODULE_PARM_DESC(warm_reset, "Windows' codec recovery cycle before the DSP download: 0=never, 1=when a ramp status byte reads failed, as Windows (default), 2=always");
+
+/* Cold table positions of Windows' warm-start steps (CtxHda FUN_0001c7dc) */
+#define AE9_COLD_AFG_F05	384	/* codec 1 AFG power state read */
+#define AE9_COLD_AFG_RESET	395	/* first of the two AFG resets (7ff) */
+#define AE9_COLD_SETTLE		774	/* after Windows' 1.5 s timer */
 
 /*
  * Windows' two start-up checks, logged only (no behaviour change yet;
@@ -1865,6 +1906,16 @@ static void ae9_bootchk_note(struct ae9_bootchk *c, u32 verb, u32 resp, int ret)
 	}
 }
 
+static bool ae9_bootchk_ramp_failed(const struct ae9_bootchk *c)
+{
+	unsigned int i;
+
+	for (i = 0; i < AE9_BOOTCHK_XRAM_N; i++)
+		if (c->xram[i] >= 0 && (c->xram[i] & 4))
+			return true;
+	return false;
+}
+
 static void ae9_bootchk_log(struct creative_chip *chip, const struct ae9_bootchk *c)
 {
 	char buf[AE9_BOOTCHK_XRAM_N * 4 + 1];
@@ -1882,9 +1933,57 @@ static void ae9_bootchk_log(struct creative_chip *chip, const struct ae9_bootchk
 	}
 	dev_info(chip->dev, "Windows' boot checks: codec 1 power 0x%x (%s), router XRAM%s (%s)\n",
 		 c->f05, !c->f05_seen || c->f05 == ~0U ? "unread" :
-		 (c->f05 & 0xf) ? "not D0: Windows wakes it + 2 s" : "D0",
-		 buf, recover ? "bit 2 set: Windows runs its recovery cycle" :
+		 (c->f05 & 0xf) ? "not D0: woken + 2 s, as Windows" : "D0",
+		 buf, recover ? "ramp failed: recovery cycle, as Windows" :
 		      unread ? "some unread" : "no recovery");
+}
+
+static int ae9_cold_verb(struct creative_chip *chip, u32 verb, u32 *resp)
+{
+	return chip->corb_buf ? creative_ae9_corb_send_verb_sync(chip, verb, resp) :
+				creative_ae9_icw_send_verb(chip, verb, resp);
+}
+
+/*
+ * One pass of Windows' codec recovery cycle (FUN_0001e0c0) with its waits:
+ * pins off and the AFG to D3cold (2 s), PLL/PMU register 0x0f low then high
+ * (~100 ms each), the 8051 flags (XRAM 0xb6 = 1 ...) and a poll until 0xb6
+ * reads 0, the AFG back to D0 (2 s), pins back, the 7 ramp bytes read
+ * again. Returns true when a byte still reads "ramp failed".
+ */
+static bool ae9_recovery_pass(struct creative_chip *chip, struct ae9_bootchk *chk)
+{
+	size_t i;
+	unsigned int polls = 0;
+
+	for (i = 0; i < AE9_BOOTCHK_XRAM_N; i++)
+		chk->xram[i] = -2;
+	chk->n = 0;
+	for (i = 0; i < ARRAY_SIZE(ae9_warm_reset); i++) {
+		u32 resp = 0;
+		int ret = ae9_cold_verb(chip, ae9_warm_reset[i], &resp);
+
+		ae9_bootchk_note(chk, ae9_warm_reset[i], resp, ret);
+		switch (i) {
+		case 14:	/* AFG D3cold */
+		case 53:	/* AFG D0 */
+			msleep(2000);
+			break;
+		case 18:	/* PMU 0x0f & 0x77 */
+		case 20:	/* PMU 0x0f | 0x88 */
+			msleep(110);
+			break;
+		case 35:	/* read XRAM 0xb6: the 8051 clears it when done */
+			while (ret == 0 && (resp & 0xff) && polls++ < 5) {
+				msleep(100);
+				ae9_cold_verb(chip, ae9_warm_reset[33], &resp);
+				ae9_cold_verb(chip, ae9_warm_reset[34], &resp);
+				ret = ae9_cold_verb(chip, ae9_warm_reset[35], &resp);
+			}
+			break;
+		}
+	}
+	return ae9_bootchk_ramp_failed(chk);
 }
 
 /* Replay the cold-boot pre-download verbs; via CORB once it is running. */
@@ -1898,26 +1997,39 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 		u32 resp = 0;
 		int ret;
 
-		/* at the point where Windows' warm start has its extra block */
-		if (warm_reset && i == AE9_WARM_RESET_POS) {
-			unsigned int loop = ~0U;
-			bool warm = warm_reset == 2;
-
-			if (warm_reset == 1)
-				warm = creative_dsp_chipio_read(chip, 0x801c, &loop) == 0 &&
-				       loop == 0;
-			dev_info(chip->dev, "warm_reset: 0x801c=0x%x, %s\n", loop,
-				 warm ? "warm DSP: Windows' reset block goes in" :
-					"cold DSP: no reset block");
-			if (warm)
-				creative_ae9_verb_block_replay(chip, ae9_warm_reset,
-							       ARRAY_SIZE(ae9_warm_reset), false,
-							       "warm_reset: Windows' warm-DSP reset");
+		/* (A) codec 1's AFG asleep (a card that was running: our
+		 * shutdown left it in D3): wake it and give it 2 s before
+		 * the two resets, as Windows does every time */
+		if (i == AE9_COLD_AFG_RESET && chk.f05_seen && chk.f05 != ~0U &&
+		    (chk.f05 & 0xf)) {
+			ae9_cold_verb(chip, 0x10170500, &resp);
+			msleep(2000);
+			ae9_cold_verb(chip, AE9_BOOTCHK_F05, &resp);
+			dev_info(chip->dev, "warm start: codec 1 was in D%u, woken (now 0x%x) + 2 s\n",
+				 chk.f05 & 0x7, resp);
 		}
-		ret = chip->corb_buf ?
-			creative_ae9_corb_send_verb_sync(chip, ae9_cold_prefw[i], &resp) :
-			creative_ae9_icw_send_verb(chip, ae9_cold_prefw[i], &resp);
+		/* Windows' 1.5 s timer between the codec set-up and the
+		 * ramp checks + download (26/26 captures) */
+		if (i == AE9_COLD_SETTLE)
+			msleep(1500);
+		/* (B) Windows' recovery cycle when a ramp byte reads failed;
+		 * up to 3 passes, each checked again */
+		if (warm_reset && i == AE9_WARM_RESET_POS) {
+			bool failed = warm_reset == 2 || ae9_bootchk_ramp_failed(&chk);
+			unsigned int pass;
 
+			ae9_bootchk_log(chip, &chk);
+			for (pass = 1; failed && pass <= 3; pass++) {
+				failed = ae9_recovery_pass(chip, &chk);
+				dev_info(chip->dev, "warm start: recovery cycle %u: ramp status %02x %02x %02x %02x %02x %02x %02x (%s)\n",
+					 pass, chk.xram[0] & 0xff, chk.xram[1] & 0xff,
+					 chk.xram[2] & 0xff, chk.xram[3] & 0xff,
+					 chk.xram[4] & 0xff, chk.xram[5] & 0xff,
+					 chk.xram[6] & 0xff, failed ? "still failed" : "clear");
+			}
+			creative_dsp_chipio_addr_invalidate();
+		}
+		ret = ae9_cold_verb(chip, ae9_cold_prefw[i], &resp);
 		if (ret < 0)
 			errs++;
 		ae9_bootchk_note(&chk, ae9_cold_prefw[i], resp, ret);
@@ -1925,7 +2037,8 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 	creative_dsp_chipio_addr_invalidate();
 	dev_info(chip->dev, "cold_prefw: replayed %zu pre-download verbs (%u errors)\n",
 		 ARRAY_SIZE(ae9_cold_prefw), errs);
-	ae9_bootchk_log(chip, &chk);
+	if (!warm_reset)
+		ae9_bootchk_log(chip, &chk);
 }
 
 /* Replay both codecs' captured init verbs (codec 2 first, as Windows). */
@@ -4530,11 +4643,25 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 	writel((ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + 0x100 + AZX_REG_SD_CTL);
 
 	if (chip->corb_buf) {
+		/* the AFGs go to D3cold (705 p=4) only at power-off; Windows
+		 * uses D3hot (p=3) for a reboot, and so do we for an unload
+		 * and the bring-up retries (CtxHda: the system power action) */
+		bool cold = system_state == SYSTEM_POWER_OFF;
+		struct ae9_bar2_op *b = kmemdup(ae9_shutdown_b, sizeof(ae9_shutdown_b),
+						GFP_KERNEL);
+		size_t k;
+
 		creative_ae9_ops_replay(chip, ae9_shutdown_a, ARRAY_SIZE(ae9_shutdown_a),
 					"shutdown: power-down");
-		msleep(100);
-		creative_ae9_ops_replay(chip, ae9_shutdown_b, ARRAY_SIZE(ae9_shutdown_b),
-					"shutdown: codecs to D3");
+		msleep(1100);	/* Windows: >= 1.08 s between the two halves */
+		if (b && !cold)
+			for (k = 0; k < ARRAY_SIZE(ae9_shutdown_b); k++)
+				if (b[k].type == 'V' &&
+				    (b[k].val & 0x0fffffff) == 0x00170504)
+					b[k].val = (b[k].val & ~0xff) | 0x03;
+		creative_ae9_ops_replay(chip, b ?: ae9_shutdown_b, ARRAY_SIZE(ae9_shutdown_b),
+					cold ? "shutdown: codecs to D3cold" : "shutdown: codecs to D3hot");
+		kfree(b);
 	} else {
 		dev_info(chip->dev, "shutdown: command ring not running, skipping the sequence\n");
 	}

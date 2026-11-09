@@ -1485,11 +1485,10 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 		msleep(20);	/* Windows: ~20 ms after the unbind */
 		chip->cv.mon_bound = false;
 	}
-	if (!chip->cap_start_sent && AE9_CV_WANT(chip) && !chip->cv.route_on) {
-		creative_ae9_cv_route(chip, true);
-	}
+	/* Voice Clarity: the route-in goes inside the start block, after the
+	 * format and before the bind, as Windows (creative_ae9_cap_start) */
 	if (!chip->cap_start_sent) {
-		creative_ae9_cap_replay(chip, true);	/* + the user's mic level */
+		creative_ae9_cap_start(chip, AE9_CV_WANT(chip) && !chip->cv.route_on);
 		chip->cap_start_sent = 1;
 		ae9_dbg(chip, "capture prepare: SD_FMT=0x%04x\n",
 			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));
@@ -1585,9 +1584,11 @@ static const struct ae9_xcap ae9_xcaps[3] = {
 	  44100, 192000, AE9_SPDIF_IN_PIN },
 	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
 	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
+	/* no 176.4 kHz: ADC 0x08's rate list (param 0x0a = 0x000a05e4) has
+	 * 44.1/48/88.2/96/192 but not 176.4 (bit 9) */
 	{ "AE-9 Rear RCA In", 0xe0, 4, 2, 0x08,
 	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
-	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_192000,
 	  44100, 192000, 0 },
 };
 #define AE9_XCAP_WUH	1

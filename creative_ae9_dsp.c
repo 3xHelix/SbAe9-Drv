@@ -148,12 +148,57 @@ module_param(overlay, uint, 0444);
 MODULE_PARM_DESC(overlay, "Transfer the DSP overlay image (ctefx-ae9-overlay.bin) during the boot handshake (1=on, default)");
 #define AE9_OVERLAY_FILE	"ctefx-ae9-overlay.bin"
 
+/*
+ * Windows' soft retry for a failed DSP load (CtxHda 0065 FUN_00012d6c,
+ * 0x12e8c-0x12f5a): when the download (FUN_0012d914) or the boot handshake
+ * (FUN_00014ea8: 0x0c = 3/4/5/0, each polled for 2 s) fails, it sends
+ * DSP_INIT (DSPIO 0x703) until the reply isn't 1 (FUN_0001b024), waits
+ * 0.5 s and downloads again: 3 downloads in all. No shutdown, no power
+ * cycle. dsp_soft_tries = downloads per bring-up (1 = old behaviour).
+ */
+static unsigned int dsp_soft_tries = 3;
+module_param(dsp_soft_tries, uint, 0644);
+MODULE_PARM_DESC(dsp_soft_tries, "DSP downloads per bring-up when one fails, with Windows' DSP_INIT + 0.5 s between them (3 = Windows, default; 1 = none)");
+
+/*
+ * Test only: make the next DSP load(s) fail on purpose, to exercise the
+ * retry. 1 = stop the download after its first chunk (DSP never started),
+ * 2 = start the DSP but skip the boot handshake (as a DSP that never
+ * answered). Cleared when used; set it again for each test.
+ */
+static unsigned int dsp_fail_inject;
+module_param(dsp_fail_inject, uint, 0644);
+MODULE_PARM_DESC(dsp_fail_inject, "Test: fail the next DSP load once (1 = download, 2 = handshake); cleared when used");
+
+/* a retry (soft or a whole bring-up) comes after this attempt: don't sit
+ * out every timeout */
+static bool dsp_fail_fast(struct creative_chip *chip)
+{
+	return chip->resuming || chip->dsp_soft_left;
+}
+
 /* wait between a CA0113 command's value write and its commit: 20 ms for
  * the boot commands; volume changes (replay_quiet) use hu_cmd_settle_us */
 #define CA0113_SETTLE_US	20000
 static unsigned int hu_cmd_settle_us = 4000;
 module_param(hu_cmd_settle_us, uint, 0644);
 MODULE_PARM_DESC(hu_cmd_settle_us, "post_windows: CA0113 settle time for volume changes (us)");
+
+/*
+ * After the voice processor is routed in (VIP source 1), the DSP takes no
+ * messages for a while: with Voice Morphing every recording start's next
+ * message found the command queue full (6 of 6), with Noise Reduction 5 of
+ * 16, plain Voice Clarity 0 of 53 (journal 2026-11-08/09). Windows routes in,
+ * binds the ADC 51-66 ms later and sends nothing to the DSP for >= 975 ms
+ * (28 route-ins in 4 captures). Hold any DSP message this long after a
+ * route-in (0 = off).
+ */
+/* Off by default: Windows' order (route-in just before the bind) and the
+ * level block once per DSP load already end the route-in stalls (card
+ * test 2026-11-09: 0 kicks in 12 takes with and without the hold) */
+static unsigned int vc_quiet_ms;
+module_param(vc_quiet_ms, uint, 0644);
+MODULE_PARM_DESC(vc_quiet_ms, "Hold DSP messages this long after Voice Clarity routes the mic in, as Windows (ms; default 0 = off)");
 
 #define CAD			1		/* main codec address */
 #define WIDGET_CHIP_CTRL	0x15
@@ -503,10 +548,20 @@ static void dspio_write_wait(struct creative_chip *chip)
 			break;
 		msleep(20); /* match decompiled: give 8051 time to drain commands */
 	} while (time_before(jiffies, timeout));
+	/* still busy after 2 s: the word goes into a busy queue and can be
+	 * lost or misframed (the "not a reply header" lines that follow);
+	 * this used to be silent (Kaiba's distorted take, 0.12.3) */
+	if (status != VENDOR_STATUS_DSPIO_OK &&
+	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY) {
+		chip->scp_busy_writes++;
+		dev_warn_ratelimited(chip->dev, "DSP command queue still busy after 2 s (status 0x%x): writing anyway, the message may be lost (%u so far)\n",
+				     status, chip->scp_busy_writes);
+	}
 }
 
 static void dspio_clear_response_queue(struct creative_chip *chip);
 static int dsp_set_run_state(struct creative_chip *chip);
+static int dsp_kick(struct creative_chip *chip);
 /* Forward declarations for functions called during standup */
 
 static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
@@ -548,6 +603,11 @@ static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 	 * to un-halt it so it resumes consuming the queue, then wait. Without
 	 * this the queue stays full and every later SCP op fails -EIO
 	 * (select_lineout etc).
+	 *
+	 * Since the DSP has answered its boot handshake, dsp_kick() only
+	 * looks: a running DSP (halt state 0, every Voice Clarity route-in
+	 * stall) is left alone, a halted one is marked broken, never set
+	 * running again (see dsp_kick).
 	 */
 	timeout = jiffies + msecs_to_jiffies(500);
 	do {
@@ -558,14 +618,15 @@ static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 		if (!kicked) {
 			unsigned int dbg = ~0U;
 
-			/* Un-halt the 8051 so it resumes draining the queue.
-			 * Logged: this writes DBGCNTL, a suspect in the one
-			 * Linux DSP halt (2026-11-07 22:25, note 52d). */
+			/* Logged: before the handshake this writes DBGCNTL,
+			 * a suspect in the one Linux DSP halt (2026-11-07
+			 * 22:25, note 52d). */
 			creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
 			dev_warn_ratelimited(chip->dev, "DSP command queue full (DBGCNTL 0x%08x): kicking the DSP's run state\n",
 					     dbg);
-			dsp_set_run_state(chip);
 			kicked = 1;
+			if (dsp_kick(chip) == -EIO)
+				return -EIO;	/* halted itself: don't wait */
 		}
 		usleep_range(50, 100);
 	} while (time_before(jiffies, timeout));
@@ -892,6 +953,21 @@ static int dspio_scp(struct creative_chip *chip, int mod_id, int src_id,
 	int ret;
 
 	mutex_lock(&chip->scp_mutex);
+	if (chip->dsp_halted) {		/* dsp_kick: halted itself, logged once */
+		mutex_unlock(&chip->scp_mutex);
+		return -EIO;
+	}
+	/* the voice processor was just routed in: hold the message until the
+	 * DSP had Windows' quiet time (creative_ae9_cv_route) */
+	if (time_before(jiffies, chip->scp_quiet_until)) {
+		unsigned long left = chip->scp_quiet_until - jiffies;
+
+		if (left <= msecs_to_jiffies(vc_quiet_ms)) {
+			ae9_dbg(chip, "scp 0x%02x/0x%02x held %u ms (voice processor route-in)\n",
+				mod_id, req, jiffies_to_msecs(left));
+			msleep(jiffies_to_msecs(left));
+		}
+	}
 	ret = dspio_scp_unlocked(chip, mod_id, src_id, req, dir, data, len,
 				 reply, reply_len);
 	/*
@@ -1995,6 +2071,7 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 		{ 0x0c, 3 }, { 0x0c, 4 }, { 0x0c, 5 }, { 0x0c, 0 },
 	};
 	unsigned int i, tries;
+	unsigned long t0;
 	int ret, err = 0;
 	u32 v, chan;
 
@@ -2045,10 +2122,16 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 		ret = scp_set_u32(chip, MASTERCONTROL, states[i].req,
 				  states[i].val);
 		v = ~0U;
+		t0 = jiffies;
 		/* Each unanswered GET already waits up to 1s in dspio_scp(). */
 		for (tries = 0; tries < 10; tries++) {
 			if (scp_get_u32(chip, MASTERCONTROL, states[i].req,
 					&v) == 0 && v == states[i].val)
+				break;
+			/* with a retry to come: Windows' 2 s per state
+			 * (FUN_00029230), not ~11 s */
+			if (i == 0 && dsp_fail_fast(chip) &&
+			    time_after(jiffies, t0 + msecs_to_jiffies(2000)))
 				break;
 			/* Windows: the first GET reads 1, the next ~110 ms
 			 * later reads 3 (15 of 15 captures) */
@@ -2060,9 +2143,9 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			 v == states[i].val ? "" : " (NO MATCH)");
 		if (v != states[i].val) {
 			err = -ETIMEDOUT;
-			/* resume retries the whole bring-up instead of
-			 * sitting out every remaining timeout */
-			if (chip->resuming && i == 0)
+			/* a retry (soft or the whole bring-up) comes next:
+			 * don't sit out every remaining timeout */
+			if (dsp_fail_fast(chip) && i == 0)
 				return err;
 		}
 	}
@@ -2256,6 +2339,59 @@ static int dsp_set_run_state(struct creative_chip *chip)
 			return err;
 	}
 	return 0;
+}
+
+/*
+ * The DSP halted itself (found by dsp_kick): stop all DSP traffic until
+ * the next bring-up and say once what clears it. A warm re-start of a
+ * card in this state went dark (2026-11-09 08:36, codec 1 silent);
+ * sleep (S3 cuts the card's power) or a power-off brings it back.
+ */
+static void dsp_mark_halted(struct creative_chip *chip, unsigned int reg)
+{
+	unsigned int ovl = ~0U;
+
+	if (chip->dsp_halted)
+		return;
+	chip->dsp_halted = true;
+	chip->fx.dead = true;		/* no effect changes or profile uploads */
+	creative_dsp_chipio_read(chip, 0x3f3b4, &ovl);	/* overlay check word */
+	creative_dsp_chipio_addr_invalidate();
+	dev_err(chip->dev, "DSP halted itself (DBGCNTL 0x%08x, halt state %u, overlay 0x%08x%s): no more DSP messages; sleep (sudo rtcwake -m mem -s 25) or power off\n",
+		reg, (reg & DSP_DBGCNTL_STATE_MASK) >> DSP_DBGCNTL_STATE_LOBIT,
+		ovl, ovl == 0x04000086 ? "" : ", firmware gone");
+}
+
+/*
+ * Full SCP command queue. Before the DSP has answered its boot handshake
+ * (bring-up: the June "standup" halts this was written for) set it
+ * running as always. After that, never write DBGCNTL:
+ * - halt state 0 (35 of the 36 kicks logged 2026-11-08/09, every Voice
+ *   Clarity route-in stall): the DSP runs and is busy; nothing was ever
+ *   written there, the caller just keeps waiting.
+ * - halt state != 0 (2026-11-09 08:34:57, warm start #5: 0x...1860 then
+ *   0x...3cf0 = halted, the state of a reset DSP): the DSP stopped by
+ *   itself. Setting that running gave garbage (overlay 0xffffffff, every
+ *   reply 0xffffffff) and the next start found codec 1 dark. Mark it
+ *   halted instead and stop sending (-EIO).
+ * Three agreeing reads (dsp_dbgcntl_read_stable): one glitched read can't
+ * mark a running DSP halted. Unreadable: leave it alone, keep waiting.
+ */
+static int dsp_kick(struct creative_chip *chip)
+{
+	unsigned int reg, halt_state;
+
+	if (!chip->hs_done || !chip->hs_ok)
+		return dsp_set_run_state(chip);
+	if (chip->dsp_halted)
+		return -EIO;
+	if (dsp_dbgcntl_read_stable(chip, &reg) < 0)
+		return 0;
+	halt_state = (reg & DSP_DBGCNTL_STATE_MASK) >> DSP_DBGCNTL_STATE_LOBIT;
+	if (!halt_state)
+		return 0;
+	dsp_mark_halted(chip, reg);
+	return -EIO;
 }
 
 /* Router ports (ChipIO) */
@@ -2761,6 +2897,12 @@ static int dspxfr_image(struct creative_chip *chip,
 					port_map_mask);
 		if (status < 0)
 			break;
+		if (dsp_fail_inject == 1) {
+			dsp_fail_inject = 0;
+			dev_warn(chip->dev, "dspxfr: dsp_fail_inject=1: stopping the download after its first segment (test)\n");
+			status = -ETIMEDOUT;
+			break;
+		}
 		if (seg_is_hci(fls_data))
 			fls_data = seg_next(fls_data);
 		if (fls_data && !seg_is_last(fls_data))
@@ -2886,14 +3028,21 @@ static int dspload_image(struct creative_chip *chip,
 		 * and the first bring-up failed on 5 of 13 boots (2026-11-07).
 		 */
 		msleep(250);
-		hs = creative_dsp_boot_handshake(chip);
+		if (dsp_fail_inject == 2) {
+			dsp_fail_inject = 0;
+			dev_warn(chip->dev, "dspload: dsp_fail_inject=2: skipping the boot handshake (test)\n");
+			msleep(2000);	/* Windows' wait for state 3 */
+			hs = -ETIMEDOUT;
+		} else {
+			hs = creative_dsp_boot_handshake(chip);
+		}
 
 		chip->hs_done = 1;
 		chip->hs_ok = !hs;
 		dev_info(chip->dev,
 			 "dspload: run ret=%d, immediate boot handshake %s (%d)\n",
 			 r, hs ? "INCOMPLETE" : "complete", hs);
-		if (hs && chip->resuming)
+		if (hs && dsp_fail_fast(chip))
 			return -EIO;
 		return r;
 	}
@@ -3028,6 +3177,54 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
 	creative_ext_readl(chip, 0x210);
 }
 
+/*
+ * Windows' verbs at the top of each download (FUN_0012d914; the last 20 of
+ * ae9_cold_prefw, idx 795-814): PLL/PMU 0x00 = 0xff, the 96 kHz flags
+ * 9/8/6/7/11, connection points 0x0a/0x0b at 48 kHz. The cold replay sent
+ * them before the first try; a re-download sends them again, as Windows.
+ */
+static const u32 ae9_dl_prefix[] = {
+	0x11570d00, 0x11570cff, 0x11570f89, 0x11570f88, 0x11570f86,
+	0x11570f87, 0x11570f8b, 0x115f0100, 0x1157171d, 0x1157180a,
+	0x115f0100, 0x1157171e, 0x11571809, 0x115f0100, 0x1157171d,
+	0x1157180b, 0x115f0100, 0x1157171e, 0x11571809, 0x115f0100,
+};
+
+/* worth a re-download: not a missing card, firmware file or memory */
+static bool dsp_soft_retry_wanted(struct creative_chip *chip, int ret)
+{
+	return ret < 0 && ret != -ENODEV && ret != -ENOMEM && ret != -EINVAL &&
+	       !chip->card_gone;
+}
+
+/*
+ * Windows' dsp_reset between downloads (FUN_0001b024 via vt+0x198, then
+ * KeDelayExecutionThread -5000000): DSPIO 0x703 (DSP_INIT) on node 0x16,
+ * sent again while the DSP answers 1 (busy), then 0.5 s. dspio_send()
+ * caps the busy loop at 1 s (Windows has no cap; ca0132's dsp_reset 20 s).
+ */
+static void dsp_soft_reset(struct creative_chip *chip, unsigned int attempt,
+			   int why)
+{
+	u32 resp;
+	size_t i;
+	int r;
+
+	creative_dsp_chipio_addr_invalidate();
+	r = dspio_send(chip, VENDOR_DSPIO_DSP_INIT, 0);
+	dev_warn(chip->dev, "DSP load attempt %u failed (%d%s): DSP_INIT (0x703) -> %d%s, 0.5 s, downloading again (as Windows)\n",
+		 attempt, why, chip->hs_done && !chip->hs_ok ? ", boot handshake" : "",
+		 r, r == -EIO ? " (still busy after 1 s)" : "");
+	msleep(500);
+	for (i = 0; i < ARRAY_SIZE(ae9_dl_prefix); i++)
+		verb_send(chip, ae9_dl_prefix[i], &resp);
+	creative_dsp_chipio_addr_invalidate();
+	chip->hs_done = 0;
+	chip->hs_ok = false;
+	atomic_set(&chip->scp_unsol, 0);
+	chip->scp_unsol_done = 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public: download the DSP firmware					  */
 /* ------------------------------------------------------------------ */
@@ -3035,6 +3232,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 {
 	const struct firmware *fw;
 	const struct ae9_dsp_image_seg *fls;
+	unsigned int attempt, tries = max(dsp_soft_tries, 1U);
 	unsigned long timeout;
 	int ret;
 
@@ -3056,11 +3254,9 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 			     DSP_DBGCNTL_STATE_LOBIT;
 
 		if (loop_val && loop_val == 0x0bad0add) {
-			/* 0x801c contains the QEMU sentinel — not a real counter.
-			 * Treat as cold boot and fall through to firmware download.
-			 */
-			dev_info(chip->dev,
-				 "0x801c=0x%x is QEMU sentinel, treating as cold boot\n",
+			/* the firmware's own marker value, not a running
+			 * counter (first seen under QEMU, normal on the card) */
+			dev_info(chip->dev, "0x801c=0x%x: firmware marker, not a running loop\n",
 				 loop_val);
 			loop_val = 0;
 		}
@@ -3073,34 +3269,14 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 			loop_val = 0;
 		}
 
-		if (loop_val && halt_state == 0) {
-			/* Audio loop running and DSP not halted — genuinely
-			 * warm, skip firmware download entirely.
-			 */
-			dev_info(chip->dev,
-				 "DSP audio loop running (0x801c=0x%x halt=0); skipping firmware download\n",
+		/* Windows downloads every time (CtxHda, all captures); the
+		 * old skips keyed on values a previous run leaves behind */
+		if (loop_val && halt_state == 0)
+			dev_info(chip->dev, "DSP audio loop was running (0x801c=0x%x): downloading anyway, as Windows\n",
 				 loop_val);
-			return 0;
-		}
 	}
-	if (dspload_is_loaded(chip)) {
-		/* 0x40004==1 is unreliable after QEMU device reset: QEMU zeroes
-		 * EXRAM but leaves the loaded flag set. Detect this by checking
-		 * 0x800000 for the QEMU sentinel 0x0bad0add — if present, EXRAM
-		 * was wiped and we must re-download firmware despite 0x40004==1.
-		 */
-		unsigned int exram_check = 0;
-		creative_dsp_chipio_read(chip, 0x800000, &exram_check);
-		if (exram_check == 0x0bad0add) {
-			dev_info(chip->dev,
-				 "DSP firmware flag set but EXRAM zeroed (QEMU reset, 0x800000=0x%x) — re-downloading\n",
-				 exram_check);
-			/* fall through to firmware download */
-		} else {
-			dev_info(chip->dev, "DSP firmware already loaded; skipping download\n");
-			return 0;
-		}
-	}
+	if (dspload_is_loaded(chip))
+		dev_info(chip->dev, "DSP firmware flag set from an earlier run: downloading anyway, as Windows\n");
 
 	ret = ae9_request_fw(chip, &fw, DESKTOP_EFX_FILE, DESKTOP_EFX_SIZE);
 	if (ret < 0) {
@@ -3131,11 +3307,24 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	 *
 	 * Also clear 0x801c so the audio-loop counter starts at 0.
 	 */
-	dev_info(chip->dev, "dsp_load: cleared 0x40004 and 0x801c before download\n");
+	/* (the clear above was the pre-Windows path, removed in cleanup
+	 * round 3: Windows leaves both as found, and so do we) */
 
 	dev_info(chip->dev, "dsp_load: calling dspload_image\n");
-	ret = dspload_image(chip, fls);
-	dev_info(chip->dev, "dsp_load: dspload_image ret=%d\n", ret);
+	for (attempt = 1; ; attempt++) {
+		/* fail fast (2 s handshake) while another download can follow */
+		chip->dsp_soft_left = tries - attempt;
+		ret = dspload_image(chip, fls);
+		chip->dsp_soft_left = 0;
+		dev_info(chip->dev, "dsp_load: dspload_image ret=%d (download %u of %u)\n",
+			 ret, attempt, tries);
+		if (attempt >= tries || !dsp_soft_retry_wanted(chip, ret))
+			break;
+		dsp_soft_reset(chip, attempt, ret);
+		creative_dsp_prepare(chip);
+	}
+	if (attempt > 1 && ret == 0)
+		dev_info(chip->dev, "DSP load: download %u worked after DSP_INIT\n", attempt);
 	release_firmware(fw);
 	if (ret < 0) {
 		dev_err(chip->dev, "DSP load failed: %d\n", ret);
@@ -3243,6 +3432,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 			if (!fls_image_check(chip, fw2, DESKTOP_EFX_FILE)) {
 				unsigned long t2;
 
+				dsp_soft_reset(chip, attempt, -ETIMEDOUT);
 				creative_dsp_prepare(chip);
 				creative_dsp_chipio_write(chip, 0x40004, 0);
 				creative_dsp_chipio_write(chip, 0x801c,  0);
@@ -3493,6 +3683,10 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 		cv_set(chip, 0x80, 0x05, FLOAT_ONE);
 		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);	/* Windows' status read */
 		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 1);
+		/* the DSP now sets the voice processor up and takes no
+		 * messages for a while: hold the next one (dspio_scp) */
+		if (vc_quiet_ms)
+			chip->scp_quiet_until = jiffies + msecs_to_jiffies(vc_quiet_ms);
 	} else {
 		/* Windows' recording stop (cap4 s8): VIP 0, 0x80/05 0, the
 		 * status read, then the mic connections set to 16 kHz again and
@@ -3502,15 +3696,24 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 0);
 		cv_set(chip, 0x80, 0x05, FLOAT_ZERO);
 		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);
-		chipio_set_conn_rate(chip, MEM_CONNID_MICIN1, SR_16_000);
-		chipio_set_conn_rate(chip, MEM_CONNID_MICOUT1, SR_16_000);
-		cv_set(chip, 0x80, 0x00, FLOAT_ONE);
+		/* then the mic mode as it stands now (Windows' route-out,
+		 * FUN_00016704: the source's config with the current master
+		 * state): Voice Clarity still on = 16 kHz + 1.0 (a recording
+		 * stop), off = 96 kHz + 3.0, here while the ADC is unbound.
+		 * Setting 96 kHz only after the rebind left a running
+		 * recording on the 16 kHz path (Kaiba, 0.12.3, 2026-11-09) */
+		cv_conns(chip, AE9_CV_WANT(chip));
 	}
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
 	chip->cv.route_on = on;
 	dev_info(chip->dev, "Voice Clarity: voice processor %s the recording (0x80/0x3d = 0x%x)\n",
 		 on ? "in" : "out of", st);
+	/* Windows binds the ADC 51-66 ms after the route-in (FUN_00016704's
+	 * 50 ms wait; 18 route-ins at a recording start, 4 captures): the callers
+	 * bind right after this */
+	if (on)
+		msleep(60);
 }
 
 /* Teardown (sleep, reboot, unload): the voice processor out of the mic
@@ -3541,6 +3744,7 @@ void creative_ae9_cv_down(struct creative_chip *chip)
 void creative_ae9_cv_apply(struct creative_chip *chip)
 {
 	struct creative_ae9_cv *cv = &chip->cv;
+	bool routed_in = false;
 	unsigned int i;
 
 	if (!chip->dsp_done)
@@ -3600,15 +3804,21 @@ void creative_ae9_cv_apply(struct creative_chip *chip)
 
 			creative_ae9_corb_send_verb_sync(chip, 0x10770600, &resp);
 			msleep(20);	/* Windows: ~20 ms after the unbind */
-			creative_ae9_cv_route(chip, in);
+			creative_ae9_cv_route(chip, in);	/* in: + Windows' 60 ms */
 			creative_ae9_corb_send_verb_sync(chip, 0x10770600 |
 							 (CREATIVE_CAP_STREAM_TAG << 4), &resp);
+			routed_in = in;
 		}
 	}
-	mutex_lock(&chip->replay_mutex);
-	cv_conns(chip, AE9_CV_WANT(chip) || cv->route_on);
-	creative_dsp_chipio_addr_invalidate();
-	mutex_unlock(&chip->replay_mutex);
+	/* the route-in has just set the connections and 0x80/0x00 for Voice
+	 * Clarity: sending them again would be the DSP message Windows never
+	 * sends right after a route-in (dspio_scp would hold it 1 s) */
+	if (!routed_in) {
+		mutex_lock(&chip->replay_mutex);
+		cv_conns(chip, AE9_CV_WANT(chip) || cv->route_on);
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&chip->replay_mutex);
+	}
 	dev_info(chip->dev, "Voice Clarity %s (Acoustic Echo Cancellation %d, Noise Reduction %d, Smart Volume %d; Mic EQ %s; Voice Morphing %s)\n",
 		 cv->on ? "on" : "off", cv->fx[0], cv->fx[1], cv->fx[2],
 		 cv_miceq[cv->miceq].name, cv_voicefx[cv->voicefx].name);
@@ -3690,6 +3900,24 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 {
 	if (!chip->dsp_done)
 		return;
+	/*
+	 * The mic reaches the DSP only while ADC 0x07 is bound (2026-11-08:
+	 * monitor with playback only was silent, with a recording open it
+	 * played). Without a recording, bind it with Windows' record start
+	 * block and no DMA; the headphone-profile wait checks running DMA,
+	 * so it doesn't hold uploads back. A recording takes it over and
+	 * its stop gives it back (creative_ae9_cap_hw_free).
+	 *
+	 * Order: on = bind the mic, let it settle, then mix it in; off = stop
+	 * mixing, then release it. Mixing first played the half-started
+	 * input for a moment: a split-second crunch at monitor-on
+	 * (2026-11-09 uv1i A2).
+	 */
+	if (chip->cv.monitor && !chip->capture_substream && !chip->cv.mon_bound) {
+		creative_ae9_cap_replay(chip, true);	/* level block once per DSP load */
+		chip->cv.mon_bound = true;
+		msleep(50);
+	}
 	mutex_lock(&chip->replay_mutex);
 	dspio_set_uint_param(chip, 0x80, 0x0d,
 			     chip->cv.monitor ? FLOAT_ONE : FLOAT_ZERO);
@@ -3701,18 +3929,7 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
 				       &chip->cv.mon_used_kc->id);
 	}
-	/*
-	 * The mic reaches the DSP only while ADC 0x07 is bound (2026-11-08:
-	 * monitor with playback only was silent, with a recording open it
-	 * played). Without a recording, bind it with Windows' record start
-	 * block and no DMA; the headphone-profile wait checks running DMA,
-	 * so it doesn't hold uploads back. A recording takes it over and
-	 * its stop gives it back (creative_ae9_cap_hw_free).
-	 */
-	if (chip->cv.monitor && !chip->capture_substream && !chip->cv.mon_bound) {
-		creative_ae9_cap_replay(chip, true);
-		chip->cv.mon_bound = true;
-	} else if (!chip->cv.monitor && chip->cv.mon_bound && !chip->capture_substream) {
+	if (!chip->cv.monitor && chip->cv.mon_bound && !chip->capture_substream) {
 		creative_ae9_cap_replay(chip, false);
 		chip->cv.mon_bound = false;
 	}

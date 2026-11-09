@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.3"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.4"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -327,10 +327,20 @@ struct creative_chip {
 	unsigned int		hp_tries;	/* failed uploads in a row */
 	unsigned int		hp_leaks;	/* DSP DMA channels we couldn't free (this bring-up) */
 	bool			scp_fail_logged;	/* first failed DSP message logged (this bring-up) */
+	/* the DSP halted itself after its boot handshake: no more DSP
+	 * messages until the next bring-up (dsp.c, dsp_kick) */
+	bool			dsp_halted;
+	/* Windows' capture level block sent since this DSP load (Windows
+	 * sends it once per stream setup, never per recording) */
+	bool			cap_level_sent;
+	/* jiffies: no DSP message before this (the voice processor was just
+	 * routed in; Windows waits >= 975 ms, creative_ae9_cv_route) */
+	unsigned long		scp_quiet_until;
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
+	unsigned int		scp_busy_writes;	/* DSP words written into a busy queue */
 	int			pcm_started;  /* set after first PCM start — skips one-time ChipIO setup */
 	int			relay_engaged; /* set after relay fires — skip on repeated prepares */
 
@@ -366,6 +376,8 @@ struct creative_chip {
 	bool			suspended;
 	bool			resuming;	/* bring-up from resume: fail fast */
 	bool			hs_ok;		/* last boot handshake completed */
+	unsigned int		dsp_soft_left;	/* DSP_INIT re-downloads still to come in
+						 * this load: fail fast while > 0 */
 	unsigned int		hu_output;	/* 0 speakers (RCA), 1 headphones */
 	unsigned int		hu_att_out[2];	/* remembered volume per output */
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
@@ -481,6 +493,7 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
+void creative_ae9_cap_start(struct creative_chip *chip, bool route_vc);
 void creative_ae9_cap_irq(struct creative_chip *chip);
 void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
 void creative_ae9_opt_irq(struct creative_chip *chip);

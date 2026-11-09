@@ -897,13 +897,16 @@ void creative_ae9_fx_dsp_reset(struct creative_chip *chip)
 	chip->hp_leaks = 0;
 	chip->hp_tries = 0;
 	chip->scp_fail_logged = false;
+	chip->dsp_halted = false;	/* a new firmware start */
+	chip->cap_level_sent = false;	/* Windows' level block again */
+	chip->scp_quiet_until = jiffies;
 }
 
 /* After a bring-up (probe or resume) the DSP is back at its startup state:
  * effects off, speaker config 8. Only SBX on needs sending again. */
 void creative_ae9_fx_restore(struct creative_chip *chip)
 {
-	chip->fx.dead = false;
+	chip->fx.dead = chip->dsp_halted;	/* halted itself in the startup tail */
 	chip->fx.fails = 0;
 	chip->fx.hp_loaded = 0;		/* the DSP was reset */
 	creative_ae9_fx_hp_reset(chip);
@@ -920,7 +923,7 @@ void creative_ae9_fx_restore(struct creative_chip *chip)
  */
 void creative_ae9_fx_defer(struct creative_chip *chip)
 {
-	chip->fx.dead = false;
+	chip->fx.dead = chip->dsp_halted;	/* halted itself in the startup tail */
 	chip->fx.fails = 0;
 	chip->fx.hp_loaded = 0;		/* the DSP was reset */
 	creative_ae9_fx_hp_reset(chip);
