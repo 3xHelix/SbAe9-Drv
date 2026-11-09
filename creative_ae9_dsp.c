@@ -1638,6 +1638,7 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	unsigned int port, rl, i, t, seen, match = 0, unread = 0;
 	bool rb_bad = false, leak = false;
 	u32 lpib = 0, matched = 0;
+	unsigned int run_ms = 0;
 	int ret;
 
 	if (!chip->dsp_done || chip->card_gone)
@@ -1844,6 +1845,7 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 			usleep_range(500, 1000);
 		}
 		lpib = readl(chip->hda_regs + HPEQ_SD + AZX_REG_SD_LPIB);
+		run_ms = ktime_ms_delta(ktime_get(), t_run);
 	}
 	stopped = xfer_stream_stop(chip, HPEQ_SD, HPEQ_TAG);
 	if (seen < 3 || (v & BIT(chan)) || (v & ~0xfffU))
@@ -1909,11 +1911,15 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	} else {
 		ret = -EREMOTEIO;
 	}
-	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u)\n",
+	/* "still running" only when the last valid read had our bit on; the
+	 * extra fields pin down cut or stalled transfers (notes 60/61) */
+	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u; busy 0x%x, %u bad reads, %u verb timeout(s), stream at %u bytes after %u ms)\n",
 		 name, HPEQ_WORDS, addr, chan, port,
 		 !ret ? "done" : rb_bad ? "FAILED (read-back differs)" :
-		 seen ? "FAILED (still running)" : "FAILED (channel never started)",
-		 t, v0, v, seen);
+		 (v & BIT(chan)) ? "FAILED (still running)" :
+		 seen ? "FAILED (channel seen, end not confirmed)" :
+		 "FAILED (channel never started)",
+		 t, v0, v, seen, busy, bad, chip->corb_timeouts - to0, lpib, run_ms);
 free_port:
 	if (!leak)
 		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);

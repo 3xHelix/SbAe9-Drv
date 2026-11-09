@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.0"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.1"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -206,6 +206,7 @@ struct creative_chip {
 	u16			cap_format;	/* capture stream format for the start block */
 	/* optical (codec 2's S/PDIF converters, creative_ae9_pcm.c) */
 	bool			spdif_out;	/* "Optical Out Playback Switch" */
+	bool			spdif_mirror;	/* "Optical Out Mirror Switch" */
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
 	struct mutex		spdif_mutex;	/* the 0x05 binding (main and optical prepare) */

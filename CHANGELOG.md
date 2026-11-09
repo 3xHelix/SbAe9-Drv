@@ -3,6 +3,36 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.1 (2026-11-08)
+Two outputs, two streams. 🔀
+Pairs with [SbAe9-SBC v0.16.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out mirror toggle on Playback > Digital, Encoder page: AC-3, or experimental DTS, to optical) and [SbAe9-AudioMon v0.4.3](https://github.com/3xHelix/SbAe9-AudioMon) (Optical Out meter, bits/kHz per stream; thanks DarkNikGr).
+
+- **Changed: optical out no longer mirrors the main output by default**
+  (thanks DarkNikGr). The analog outputs and optical out are now two
+  separate outputs: optical plays only what's sent to it ("Optical Out" in
+  PipeWire, `hw:AE9,4`). **Upgrading:** if you used the optical jack as a
+  copy of the main output, switch "Optical Out Mirror Switch" on
+  (SbAe9-SBC: Playback > Digital, or
+  `amixer -c AE9 cset name='Optical Out Mirror Switch' on`; module
+  option `optical_mirror=1`). A stream sent to optical out always takes
+  priority over the mirror.
+- **New: What U Hear in 5.1.** With the 5.1 output profile ("Analog
+  Surround 5.1 Output + Analog Stereo Input") the What U Hear source
+  records all six channels (FL FR FC LFE RL RR, each level-exact), e.g. for
+  a software AC-3 encoder; `arecord -D hw:AE9,2 -c 6` works in any
+  profile. The stereo profiles keep the stereo source.
+- **Clearer headphone-profile log**: the upload result line says what
+  happened (done, read-back differs, still running, end not confirmed,
+  never started), with the stream position, run time and any verb
+  timeouts. Profiles load once playback and recording have been stopped
+  for a moment (about 10 s of real silence); a profile picked during
+  playback waits for that.
+
+**Thanks** 🙏 to **Kaiba** (the dump generator) and **DarkNikGr** (Mr. Needs
+Optical), whose reports, dumps, tests and code shaped this release and the
+ones before it, and a hat tip 🎩 to **HandsomeHans** for helping decode our
+boot tables a bit further.
+
 ## 0.12.0 (2026-11-08)
 A second output: optical gets its own stream. 💿
 Pairs with [SbAe9-SBC v0.15.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out on Playback > Digital, passthrough status) and [SbAe9-AudioMon v0.4.2](https://github.com/3xHelix/SbAe9-AudioMon) (kit 0.3.8).

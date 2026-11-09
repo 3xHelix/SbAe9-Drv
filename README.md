@@ -7,11 +7,11 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-08, v0.12.0):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-08, v0.12.1):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
-> Optical S/PDIF works both ways: out mirrors the main output (stereo, up
-> to 24-bit/192 kHz), in is its own recording device. What U Hear records
+> Optical S/PDIF works both ways: out is its own output (stereo, up
+> to 24-bit/192 kHz; mirrors the main output if you switch that on), in is its own recording device. What U Hear records
 > what the card plays. The head unit's rear RCA input, What U Hear and
 > optical in show up in PipeWire as their own sources.
 > The ACM head unit shows the volume; its knob sets the volume, a press
@@ -36,9 +36,10 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.0 pairs with SbAe9-SBC v0.15.0 (the separate optical
-> output on Playback > Digital, passthrough status) and SbAe9-AudioMon
-> v0.4.2; v0.11.x paired with SbAe9-SBC v0.14.0 and AudioMon v0.4.1. Older
+> Driver v0.12.1 pairs with SbAe9-SBC v0.16.0 (the Optical Out mirror
+> toggle on Playback > Digital, the Encoder page: AC-3, or experimental
+> DTS, to optical) and SbAe9-AudioMon v0.4.3 (Optical Out meter); v0.12.0
+> paired with SbAe9-SBC v0.15.0 and AudioMon v0.4.2. Older
 > SbC versions still work, with fewer controls.
 
 ## Hardware / Environment
@@ -127,7 +128,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.0-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.1-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -361,8 +362,11 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   were Default/Fast/Slow; a saved old choice comes back as the default
   once.)
 - Optical (S/PDIF, new): both ways, stereo, on the card's optical jacks.
-  - Out plays what the main output plays, whenever it's stereo at 24-bit
-    (the default "PCM Bit Depth") up to 192 kHz. It's silent at 32-bit,
+  - Out plays what you send to it: the "Optical Out" output (PCM device 4,
+    below). "Optical Out Mirror Switch" (off by default since 0.12.1; on
+    before) makes it also play what the main output plays while nothing
+    is sent to it, whenever that's stereo at 24-bit (the default "PCM Bit
+    Depth") up to 192 kHz. It's silent at 32-bit,
     at 384 kHz and in 5.1 (S/PDIF carries stereo up to 24-bit/192 kHz).
     It takes the stream as the app sends it, before the DSP: no SBX on
     it, and app volume shows on it but the knob and system volume don't
@@ -372,9 +376,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   - Separate optical output (new in 0.12.0, thanks DarkNikGr): PCM device
     4, `hw:AE9,4` ("AE-9 Optical Out"; the "Optical Out" output in
     PipeWire), its own stream at 44.1-192 kHz, 16-bit or 24-bit in 32.
-    While something plays to it, the optical jack carries that instead of
-    the mirror; when it stops (PipeWire closes it a few seconds later),
-    the mirror comes back. Dolby Digital / DTS passthrough to a receiver:
+    With the mirror switched on, the optical jack carries the main output
+    whenever nothing plays to it (PipeWire closes it a few seconds after
+    its last sound); with it off (default), optical stays silent then. Dolby Digital / DTS passthrough to a receiver:
     `ae9-optical-passthrough movie.mkv` (needs ffmpeg; it sets the S/PDIF
     "non-audio" bit while it plays: `iecset -c <card> audio off`, the
     "IEC958 Playback Default" control on device 4).
@@ -403,7 +407,11 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   In PipeWire it's the "What U Hear" source of the AE-9's card profile
   (since 0.11.0; nothing to copy), for recording or streaming the card's
   own output; it runs at PipeWire's rate (48 or 96 kHz; SbAe9-SBC can pin
-  it). Upgrading from 0.10.x: if you copied `ae9-what-u-hear.conf`,
+  it). With the 5.1 output profile ("Analog Surround 5.1 Output + Analog
+  Stereo Input") it records all six channels instead (since 0.12.1:
+  "What U Hear" source with node name `...what_u_hear_51`, FL FR FC LFE RL
+  RR; `arecord -D hw:AE9,2 -c 6 ...`), e.g. for an AC-3 encoder; the
+  stereo profiles keep the stereo source. Upgrading from 0.10.x: if you copied `ae9-what-u-hear.conf`,
   `ae9-rear-rca-in.conf` or `ae9-optical-in.conf` into
   `~/.config/pipewire/pipewire.conf.d/`, delete them, or each source shows
   up twice.
@@ -599,7 +607,7 @@ the card's chip during playback can freeze the audio until a full power-off
 | `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands |
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
-| `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (follows playback), optical in (device 1) and What U Hear (device 2) |
+| `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (device 4, or a mirror of playback), optical in (device 1) and What U Hear (device 2) |
 | `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
@@ -609,7 +617,7 @@ the card's chip during playback can freeze the audio until a full power-off
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
 | `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources for optical in, What U Hear and the rear RCA input. Since 0.11.0 the card profile opens them; don't copy these any more |
-| `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear", "AE-9 Optical In" |
+| `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear" (stereo and 5.1), "AE-9 Optical In", "AE-9 Optical Out", "AE-9 Analog Out" (the main output) |
 | `config/50-ae9-safe-volume.conf` | Installed by the packages (WirePlumber): the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (100% is the head unit at 0.0 dB) |
 
 ## Module parameters
@@ -683,8 +691,10 @@ what's left is tuning and diagnostics:
 - Recording: `cap_bits` (24, writable at runtime; also the "Capture Bit
   Depth" control) 24- or 32-bit recording samples.
 - Optical: `spdif_out` (1, writable at runtime; also the "Optical Out
-  Playback Switch") optical out follows the main output; 0 keeps it
-  silent.
+  Playback Switch") optical out on; 0 keeps it silent.
+  `optical_mirror` (0, writable at runtime; also the "Optical Out Mirror
+  Switch") 1 = optical plays the main output while nothing plays to
+  optical out (device 4), as before 0.12.1.
 
 ## Where this comes from
 

@@ -491,6 +491,16 @@ static int ae9_spdif_verb(struct creative_chip *chip, unsigned int nid,
  */
 static bool spdif_out = true;
 module_param(spdif_out, bool, 0644);
+/*
+ * Mirror off by default since 0.12.1 (DarkNikGr: with several speakers on
+ * different outputs, they shouldn't all play at once): optical plays only
+ * what's sent to the optical PCM. "Optical Out Mirror Switch" (or
+ * optical_mirror=1) brings back the 0.9-0.12.0 behaviour: the main output
+ * on optical while the optical PCM is unused.
+ */
+static bool optical_mirror;
+module_param(optical_mirror, bool, 0644);
+MODULE_PARM_DESC(optical_mirror, "Optical out mirrors the main output while nothing plays to the optical PCM (0 = off, default since 0.12.1); also 'Optical Out Mirror Switch'");
 MODULE_PARM_DESC(spdif_out, "Optical out on (1, default): the separate optical PCM, or else a mirror of the main output; also 'Optical Out Playback Switch'");
 
 /* 0x70d, digital converter 1: b0 DigEn, b2 VCFG, b4 COPY, b5 /AUDIO
@@ -508,7 +518,7 @@ MODULE_PARM_DESC(spdif_out, "Optical out on (1, default): the separate optical P
 static void ae9_spdif_out_apply_locked(struct creative_chip *chip)
 {
 	bool opt = chip->opt_format != 0;
-	u16 fmt = opt ? chip->opt_format : chip->pb_format;
+	u16 fmt = opt ? chip->opt_format : chip->spdif_mirror ? chip->pb_format : 0;
 	unsigned int tag = opt ? CREATIVE_OPT_STREAM_TAG : CREATIVE_PCM_STREAM_TAG;
 	bool nonaudio = opt && (chip->spdif_aes[0] & IEC958_AES0_NONAUDIO);
 	u8 dig1 = AE9_SPDIF_DIG1_PCM | (nonaudio ? AE9_SPDIF_DIG1_NONAUDIO : 0);
@@ -571,6 +581,38 @@ static int spdif_out_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	ae9_spdif_out_apply(chip);	/* takes effect on a playing stream */
 	return 1;
 }
+
+static int spdif_mirror_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->spdif_mirror;
+	return 0;
+}
+
+static int spdif_mirror_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->spdif_mirror)
+		return 0;
+	mutex_lock(&chip->spdif_mutex);
+	chip->spdif_mirror = on;
+	optical_mirror = on;
+	ae9_spdif_out_apply_locked(chip);	/* takes effect on a playing stream */
+	mutex_unlock(&chip->spdif_mutex);
+	return 1;
+}
+
+static const struct snd_kcontrol_new spdif_mirror_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Optical Out Mirror Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = spdif_mirror_get,
+	.put = spdif_mirror_put,
+};
 
 /* not "IEC958 ...": PipeWire's analog output paths switch that one off */
 static const struct snd_kcontrol_new spdif_out_control = {
@@ -1581,6 +1623,20 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 		runtime->hw.rates |= SNDRV_PCM_RATE_96000;
 		runtime->hw.rate_max = 96000;
 	}
+	if (i == AE9_XCAP_WUH) {
+		/* 2 or 6 channels: Windows records the card's mix as 48 kHz /
+		 * 24-bit / 6 ch from this converter for its PC-side encoder
+		 * loop (capture 6, memory optical-spdif); a software AC-3
+		 * encoder needs the 5.1 mix the same way */
+		static const unsigned int wuh_ch[] = { 2, 6 };
+		static const struct snd_pcm_hw_constraint_list wuh_ch_list = {
+			.count = ARRAY_SIZE(wuh_ch), .list = wuh_ch,
+		};
+
+		runtime->hw.channels_max = 6;
+		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
+					   &wuh_ch_list);
+	}
 	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
 	runtime->hw.period_bytes_min = 1024;
 	runtime->hw.period_bytes_max = CREATIVE_PCM_BUF_MAX / 2;
@@ -1958,6 +2014,10 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	ret = snd_ctl_add(chip->card, snd_ctl_new1(&spdif_out_control, chip));
 	if (ret < 0)
 		dev_warn(chip->dev, "Optical Out control not added (%d)\n", ret);
+	chip->spdif_mirror = optical_mirror;
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&spdif_mirror_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "Optical Out Mirror control not added (%d)\n", ret);
 	creative_ae9_xcap_new(chip, 0);	/* optical in */
 	creative_ae9_xcap_new(chip, 1);	/* What U Hear */
 	creative_ae9_xcap_new(chip, 2);	/* head unit rear RCA in */

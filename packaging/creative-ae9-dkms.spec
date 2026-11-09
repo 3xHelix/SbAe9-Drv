@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.0
+Version:        0.12.1
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -113,6 +113,9 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.1-1
+- Driver 0.12.1: optical out is its own output by default (mirror is a
+  switch), What U Hear in 5.1, clearer headphone-profile log
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.0-1
 - Driver 0.12.0: separate optical output with passthrough (DarkNikGr),
   headphone-profile uploads no longer cut short, quieter login, DKMS for
