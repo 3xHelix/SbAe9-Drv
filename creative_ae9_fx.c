@@ -36,7 +36,10 @@
 // With SBX off every effect and the EQ are off in the DSP; the controls
 // keep their values for the next time SBX is turned on.
 
+#include <linux/ctype.h>
 #include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/math64.h>
 #include <linux/moduleparam.h>
 #include <sound/core.h>
@@ -171,6 +174,13 @@ static const char * const spk_ch_names[6] = {
  * extracts them from Creative's installer (AE9HPEQ/<key>.reg) into
  * /lib/firmware/creative-ae9/hp/<key>.bin. Keys as in Creative's registry
  * files, names as Sound Blaster Command shows them.
+ *
+ * Four custom slots (not in Windows) at the end of the list, so saved
+ * picks of Creative's profiles keep their numbers: the same format, two
+ * 512-tap linear-phase FIRs at 48 kHz (left, right), made from a published
+ * measurement by ae9-hp-profile. hp_custom names them ("DT990=Beyerdynamic
+ * DT 990 PRO;DT880=..."): slot N loads hp/<KEY>.bin and shows the name; an
+ * empty slot shows "Custom N" and loads hp/custom<N>.bin.
  */
 static const struct { const char *key, *name; } hp_profiles[] = {
 	{ NULL,		"Off" },
@@ -206,7 +216,145 @@ static const struct { const char *key, *name; } hp_profiles[] = {
 	{ "H5",		"Sound BlasterX H5 TE" },
 	{ "H7",		"Sound BlasterX H7 TE" },
 	{ "P5",		"Sound BlasterX P5" },
+	{ "custom1",	"Custom 1" },
+	{ "custom2",	"Custom 2" },
+	{ "custom3",	"Custom 3" },
+	{ "custom4",	"Custom 4" },
 };
+
+#define HP_CUSTOM	4
+#define HP_CUSTOM0	(ARRAY_SIZE(hp_profiles) - HP_CUSTOM)
+#define HP_KEY_MAX	24
+#define HP_NAME_MAX	40
+
+static struct {
+	char key[HP_KEY_MAX + 1], name[HP_NAME_MAX + 1];
+} hp_custom_slot[HP_CUSTOM];
+static char hp_custom_val[HP_CUSTOM * (HP_KEY_MAX + HP_NAME_MAX + 2) + 1];
+static DEFINE_MUTEX(hp_custom_lock);
+static struct creative_chip *hp_custom_chip;	/* for the names' change event */
+static struct snd_kcontrol *hp_custom_kc;
+
+static bool hp_key_ok(const char *k)
+{
+	if (!*k || *k == '.')
+		return false;
+	for (; *k; k++)
+		if (!isalnum(*k) && *k != '_' && *k != '-' && *k != '.')
+			return false;
+	return true;
+}
+
+/* "KEY=Name;KEY=Name;;KEY=Name": slot by position, empty = unused */
+static int hp_custom_set(const char *val, const struct kernel_param *kp)
+{
+	typeof(hp_custom_slot) s = {};
+	char *buf, *p, *ent;
+	unsigned int n = 0;
+	int ret = 0;
+
+	if (strlen(val) >= sizeof(hp_custom_val))
+		return -ENOSPC;
+	buf = kstrdup(val, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	p = strim(buf);
+	while (p && !ret) {
+		char *eq;
+
+		ent = strsep(&p, ";");
+		ent = strim(ent);
+		if (n >= HP_CUSTOM) {
+			ret = *ent ? -E2BIG : 0;
+			continue;
+		}
+		if (*ent) {
+			eq = strchr(ent, '=');
+			if (eq)
+				*eq++ = '\0';
+			ent = strim(ent);
+			eq = eq ? strim(eq) : ent;
+			if (strlen(ent) > HP_KEY_MAX || !hp_key_ok(ent) ||
+			    strlen(eq) > HP_NAME_MAX || !*eq) {
+				ret = -EINVAL;
+				continue;
+			}
+			strscpy(s[n].key, ent, sizeof(s[n].key));
+			strscpy(s[n].name, eq, sizeof(s[n].name));
+		}
+		n++;
+	}
+	kfree(buf);
+	if (ret)
+		return ret;
+	mutex_lock(&hp_custom_lock);
+	memcpy(hp_custom_slot, s, sizeof(s));
+	hp_custom_val[0] = '\0';	/* the same, tidied: "KEY=Name;;KEY=Name" */
+	for (n = 0; n < HP_CUSTOM; n++) {
+		size_t l = strlen(hp_custom_val);
+
+		if (n)
+			l += scnprintf(hp_custom_val + l, sizeof(hp_custom_val) - l, ";");
+		if (s[n].key[0])
+			scnprintf(hp_custom_val + l, sizeof(hp_custom_val) - l, "%s=%s",
+				  s[n].key, s[n].name);
+	}
+	if (hp_custom_chip && hp_custom_kc)	/* SbAe9-SBC & co. re-read the names */
+		snd_ctl_notify(hp_custom_chip->card, SNDRV_CTL_EVENT_MASK_INFO,
+			       &hp_custom_kc->id);
+	mutex_unlock(&hp_custom_lock);
+	return 0;
+}
+
+static int hp_custom_get(char *buf, const struct kernel_param *kp)
+{
+	int n;
+
+	mutex_lock(&hp_custom_lock);
+	n = scnprintf(buf, PAGE_SIZE, "%s\n", hp_custom_val);
+	mutex_unlock(&hp_custom_lock);
+	return n;
+}
+
+static const struct kernel_param_ops hp_custom_ops = {
+	.set = hp_custom_set,
+	.get = hp_custom_get,
+};
+module_param_cb(hp_custom, &hp_custom_ops, NULL, 0644);
+MODULE_PARM_DESC(hp_custom, "Custom headphone profiles, by slot: \"KEY=Name;KEY=Name;...\" (up to 4; slot N loads creative-ae9/hp/<KEY>.bin and shows Name); written by ae9-hp-profile");
+
+/* firmware key (hp/<key>.bin) and shown name of profile e */
+static void hp_profile_id(unsigned int e, char *key, size_t klen,
+			  char *name, size_t nlen)
+{
+	unsigned int c = e - HP_CUSTOM0;
+
+	if (e < HP_CUSTOM0) {
+		if (key)
+			strscpy(key, hp_profiles[e].key ?: "", klen);
+		if (name)
+			strscpy(name, hp_profiles[e].name, nlen);
+		return;
+	}
+	mutex_lock(&hp_custom_lock);
+	if (key)
+		strscpy(key, hp_custom_slot[c].key[0] ? hp_custom_slot[c].key :
+			hp_profiles[e].key, klen);
+	if (name)
+		strscpy(name, hp_custom_slot[c].name[0] ? hp_custom_slot[c].name :
+			hp_profiles[e].name, nlen);
+	mutex_unlock(&hp_custom_lock);
+}
+
+void creative_ae9_fx_remove(struct creative_chip *chip)
+{
+	mutex_lock(&hp_custom_lock);
+	if (hp_custom_chip == chip) {
+		hp_custom_chip = NULL;
+		hp_custom_kc = NULL;
+	}
+	mutex_unlock(&hp_custom_lock);
+}
 
 static unsigned int fx_spk_cfg = 2;
 module_param(fx_spk_cfg, uint, 0444);
@@ -430,8 +578,10 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 			st = HP_WAIT;
 		} else {
 			fx->hp_waiting = false;
-			snprintf(name, sizeof(name), "creative-ae9/hp/%s.bin",
-				 hp_profiles[fx->hp_profile].key);
+			char key[HP_KEY_MAX + 1];
+
+			hp_profile_id(fx->hp_profile, key, sizeof(key), NULL, 0);
+			snprintf(name, sizeof(name), "creative-ae9/hp/%s.bin", key);
 			ret = creative_dsp_hpeq_upload(chip, name);
 			fx->hp_loaded = ret ? 0 : fx->hp_profile;
 			st = ret ? HP_RETRY : HP_LOADED;
@@ -465,12 +615,49 @@ static bool fx_ready(struct creative_chip *chip)
 }
 
 /* Windows' SBX profile sequence; with SBX off, everything off. */
+/*
+ * Headphone virtualization ("Virtual 7.1" in Creative's guide): with the
+ * output on headphones and Direct Mode off, Windows tells the DSP it is
+ * driving headphones, speaker config 0 (MASTERCONTROL 0x80/0x04 = 0), and
+ * SBX Surround becomes the headphone virtualizer; there is no other switch
+ * (Sound Blaster Command: one headphone config on the AE-9). Its headphone
+ * block (capture 4 s11, 00:58:27.54 #16040-16500; CtxHda FUN_00019534):
+ * levels and delays of all 8 channels 0, interleaved; config 0; X-Bass at
+ * 0x17 80 Hz; bass redirect off; no full-range pairs 0x1a-0x1d. We sent
+ * the speaker config (2.0..5.1) on headphones until 2026-11-09.
+ */
+static bool fx_hp_virt(struct creative_chip *chip)
+{
+	return !chip->fx.direct && chip->hu_output && chip->fx.hp_virt;
+}
+
 static void fx_apply_all_locked(struct creative_chip *chip)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
 	unsigned int i;
 
 	bool on;
+
+	if (fx_hp_virt(chip)) {
+		fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
+		/* Windows sends 8+8; the DSP rejects channels 7/8 (0x27/0x28/
+		 * 0x37/0x38, error replies in all 36 Windows sets), so 6+6 */
+		for (i = 0; i < 6; i++) {
+			fx_send(chip, FX_MID_OUT, 0x21 + i, 0, false);
+			fx_send(chip, FX_MID_OUT, 0x31 + i, 0, false);
+			usleep_range(10000, 11000);	/* CtxHda FUN_00019534: 10 ms */
+		}
+		fx_send(chip, FX_MID_MASTER, 0x04, 0, true);
+		/* X-Bass crossover gain: always 0.1 in Windows' headphone block
+		 * (every headphone + DSP block in all captures) */
+		fx_send(chip, FX_MID_OUT, 0x19, fx_f32(1, 10), false);
+		fx_send(chip, FX_MID_OUT, 0x17, fx_f32(80, 1), false);
+		fx_send(chip, FX_MID_OUT, 0x18, 0, false);
+		fx_send(chip, FX_MID_SPKEQ, 0x01, 0, false);
+		fx_hp_sync_locked(chip, false);
+		fx_send(chip, FX_MID_OUT, 0x15, 0, false);
+		goto effects;
+	}
 
 	/* Windows' order (capture 3, 19:56:08): mute, speaker config, speaker
 	 * block, on/offs, then values only for what is on, EQ on last. */
@@ -498,6 +685,7 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 	 * which the AE-9's stereo outputs don't have */
 	for (i = 0; i < 4; i++)
 		fx_send(chip, FX_MID_OUT, 0x1a + i, fx_f32(1, 1), false);
+effects:
 	for (i = 0; i < FX_COUNT; i++)
 		fx_send(chip, FX_MID_OUT, fx_req_on[i],
 			fx_f32(fx_eff(fx) && fx->on[i], 1), false);
@@ -526,8 +714,9 @@ static void fx_apply_all(struct creative_chip *chip)
 	fx_apply_all_locked(chip);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
-	dev_info(chip->dev, "Direct Mode %s, SBX %s (Surround %d, Dialog+ %d, Smart Volume %d, Crystalizer %d, Bass %d, EQ %d%s)\n",
+	dev_info(chip->dev, "Direct Mode %s, SBX %s%s (Surround %d, Dialog+ %d, Smart Volume %d, Crystalizer %d, Bass %d, EQ %d%s)\n",
 		 chip->fx.direct ? "on" : "off", chip->fx.sbx ? "on" : "off",
+		 fx_hp_virt(chip) ? ", headphone virtualization" : "",
 		 chip->fx.on[FX_SURROUND],
 		 chip->fx.on[FX_DIALOG], chip->fx.on[FX_SMARTVOL],
 		 chip->fx.on[FX_CRYSTAL], chip->fx.on[FX_BASS], chip->fx.eq_on,
@@ -661,6 +850,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 	fx->direct = true;
 	fx->spk = fx_spk_cfg == 1 ? 0 : 1;
 	fx->xover = XOVER_DEF;
+	fx->hp_virt = true;	/* Windows: always on with headphones, DSP mode */
 	for (i = 0; i < FX_COUNT; i++) {
 		fx->on[i] = fx_def_on[i];
 		fx->level[i] = fx_def_lvl[i];
@@ -754,11 +944,21 @@ static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 		return snd_ctl_enum_info(ui, 1, spk_count(), spk_names);
 	case K_HPPROF: {
 		static const char *names[ARRAY_SIZE(hp_profiles)];
+		static char cname[HP_CUSTOM][HP_NAME_MAX + 1];
+		static DEFINE_MUTEX(info_lock);	/* names[] is shared */
 		unsigned int i;
+		int ret;
 
+		mutex_lock(&info_lock);
 		for (i = 0; i < ARRAY_SIZE(hp_profiles); i++)
 			names[i] = hp_profiles[i].name;
-		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(hp_profiles), names);
+		for (i = 0; i < HP_CUSTOM; i++) {
+			hp_profile_id(HP_CUSTOM0 + i, NULL, 0, cname[i], sizeof(cname[i]));
+			names[HP_CUSTOM0 + i] = cname[i];
+		}
+		ret = snd_ctl_enum_info(ui, 1, ARRAY_SIZE(hp_profiles), names);
+		mutex_unlock(&info_lock);
+		return ret;
 	}
 	}
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
@@ -925,6 +1125,10 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 				snd_pcm_stop_xrun(ss);
 			}
 		}
+		/* Line Out Virtualization is DSP mode only: re-route after
+		 * the mode switch, from the heartbeat */
+		if (chip->lo_virt && chip->hu_output)
+			creative_ae9_hu_reroute_request(chip);
 		fx_update_active(chip);
 		return 1;
 	case K_SBX:
@@ -1054,7 +1258,12 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		if (e >= ARRAY_SIZE(hp_profiles) || e == fx->hp_profile)
 			return 0;
 		fx->hp_profile = e;
-		dev_info(chip->dev, "Headphone Profile: %s\n", hp_profiles[e].name);
+		{
+			char n[HP_NAME_MAX + 1];
+
+			hp_profile_id(e, NULL, 0, n, sizeof(n));
+			dev_info(chip->dev, "Headphone Profile: %s\n", n);
+		}
 		/* upload once the picker has been still for a moment */
 		chip->hp_tries = 0;
 		if (fx_live_spk(chip))
@@ -1097,8 +1306,8 @@ void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channel
 	struct creative_ae9_fx *fx = &chip->fx;
 	unsigned int want = fx->spk, i;
 
-	if (!ae9_surround)
-		return;
+	if (!ae9_surround || fx_hp_virt(chip))
+		return;	/* headphone mode: the DSP downmixes 5.1 itself */
 	if (channels == 6 && spk_idx(fx) <= 1)
 		want = 4;		/* 5.1 */
 	else if (channels == 2 && spk_idx(fx) == 4)
@@ -1183,6 +1392,12 @@ static int fx_add(struct creative_chip *chip, const char *name,
 	err = snd_ctl_add(chip->card, kc);	/* frees kc on error */
 	if (!err && chip->fx.nkc < ARRAY_SIZE(chip->fx.kc))
 		chip->fx.kc[chip->fx.nkc++] = kc;
+	if (!err && kind == K_HPPROF) {	/* for the custom names' change event */
+		mutex_lock(&hp_custom_lock);
+		hp_custom_chip = chip;
+		hp_custom_kc = kc;
+		mutex_unlock(&hp_custom_lock);
+	}
 	return err;
 }
 
@@ -1190,8 +1405,40 @@ static int fx_add(struct creative_chip *chip, const char *name,
  * Names avoid PipeWire's mixer-path element names ("Surround", "Bass",
  * "Treble" ...), so the desktop leaves them alone.
  */
+static int hp_virt_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->fx.hp_virt;
+	return 0;
+}
+
+static int hp_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->fx.hp_virt)
+		return 0;
+	chip->fx.hp_virt = on;
+	dev_info(chip->dev, "Headphone Virtualization %s\n", on ? "on" : "off");
+	if (!chip->fx.direct && chip->hu_output && !chip->dsp_switch_pending)
+		fx_apply_all(chip);
+	return 1;
+}
+
+static const struct snd_kcontrol_new hp_virt_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Headphone Virtualization Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = hp_virt_get,
+	.put = hp_virt_put,
+};
+
 int creative_ae9_fx_controls_add(struct creative_chip *chip)
 {
+	snd_ctl_add(chip->card, snd_ctl_new1(&hp_virt_control, chip));
 	char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 	unsigned int i;
 	int err;

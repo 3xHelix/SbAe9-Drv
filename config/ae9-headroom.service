@@ -1,0 +1,17 @@
+# Per-rate PipeWire headroom for the AE-9 (scripts/ae9-headroom.sh).
+#   cp scripts/ae9-headroom.sh ~/.local/bin/
+#   cp config/ae9-headroom.service ~/.config/systemd/user/
+#   systemctl --user enable --now ae9-headroom
+# Log: journalctl --user -u ae9-headroom
+[Unit]
+Description=AE-9 per-rate PipeWire headroom
+After=wireplumber.service
+Wants=wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/ae9-headroom.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

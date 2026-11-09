@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.1
+Version:        0.12.2
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -59,6 +59,7 @@ install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}/usr/bin/ae9-dsp-snapshot
 install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}/usr/bin/ae9-read-stress
 install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}/usr/bin/ae9-optical-passthrough
+install -D -m 755 scripts/ae9-hp-profile %{buildroot}/usr/bin/ae9-hp-profile
 install -d %{buildroot}/usr/share/creative-ae9/examples
 install -m 644 extract_firmware.py extract_overlay.py extract_hpeq.py %{buildroot}/usr/share/creative-ae9/
 for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do
@@ -110,9 +111,14 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/bin/ae9-dsp-snapshot
 /usr/bin/ae9-read-stress
 /usr/bin/ae9-optical-passthrough
+/usr/bin/ae9-hp-profile
 /usr/share/creative-ae9/
 
 %changelog
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.2-1
+- Driver 0.12.2: Voice Clarity, Voice Morphing and Mic EQ on the DSP, mic
+  monitoring, headphone and line-out virtualization, custom headphone
+  profiles (ae9-hp-profile)
 * Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.1-1
 - Driver 0.12.1: optical out is its own output by default (mirror is a
   switch), What U Hear in 5.1, clearer headphone-profile log

@@ -28,6 +28,7 @@
 #include <sound/hdaudio.h>
 
 #include <linux/moduleparam.h>
+#include <sound/control.h>
 #include "creative_ae9.h"
 #include "ca0132_regs.h"
 
@@ -1646,8 +1647,10 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	to0 = chip->corb_timeouts;
 	ret = request_firmware(&fw, name, chip->dev);
 	if (ret) {
-		dev_warn(chip->dev, "headphone profile: /lib/firmware/%s not available (%d); extract the profiles with ae9-get-firmware\n",
-			 name, ret);
+		dev_warn(chip->dev, "headphone profile: /lib/firmware/%s not available (%d); %s\n",
+			 name, ret, strstr(name, "/custom") ?
+			 "make one with ae9-hp-profile" :
+			 "extract the profiles with ae9-get-firmware");
 		return ret;
 	}
 	seg = (const void *)fw->data;
@@ -3299,3 +3302,443 @@ int creative_dsp_prepare(struct creative_chip *chip)
 	return 0;
 }
 
+
+
+/* ChipIO / DSPIO helpers used by Voice Clarity (restored after cleanup round 2) */
+static void chipio_set_control_param(struct creative_chip *chip,
+				     int param_id, int param_val)
+{
+	if (param_id < 32 && param_val < 8) {
+		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PARAM_SET,
+			  (param_val << 5) | param_id);
+	} else if (chipio_send(chip, VENDOR_CHIPIO_STATUS, 0) == 0) {
+		dsp_write(chip, WIDGET_CHIP_CTRL,
+			  VENDOR_CHIPIO_PARAM_EX_ID_SET, param_id);
+		dsp_write(chip, WIDGET_CHIP_CTRL,
+			  VENDOR_CHIPIO_PARAM_EX_VALUE_SET, param_val);
+	}
+}
+
+static void chipio_set_conn_rate(struct creative_chip *chip, int connid,
+				 int rate)
+{
+	chipio_set_control_param(chip, CONTROL_PARAM_CONN_POINT_ID, connid);
+	chipio_set_control_param(chip, CONTROL_PARAM_CONN_POINT_SR, rate);
+}
+
+static int dspio_set_uint_param(struct creative_chip *chip, int mod_id,
+				int req, unsigned int data)
+{
+	int ret = dspio_scp(chip, mod_id, 0x20, req, SCP_SET, &data,
+			    sizeof(data), NULL, NULL);
+	if (ret < 0) {
+		u32 sts = dsp_read(chip, WIDGET_DSP_CTRL,
+				   VENDOR_DSPIO_STATUS, 0);
+		dev_info(chip->dev,
+			 "set_uint_param mid=0x%x req=0x%x FAILED ret=%d sts=0x%x\n",
+			 mod_id, req, ret, sts);
+	}
+	return ret;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Voice Clarity and Voice Morphing (Creative's AE-9 names, Sound	  */
+/* Blaster Command > Recording; the kernel's ca0132 calls the set	  */
+/* CrystalVoice): the DSP's voice processing for the mic (XLR) path.	  */
+/*									  */
+/* The effects are DSP module 0x95 parameters, the same ones the	  */
+/* kernel's ca0132 driver uses (Acoustic Echo Cancellation req 0, Noise */
+/* Reduction 4, Smart Volume ("Mic SVM") 0x2c, Voice Morphing	  */
+/* ("VoiceFX") 10-18; presets from ca0132.c). The AE-9 has no Voice	  */
+/* Focus (Creative doesn't list it; ca0132 applies it to digital mics	  */
+/* only). Windows sends them all with the effects off during recording */
+/* (XLR recording capture, 2026-11-01), so the module is set up and	  */
+/* only the switches change here.					  */
+/*									  */
+/* The master switch reroutes the mic: on, its connections run at	  */
+/* 16 kHz through the voice processor (VIP source 1, module 0x80 req 5	  */
+/* on); off, back to 96 kHz and module 0x80 req 0 = 3.0, Windows'	  */
+/* recording value. The voice processor's output is 16 kHz data: with	  */
+/* the mic-out connection at 96 kHz the DSP stretches it without	  */
+/* filtering (mirror images above 8 kHz, metallic), at any other rate	  */
+/* it passes it as is (a third of the data for a 48 kHz stream). So the */
+/* recording runs at 16 kHz while Voice Clarity is on and the switch	  */
+/* takes effect when a recording starts (tested 2026-11-05). Voice	  */
+/* chat, not music: off by default.					  */
+/* ------------------------------------------------------------------ */
+#define CV_MID			0x95
+#define CV_VOICEFX_REQ		0x0a	/* 9 values, reqs 10-18 */
+#define MEM_CONNID_MICIN1	3
+#define MEM_CONNID_MICOUT1	12
+#define SR_16_000		0x04
+#define CONTROL_PARAM_VIP_SOURCE 1
+#define FLOAT_THREE		0x40400000
+
+/* The effects, by Creative's own enums (CtxHdC64.DLL, notes 13), ca0132's
+ * map and Windows' capture 4 (unicorn VC report F4/F5, 2026-11-08; the
+ * first map here was shifted by one): module 0x95 req 0x00 Acoustic Echo
+ * Cancellation, 0x04 Noise Reduction (Windows sends 0x47/0x00 with it, as
+ * ca0132 does), 0x2c Mic Smart Volume, 0x13 Mic EQ on (bands 0x14-0x1b). */
+#define CV_AEC_REQ		0x00
+#define CV_NR_REQ		0x04
+#define CV_SVM_REQ		0x2c
+#define CV_MICEQ_ON_REQ		0x13
+#define CV_MICEQ_REQ		0x14	/* 8 band gains in dB, 0x14-0x1b */
+
+/* Voice Morphing: Sound Blaster Command's 18 voices (PresetConfig.json
+ * VoiceFx, Creative's installer; names from its string table). Value 0 is
+ * the on switch (0x95/0x0a), then Creative's 8 values for reqs 0x0b-0x12.
+ * Robot matches Windows' captured values. */
+static const struct { const char *name; u32 vals[9]; } cv_voicefx[] = {
+	{ "Neutral",       { 0x00000000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3F800000, 0x3F800000, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Male",          { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3F19999A, 0x3F866666, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Female",        { 0x3F800000, 0x43C80000, 0x44AF0000, 0x450AC000, 0x4017AE14, 0x3F6B851F, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Kid",           { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x40400000, 0x3F28F5C3, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Elderly",       { 0x3F800000, 0x44324000, 0x44BB8000, 0x44E10000, 0x3FB33333, 0x3FB9999A, 0x3F800000, 0x3E3A29C7, 0x00000000 } },
+	{ "Deep Voice",    { 0x3F800000, 0x43A9C5AC, 0x44AA4FDF, 0x44FFC000, 0x3EDBB56F, 0x3F99C4CA, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "From Up North", { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3F800000, 0x3F800000, 0xBE538EF3, 0x00000000, 0x3E87676F } },
+	{ "Unstable",      { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x4017AE14, 0x3F6B851F, 0x40200000, 0x00000000, 0x00000000 } },
+	{ "Emo",           { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3F800000, 0x3F800000, 0x3E4CCCCD, 0x00000000, 0x00000000 } },
+	{ "Elf",           { 0x3F800000, 0x43C70000, 0x44AE6000, 0x45193000, 0x3F8E147B, 0x3F75C28F, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Dwarf",         { 0x3F800000, 0x43930000, 0x44BEE000, 0x45007000, 0x3F451EB8, 0x3F7851EC, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Demon",         { 0x3F800000, 0x43E28000, 0x44C10000, 0x45228000, 0x3F30A3D7, 0x40000000, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Infiltrator",   { 0x3F800000, 0x43480000, 0x44AB4000, 0x44FA0000, 0x3F9EB852, 0x3F87AE14, 0x3F800000, 0x3E051EB8, 0x00000000 } },
+	{ "Brute",         { 0x3F800000, 0x43BF8000, 0x44B28000, 0x451F6000, 0x3F266666, 0x3FA7DB4D, 0x3F800000, 0x3CF5C28F, 0x00000000 } },
+	{ "Orc",           { 0x3F800000, 0x43EA0000, 0x44A52000, 0x45098000, 0x3F28F5C3, 0x3FC00000, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Marine",        { 0x3F800000, 0x43C20000, 0x44906000, 0x44E70000, 0x3F4CCCCD, 0x3F8A3D71, 0x3F0A3D71, 0x00000000, 0x00000000 } },
+	{ "Chipmunk",      { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3F800000, 0x3F1A043A, 0x3F800000, 0x00000000, 0x00000000 } },
+	{ "Robot",         { 0x3F800000, 0x43C80000, 0x44AF0000, 0x44FA0000, 0x3FB26E98, 0x3F800000, 0xBC070111, 0x00000000, 0x00000000 } },
+};
+
+/* Mic EQ presets: 8 band gains (dB) for the bands Windows sets at boot
+ * (0x1c-0x23 = 62 Hz ... 6 kHz). Captured: DM-1; the other nine presets
+ * still to capture. */
+/* Mic EQ: Sound Blaster Command's list and names (PresetConfig.json
+ * VoiceEq + its string table, from Creative's installer), 8 band gains in
+ * dB for module 0x95 reqs 0x14-0x1b. Captures: Preset 1 picked in session 3,
+ * Preset DM-1 = the one Windows sent at boot (notes 05; "DM-1" there was
+ * really Preset 10). "Off" = Mic EQ enable 0x95/0x13 off. */
+static const struct { const char *name; s8 db[8]; } cv_miceq[] = {
+	{ "Off",							{ 0, 0, 0, 0, 0, 0, 0, 0 } },
+	{ "Preset 1 - Reduce Bass, harshness, improve clarity",	{ -3, -4, 0, 2, 3, -3, 4, 5 } },
+	{ "Preset 2 - Reduce Bass, improve vocal and clarity",	{ -3, -4, 0, 2, 4, -2, 2, 4 } },
+	{ "Preset 3 - Reduce harshness, improve vocal",		{ -2, -3, 3, 4, 4, -4, 3, 2 } },
+	{ "Preset 4 - Reduce Bass, improve vocal",		{ -3, -5, 0, 4, 4, -3, 0, 0 } },
+	{ "Preset 5 - Improve vocal, reduce harshness",		{ -2, -3, 2, 4, 4, 0, -3, 2 } },
+	{ "Preset 6 - Reduce Bass, improve clarity",		{ -5, -4, -2, 0, 3, 4, 6, 7 } },
+	{ "Preset 7 - Reduce vocal, improve bass/clarity",	{ 0, 3, -2, -4, -4, -2, 5, 7 } },
+	{ "Preset 8 - Reduce harshness, improve vocal/clarity",	{ 0, 0, 2, 2, 3, -4, 2, 4 } },
+	{ "Preset 9 - Reduce harshness, improve clarity",	{ 0, 0, 2, 2, -2, 0, -4, 4 } },
+	{ "Preset 10 - Improve clarity",			{ 0, 2, -2, 0, 3, 5, 6, 5 } },
+	{ "Preset DM-1 - Improve vocal and clarity",		{ 0, 8, 0, 12, 12, 4, 8, 10 } },
+};
+
+static u32 cv_float(int v)	/* small integer -> IEEE float bits */
+{
+	u32 sign = v < 0 ? 0x80000000 : 0, m = v < 0 ? -v : v, e = 0;
+
+	if (!m)
+		return 0;
+	while (m >= 2 << e)
+		e++;
+	return sign | ((127 + e) << 23) | ((m << (23 - e)) & 0x7fffff);
+}
+
+/* The mic connections: Voice Clarity runs them at 16 kHz with module
+ * 0x80 req 0 at 1.0; off puts them back at 96 kHz (Windows sends just
+ * that, nothing to 0x80 or the DSP's mic streams). Caller holds
+ * replay_mutex. */
+/* Voice Clarity's DSP messages, paced as Windows sends them (2-3 ms
+ * apart, capture 4 s8): sent back to back, a voice change (9 values) plus
+ * the route-in filled the DSP's command queue (cv-morph, 2026-11-09:
+ * "queue full ... kicking the DSP" on 3 of 6 voices). */
+static void cv_set(struct creative_chip *chip, int mid, int req, u32 val)
+{
+	dspio_set_uint_param(chip, mid, req, val);
+	usleep_range(2000, 3000);
+}
+
+static void cv_conns(struct creative_chip *chip, bool on)
+{
+	chipio_set_conn_rate(chip, MEM_CONNID_MICIN1, on ? SR_16_000 : SR_96_000);
+	chipio_set_conn_rate(chip, MEM_CONNID_MICOUT1, on ? SR_16_000 : SR_96_000);
+	if (on)
+		cv_set(chip, 0x80, 0x00, FLOAT_ONE);
+}
+
+/* Recording start/stop with Voice Clarity on: the voice processor in
+ * (module 0x80 req 5 = 1.0, VIP source 1) or out. Windows does this per
+ * recording and never touches the DSP's mic streams 3/4 (switching those
+ * on scrambled the 8051 router: tinny DSP mode, 2026-11-05 21:14).
+ * Windows' timing: in ~0.1 s after the stream is set up, before the ADC
+ * is bound; out ~30 ms after it is unbound; ~2-3 ms between messages. */
+void creative_ae9_cv_route(struct creative_chip *chip, bool on)
+{
+	if (!chip->dsp_done)
+		return;
+	mutex_lock(&chip->replay_mutex);
+	u32 st = 0;
+
+	if (on) {
+		cv_conns(chip, true);
+		cv_set(chip, 0x80, 0x05, FLOAT_ONE);
+		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);	/* Windows' status read */
+		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 1);
+	} else {
+		/* Windows' recording stop (cap4 s8): VIP 0, 0x80/05 0, the
+		 * status read, then the mic connections set to 16 kHz again and
+		 * 0x80/00 back to 1.0. Without the last two a second route-in
+		 * recorded the plain mic on the left and noise on the right
+		 * (cv-order 2026-11-08, takes 5/6) */
+		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 0);
+		cv_set(chip, 0x80, 0x05, FLOAT_ZERO);
+		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);
+		chipio_set_conn_rate(chip, MEM_CONNID_MICIN1, SR_16_000);
+		chipio_set_conn_rate(chip, MEM_CONNID_MICOUT1, SR_16_000);
+		cv_set(chip, 0x80, 0x00, FLOAT_ONE);
+	}
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	chip->cv.route_on = on;
+	dev_info(chip->dev, "Voice Clarity: voice processor %s the recording (0x80/0x3d = 0x%x)\n",
+		 on ? "in" : "out of", st);
+}
+
+/* Send the whole Voice Clarity state, in Windows' order: the master
+ * (module 0x95 req 4 and module 0x47 req 0), Voice Morphing, each effect
+ * (off unless the master is on), Mic EQ, then the mic connections. */
+void creative_ae9_cv_apply(struct creative_chip *chip)
+{
+	struct creative_ae9_cv *cv = &chip->cv;
+	unsigned int i;
+
+	if (!chip->dsp_done)
+		return;
+	mutex_lock(&chip->replay_mutex);
+	/* Windows' order for every change (cap4 s8): Voice Morphing, Noise
+	 * Reduction + 0x47/0x00, Echo Cancellation, Smart Volume, Mic EQ */
+	/* the multi-value presets only when they change: resending all 17
+	 * at every switch filled the DSP's command queue (cv-talk take 3,
+	 * 2026-11-08); Windows sends them only on a preset change */
+	if (cv->on && cv->voicefx) {
+		if (cv->sent_voicefx != (int)cv->voicefx)
+			for (i = 0; i < 9; i++)
+				cv_set(chip, CV_MID, CV_VOICEFX_REQ + i,
+						     cv_voicefx[cv->voicefx].vals[i]);
+		cv->sent_voicefx = cv->voicefx;
+	} else {
+		cv_set(chip, CV_MID, CV_VOICEFX_REQ, FLOAT_ZERO);
+		cv->sent_voicefx = 0;
+	}
+	cv_set(chip, CV_MID, CV_NR_REQ,
+			     cv->on && cv->fx[1] ? FLOAT_ONE : FLOAT_ZERO);
+	cv_set(chip, 0x47, 0x00,
+			     cv->on && cv->fx[1] ? FLOAT_ONE : FLOAT_ZERO);
+	cv_set(chip, CV_MID, CV_AEC_REQ,
+			     cv->on && cv->fx[0] ? FLOAT_ONE : FLOAT_ZERO);
+	cv_set(chip, CV_MID, CV_SVM_REQ,
+			     cv->on && cv->fx[2] ? FLOAT_ONE : FLOAT_ZERO);
+	cv_set(chip, CV_MID, CV_MICEQ_ON_REQ,
+			     cv->on && cv->miceq ? FLOAT_ONE : FLOAT_ZERO);
+	if (cv->on && cv->sent_miceq != (int)cv->miceq) {
+		for (i = 0; i < 8; i++)
+			cv_set(chip, CV_MID, CV_MICEQ_REQ + i,
+					     cv_float(cv_miceq[cv->miceq].db[i]));
+		cv->sent_miceq = cv->miceq;
+	}
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	/*
+	 * A recording already running: switch the voice processor too, and
+	 * set the mic connections after it. Going out, cv_route(false) leaves
+	 * them at 16 kHz (Windows' recording stop), so the 96 kHz of "no
+	 * effect" must come last, or every later plain recording ran through
+	 * 16 kHz connections (unicorn mic report, 2026-11-08). Going in only
+	 * on a 48 kHz stream (Windows records 0x31 with it), with the ADC
+	 * bound again after the route, as at a recording start.
+	 */
+	if (chip->capture_substream && chip->cap_start_sent) {
+		struct snd_pcm_runtime *rt = chip->capture_substream->runtime;
+
+		bool in = AE9_CV_WANT(chip) && !cv->route_on && rt && rt->rate == 48000;
+		bool out = !AE9_CV_WANT(chip) && cv->route_on;
+
+		/* never with the ADC bound: unbind, switch, bind again */
+		if (in || out) {
+			u32 resp;
+
+			creative_ae9_corb_send_verb_sync(chip, 0x10770600, &resp);
+			msleep(20);	/* Windows: ~20 ms after the unbind */
+			creative_ae9_cv_route(chip, in);
+			creative_ae9_corb_send_verb_sync(chip, 0x10770600 |
+							 (CREATIVE_CAP_STREAM_TAG << 4), &resp);
+		}
+	}
+	mutex_lock(&chip->replay_mutex);
+	cv_conns(chip, AE9_CV_WANT(chip) || cv->route_on);
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	dev_info(chip->dev, "Voice Clarity %s (Acoustic Echo Cancellation %d, Noise Reduction %d, Smart Volume %d; Mic EQ %s; Voice Morphing %s)\n",
+		 cv->on ? "on" : "off", cv->fx[0], cv->fx[1], cv->fx[2],
+		 cv_miceq[cv->miceq].name, cv_voicefx[cv->voicefx].name);
+}
+
+/* private_value: 0 master, 1-3 effects, 4 Voice Morphing, 5 Mic EQ */
+static int cv_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	if (kc->private_value == 5) {
+		static const char *names[ARRAY_SIZE(cv_miceq)];
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(cv_miceq); i++)
+			names[i] = cv_miceq[i].name;
+		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(cv_miceq), names);
+	}
+	if (kc->private_value == 4) {
+		static const char *names[ARRAY_SIZE(cv_voicefx)];
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(cv_voicefx); i++)
+			names[i] = cv_voicefx[i].name;
+		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(cv_voicefx), names);
+	}
+	return snd_ctl_boolean_mono_info(kc, ui);
+}
+
+static int cv_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned long k = kc->private_value;
+
+	if (k == 4)
+		uv->value.enumerated.item[0] = chip->cv.voicefx;
+	else if (k == 5)
+		uv->value.enumerated.item[0] = chip->cv.miceq;
+	else
+		uv->value.integer.value[0] = k ? chip->cv.fx[k - 1] : chip->cv.on;
+	return 0;
+}
+
+static int cv_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	struct creative_ae9_cv *cv = &chip->cv;
+	unsigned long k = kc->private_value;
+
+	if (k == 4 || k == 5) {
+		unsigned int v = uv->value.enumerated.item[0];
+		unsigned int *p = k == 4 ? &cv->voicefx : &cv->miceq;
+
+		if (v >= (k == 4 ? ARRAY_SIZE(cv_voicefx) : ARRAY_SIZE(cv_miceq)))
+			return -EINVAL;
+		if (v == *p)
+			return 0;
+		*p = v;
+	} else {
+		bool v = !!uv->value.integer.value[0];
+		bool *p = k ? &cv->fx[k - 1] : &cv->on;
+
+		if (v == *p)
+			return 0;
+		*p = v;
+	}
+	/* effect changes only act with the master on; the master always */
+	if (k == 0 || cv->on)
+		creative_ae9_cv_apply(chip);
+	return 1;
+}
+
+/*
+ * Hardware mic monitoring (Windows' "LineMic1Monitor", CtxHda.sys
+ * FUN_0002733c): one DSP message, module 0x80 req 0x0d = 1.0 / 0, sent
+ * only with the DSP running; 0 at every boot. Windows re-applies the
+ * voice processor route after it when that is in (FUN_000161fc). The DSP
+ * mixes the mic into the output with no host round trip (zero delay).
+ */
+void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
+{
+	if (!chip->dsp_done)
+		return;
+	mutex_lock(&chip->replay_mutex);
+	dspio_set_uint_param(chip, 0x80, 0x0d,
+			     chip->cv.monitor ? FLOAT_ONE : FLOAT_ZERO);
+	creative_dsp_chipio_addr_invalidate();
+	mutex_unlock(&chip->replay_mutex);
+	/*
+	 * The mic reaches the DSP only while ADC 0x07 is bound (2026-11-08:
+	 * monitor with playback only was silent, with a recording open it
+	 * played). Without a recording, bind it with Windows' record start
+	 * block and no DMA; the headphone-profile wait checks running DMA,
+	 * so it doesn't hold uploads back. A recording takes it over and
+	 * its stop gives it back (creative_ae9_cap_hw_free).
+	 */
+	if (chip->cv.monitor && !chip->capture_substream && !chip->cv.mon_bound) {
+		creative_ae9_cap_replay(chip, true);
+		chip->cv.mon_bound = true;
+	} else if (!chip->cv.monitor && chip->cv.mon_bound && !chip->capture_substream) {
+		creative_ae9_cap_replay(chip, false);
+		chip->cv.mon_bound = false;
+	}
+	dev_info(chip->dev, "Mic Monitor %s%s\n", chip->cv.monitor ? "on" : "off",
+		 chip->cv.mon_bound ? " (mic input held for it)" : "");
+}
+
+static int mic_monitor_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->cv.monitor;
+	return 0;
+}
+
+static int mic_monitor_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->cv.monitor)
+		return 0;
+	chip->cv.monitor = on;
+	creative_ae9_mic_monitor_apply(chip);
+	return 1;
+}
+
+static const struct snd_kcontrol_new mic_monitor_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Mic Monitor Playback Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = mic_monitor_get,
+	.put = mic_monitor_put,
+};
+
+int creative_ae9_cv_controls_add(struct creative_chip *chip)
+{
+	snd_ctl_add(chip->card, snd_ctl_new1(&mic_monitor_control, chip));
+	/* Creative's names (Sound Blaster Command > Recording) */
+	static const char * const names[6] = {
+		"Voice Clarity Capture Switch",
+		"Acoustic Echo Cancellation Capture Switch",
+		"Noise Reduction Capture Switch",
+		"Mic Smart Volume Capture Switch",	/* "Smart Volume" there */
+		"Voice Morphing Capture Enum",
+		"Mic EQ Capture Enum",
+	};
+	struct snd_kcontrol_new kn = {
+		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = cv_info, .get = cv_get, .put = cv_put,
+	};
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		kn.name = names[i];
+		kn.private_value = i;
+		err = snd_ctl_add(chip->card, snd_ctl_new1(&kn, chip));
+		if (err < 0)
+			return err;
+	}
+	return 0;
+}

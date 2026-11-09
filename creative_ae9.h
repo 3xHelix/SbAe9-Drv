@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.1"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.2"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -256,6 +256,7 @@ struct creative_chip {
 		u8		spk;		/* index into spk_cfgs (fx.c) */
 		/* speaker setup (Direct Mode off) */
 		bool		bass_redirect;
+		bool		hp_virt;	/* "Headphone Virtualization": DSP headphone mode (config 0) */
 		u8		xover;		/* bass redirect crossover, Hz */
 		s8		sub_gain;	/* dB */
 		s8		spk_level[6];	/* dB: FL FR C LFE RL RR */
@@ -275,6 +276,17 @@ struct creative_chip {
 		struct snd_kcontrol *kc[48];
 		unsigned int	nkc;
 	} fx;
+	struct creative_ae9_cv {		/* Voice Clarity / Voice Morphing, creative_ae9_dsp.c */
+		bool		on;		/* "Voice Clarity": mic through the voice processor */
+		bool		fx[3];		/* Acoustic Echo Cancellation, Noise Reduction, Smart Volume */
+		unsigned int	voicefx;	/* Voice Morphing preset, 0 = Neutral (off) */
+		unsigned int	miceq;		/* Mic EQ preset, 0 = Flat */
+		bool		route_on;	/* mic route as last set: voice processor (16 kHz) */
+		int		sent_voicefx;	/* last sent to the DSP, -1 = resend */
+		int		sent_miceq;
+		bool		monitor;	/* "Mic Monitor": the DSP mixes the mic into the output */
+		bool		mon_bound;	/* ADC 0x07 bound for the monitor, no recording */
+	} cv;
 
 	/* debugfs */
 	struct dentry		*dbg_dir;
@@ -357,6 +369,9 @@ struct creative_chip {
 	int			hu_phantom_req;	/* phantom power to send: 0/1, -1 = none */
 	unsigned long		hu_phantom_hold; /* "on" requests ignored until (jiffies) */
 	int			hu_switch_to;	/* pending output switch, -1 none */
+	bool			lo_virt;	/* "Line Out Virtualization": headphone mode on the line out */
+	bool			lo_virt_phys;	/* the line out carries the headphone mode now */
+	bool			hu_reroute;	/* pending: redo the headphone routing */
 	unsigned int		hu_light;	/* knob light on */
 	int			hu_light_sent;	/* knob light as last sent, -1 unknown */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
@@ -490,11 +505,23 @@ int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
 			   unsigned int req, unsigned int count, unsigned int wait_us);
 void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
+void creative_ae9_fx_remove(struct creative_chip *chip);
+void creative_ae9_cv_apply(struct creative_chip *chip);
+void creative_ae9_cv_route(struct creative_chip *chip, bool on);
+int creative_ae9_cv_controls_add(struct creative_chip *chip);
+void creative_ae9_mic_monitor_apply(struct creative_chip *chip);
+/* Windows routes the voice processor in only while an effect is on; the
+ * Voice Clarity master alone is UI-only (cap4: master on, nothing on ->
+ * conns 96 kHz, no route) */
+#define CREATIVE_CAP_STREAM_TAG	1	/* mic capture stream tag (ADC 0x07 bind) */
+#define AE9_CV_WANT(c)	((c)->cv.on && ((c)->cv.fx[0] || (c)->cv.fx[1] || \
+			 (c)->cv.fx[2] || (c)->cv.miceq || (c)->cv.voicefx))
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
 void creative_ae9_fx_dsp_reset(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_fx_output_changed(struct creative_chip *chip);
+void creative_ae9_hu_reroute_request(struct creative_chip *chip);
 void creative_ae9_fx_hp_work(struct work_struct *w);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
 void creative_ae9_fx_spk_follow_work(struct work_struct *w);

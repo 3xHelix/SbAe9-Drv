@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-08, v0.12.1):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-09, v0.12.2):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -28,6 +28,10 @@ playback.
 > the DSP. With Direct Mode off there's also Sound Blaster Command's speaker
 > setup (bass redirection, per-speaker level and distance) and its 32
 > headphone profiles.
+> New in 0.12.2, also on the card's DSP: Voice Clarity and Voice Morphing
+> for the mic, zero-delay mic monitoring, headphone virtualization
+> ("Virtual 7.1") and its line out version, and your own headphone
+> profiles.
 > This repository holds only what you need to build and run the driver.
 > Changes per release: **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -36,10 +40,10 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.1 pairs with SbAe9-SBC v0.16.0 (the Optical Out mirror
-> toggle on Playback > Digital, the Encoder page: AC-3, or experimental
-> DTS, to optical) and SbAe9-AudioMon v0.4.3 (Optical Out meter); v0.12.0
-> paired with SbAe9-SBC v0.15.0 and AudioMon v0.4.2. Older
+> Driver v0.12.2 pairs with SbAe9-SBC v0.17.0 (Voice Clarity, Voice
+> Morphing, mic monitor and virtualization pages, the "Optical out plays"
+> selector) and SbAe9-AudioMon v0.4.4; v0.12.1 paired with SbAe9-SBC
+> v0.16.1 and AudioMon v0.4.3. Older
 > SbC versions still work, with fewer controls.
 
 ## Hardware / Environment
@@ -128,7 +132,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.1-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.2-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -352,6 +356,42 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   the desktop microphone slider moves it (100% = +9 dB). Mic Gain stays
   separate. Phantom power is the 48V button on the head unit's front panel;
   the driver doesn't need to do anything.
+- Voice Clarity (new in 0.12.2): Sound Blaster Command's Recording page,
+  run on the card's DSP as Windows does, for the head unit's mic input.
+  "Voice Clarity Capture Switch" is the master; under it "Acoustic Echo
+  Cancellation Capture Switch" (takes the speakers' sound out of the mic,
+  about 43 dB in our test), "Noise Reduction Capture Switch", "Mic Smart
+  Volume Capture Switch" and "Mic EQ Capture Enum" (Off, or Creative's 11
+  presets, "Preset 1 - Reduce Bass, harshness, improve clarity" to
+  "Preset 10 - Improve clarity" and "Preset DM-1 - Improve vocal and
+  clarity"). All off by default. The mic goes through the DSP's voice
+  processor only while the master and at least one effect are on;
+  otherwise it records as before.
+  It sounds like Windows: wideband voice with nothing above 8 kHz (the
+  voice processor runs at 16 kHz), and Noise Reduction thins the low end.
+  For voice chat, not music. While an effect is on, the mic records at
+  48 kHz only (Windows does the same). Changes act at the next recording
+  start, or at once on a recording already running at 48 kHz. Example:
+  `amixer -c AE9 cset name='Voice Clarity Capture Switch' on`, then
+  `amixer -c AE9 cset name='Noise Reduction Capture Switch' on` and
+  `amixer -c AE9 cset name='Mic EQ Capture Enum' 'Preset 10 - Improve clarity'`.
+- Voice Morphing (new in 0.12.2): "Voice Morphing Capture Enum", Sound
+  Blaster Command's 18 voices: Neutral (off, the default), Male, Female,
+  Kid, Elderly, Deep Voice, From Up North, Unstable, Emo, Elf, Dwarf,
+  Demon, Infiltrator, Brute, Orc, Marine, Chipmunk, Robot. It's part of
+  Voice Clarity: it acts with "Voice Clarity Capture Switch" on, at 48 kHz
+  (`amixer -c AE9 cset name='Voice Morphing Capture Enum' Robot`).
+- Mic monitoring (new in 0.12.2): "Mic Monitor Playback Switch" (off by
+  default) plays the head unit's mic input on the output with zero delay,
+  mixed inside the DSP, like Windows' mic monitor. Direct Mode off only.
+  The driver holds the mic input for it, so no app has to record. It plays
+  once DSP mode has been set up by some playback since boot: with Direct
+  Mode off, play something for a few seconds first. Use headphones: on
+  speakers the mic picks itself up and feeds back. On:
+  `amixer -c AE9 cset name='Mic Monitor Playback Switch' on`. Software
+  monitoring (the desktop's "Listen", a pw-loopback) still works, with a
+  short delay; if you set a PipeWire headroom, use the per-rate one (see
+  "Low latency").
 - DAC filter (seven since 0.11.0, thanks to DarkNikGr): the ES9038's
   digital filters with the Creative app's names: Apodizing Fast Roll Off
   (Windows' startup filter, the default), Fast Roll Off, Slow Roll Off,
@@ -382,6 +422,10 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     `ae9-optical-passthrough movie.mkv` (needs ffmpeg; it sets the S/PDIF
     "non-audio" bit while it plays: `iecset -c <card> audio off`, the
     "IEC958 Playback Default" control on device 4).
+    While something holds `hw:AE9,4` directly (the passthrough script,
+    an encoder), don't switch the card profile: PipeWire then builds it
+    without the "Optical Out" output, which comes back at the next profile
+    change.
   - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1 to
     192 kHz, so it records alongside the XLR mic
     (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). In PipeWire
@@ -449,16 +493,53 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   "Bass Redirect Sub Boost Switch" (subwoofer boost, on/off); per speaker (Front L/R,
   Center, Sub, Rear L/R) "Speaker Level ... Volume" (-12..+12 dB) and
   "Speaker Distance ..." (0-500 cm of delay, as Windows' calibration).
+  Measured on the card's C/Sub jack (0.12.2): the sub's -6 dB point lands
+  on the crossover setting (82 Hz at 80, 205 Hz at 200), with Bass
+  Redirect off the sub is silent, and Sub Boost adds about 15 dB.
   "Headphone Profile" (0.10.0): Sound Blaster Command's 32 headphone curves
   (ATH-M50, HD 280 Pro, ...), active with Direct Mode off, headphones out
   and a 48 kHz stream; off on speakers. The curves are Creative's:
   `ae9-get-firmware` installs them from Creative's installer (step 1).
+  Your own profiles (0.12.2): up to four, made from a published
+  measurement of your headphones by `ae9-hp-profile` (AutoEQ's
+  corrections, thousands of models), listed under their own names:
+  `sudo ae9-hp-profile add "Beyerdynamic DT 990 Pro" DT990` fetches the
+  correction, saves `/lib/firmware/creative-ae9/hp/DT990.bin` and lists it
+  as "Beyerdynamic DT 990 Pro" (in SbAe9-SBC too); empty slots show as
+  "Custom 1" to "Custom 4". Pick it there or with
+  `amixer -c AE9 cset name='Headphone Profile' 'Beyerdynamic DT 990 Pro'`.
+  `ae9-hp-profile list` shows the slots, `sudo ae9-hp-profile remove
+  DT990` frees one; `fetch`, `make` and `install` do the steps one by one
+  (`ae9-hp-profile --help` explains them; your own CSV of
+  frequency and gain works too). The slots live in
+  `/etc/modprobe.d/creative-ae9-hp.conf` (`hp_custom`) and change in the
+  running driver at once. A profile loads once nothing has played for a
+  few seconds; to load a new file for a profile already picked, pick "Off"
+  and then it again. They never boost (the DSP stage clips), so they play
+  a few dB quieter.
   Works on speakers and headphones, across sleep and reboots. With Direct
   Mode off, a new stream after boot, wake or a switch made while stopped
   plays direct for 3 s (`dsp_switch_ms`), then moves to the DSP. Turning
   Direct Mode on restarts a stream that was going through the DSP by itself
   (0.9.4); one still waiting to move there (a 44.1 kHz stream stays direct)
   keeps playing (0.10.0).
+- Headphone virtualization (new in 0.12.2): "Headphone Virtualization
+  Switch", on by default as in Windows. With headphones selected and
+  Direct Mode off, the DSP runs its headphone mode, Creative's "Virtual
+  7.1": SBX Surround ("SBX Switch" and "FX Surround") is the virtualizer,
+  as in Windows, and 5.1 (6-channel) sources are placed around you. The
+  speaker setup (Speaker Config, Bass Redirect, per-speaker level and
+  distance) doesn't apply in this mode. Off, headphones get the older
+  speaker-style DSP path. It does nothing on speakers or in Direct Mode
+  (`amixer -c AE9 cset name='Headphone Virtualization Switch' off`).
+- Line out virtualization (new in 0.12.2): "Line Out Virtualization
+  Switch", Creative's "Apply Headphones Virtualization to Line Out", off by
+  default. With Headphones selected and Direct Mode off, the virtualized
+  headphone mix plays on the card's RCA out instead, and the head unit's
+  headphone jacks are silent (for example, for headphones on an external
+  amp). The volume is the headphone volume, so turn the knob down before
+  you switch it on. "Head Unit Output" still reads Headphones. On:
+  `amixer -c AE9 cset name='Line Out Virtualization Switch' on`.
 - Volume: turn the head-unit knob (0.5 dB per step, ~1 dB per click); press
   it to mute or unmute. The same setting is the ALSA "Master Playback
   Volume" / "Master Playback Switch" (`alsamixer -c AE9`; `hu_master=0`
@@ -485,14 +566,33 @@ read point and cures it. Values tested clean down to quantum 32-64
 | 192 kHz | 144 | up to 97 frames |
 | 384 kHz | 256 | up to 195 frames |
 
-PipeWire takes one headroom per output, so pick the one for the rate you
-use most. `config/60-ae9-headroom.conf` sets 256, which covers every rate
-(edit the number for a lower one):
+PipeWire takes one headroom per output. Two ways to set it:
 
-```sh
-cp config/60-ae9-headroom.conf ~/.config/wireplumber/wireplumber.conf.d/
-systemctl --user restart wireplumber
-```
+- Per rate (recommended): `scripts/ae9-headroom.sh` runs as a user
+  service and sets the value from the table for the rate the card is
+  running at. When the rate changes on its own it waits 2 s, sets the new
+  value and reopens the output once (a short gap, like a pause).
+
+  ```sh
+  cp scripts/ae9-headroom.sh ~/.local/bin/
+  cp config/ae9-headroom.service ~/.config/systemd/user/
+  systemctl --user enable --now ae9-headroom
+  ```
+
+- Fixed: `config/60-ae9-headroom.conf` sets 256, which covers every rate
+  (edit the number for the rate you use most, e.g. 64 for 48 kHz).
+
+  ```sh
+  cp config/60-ae9-headroom.conf ~/.config/wireplumber/wireplumber.conf.d/
+  systemctl --user restart wireplumber
+  ```
+
+A fixed 256 breaks live software mic monitoring ("Listen", a pw-loopback
+from the mic to the AE-9 output): with the mic driving the clock, PipeWire
+resyncs the output dozens of times a second and the monitor sounds
+chopped up (64 and 128 are fine). If you monitor the mic, use the per-rate
+service or a lower fixed value, or the card's own "Mic Monitor Playback
+Switch", which doesn't go through PipeWire.
 
 `pcm_posbuf=1` logs the read-ahead every 2 s while playing, to check it on
 your card.
@@ -604,11 +704,11 @@ the card's chip during playback can freeze the audio until a full power-off
 | File | Purpose |
 |---|---|
 | `creative_ae9_core.c` | PCI probe, bus reset, HDA reset, codec detection, Windows replays (pre-download, post-boot), head-unit poll/display/knob and ALSA volume controls, debugfs, module params |
-| `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands |
+| `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands, Voice Clarity / Voice Morphing / Mic EQ and mic monitoring |
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O |
 | `creative_ae9_pcm.c` | ALSA PCM playback, XLR capture, optical out (device 4, or a mirror of playback), optical in (device 1) and What U Hear (device 2) |
-| `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls |
+| `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls, speaker setup, headphone profiles and headphone virtualization |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
 | `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
 | `extract_firmware.py`, `extract_overlay.py` | Extract the DSP firmware and overlay from Creative's `CtxHda.sys` |
@@ -616,6 +716,8 @@ the card's chip during playback can freeze the audio until a full power-off
 | `config/` | Boot binding (udev rule, modprobe hook, dracut omit) and optional module options |
 | `scripts/restore-stock-audio.sh` | Remove the driver and restore stock `snd_hda_intel` |
 | `config/60-ae9-headroom.conf` | Optional PipeWire headroom for small quantums (see "Low latency") |
+| `scripts/ae9-headroom.sh`, `config/ae9-headroom.service` | Optional per-rate PipeWire headroom, as a user service (see "Low latency") |
+| `scripts/ae9-hp-profile` | Makes and installs your own headphone profiles (see "Headphone Profile") |
 | `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources for optical in, What U Hear and the rear RCA input. Since 0.11.0 the card profile opens them; don't copy these any more |
 | `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear" (stereo and 5.1), "AE-9 Optical In", "AE-9 Optical Out", "AE-9 Analog Out" (the main output) |
 | `config/50-ae9-safe-volume.conf` | Installed by the packages (WirePlumber): the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (100% is the head unit at 0.0 dB) |
@@ -679,6 +781,11 @@ what's left is tuning and diagnostics:
 - SBX: `fx_spk_cfg` (2) the "Speaker Config" setting at load (1 = 2.0,
   2 = 2.1 as Windows); `dsp_switch_ms` (3000, writable at runtime) how long a fresh
   stream plays direct before the switch to the DSP.
+- Headphone profiles: `hp_custom` (empty, writable at runtime) the four
+  custom slots of "Headphone Profile", `KEY=Name;KEY=Name;...` (slot N
+  loads `creative-ae9/hp/<KEY>.bin` and shows Name; an empty slot shows
+  "Custom N"). `ae9-hp-profile` writes it, in
+  `/etc/modprobe.d/creative-ae9-hp.conf` and in the running driver.
 - Playback buffer (all writable at runtime, applied at the next stream):
   `pcm_periods` (8) most periods per buffer, 2-32 (2 is Windows' 48 kHz
   layout; with 2 an app asking for a big quantum could fill the whole

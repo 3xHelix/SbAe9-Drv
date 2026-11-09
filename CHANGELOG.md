@@ -3,6 +3,62 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.2 (2026-11-09)
+Everything on Sound Blaster Command's list. 🎙️🎧
+Pairs with [SbAe9-SBC v0.17.0](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity, Voice Morphing, mic monitor and virtualization pages, the optical out selector) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **New: Voice Clarity on the card's DSP**, as Windows does it:
+  "Acoustic Echo Cancellation" (takes the speakers' sound out of the mic,
+  about 43 dB on our card), "Noise Reduction", "Mic Smart Volume" and
+  "Mic EQ" with Creative's 11 presets (Preset 1-10, Preset DM-1). It sounds
+  like Windows: a clean wideband voice with an 8 kHz top (the voice
+  processor runs at 16 kHz). Controls: "Voice Clarity Capture Switch" and
+  one switch per effect; recordings run at 48 kHz while an effect is on.
+  The DSP route had been parked since 0.9 because it sounded metallic; the
+  cause was found (our recording stop left the voice processor half
+  routed) and Voice Clarity now matches Windows step for step.
+- **New: Voice Morphing**, all 18 of Creative's voices ("Voice Morphing
+  Capture Enum": Male, Female, Kid, Elderly, Deep Voice, From Up North,
+  Unstable, Emo, Elf, Dwarf, Demon, Infiltrator, Brute, Orc, Marine,
+  Chipmunk, Robot; Neutral = off).
+- **New: mic monitoring with no delay** ("Mic Monitor Playback Switch"):
+  the card's DSP mixes the mic into what you hear, as Windows' mic monitor
+  does. Direct Mode off; it plays once anything has played in DSP mode
+  since boot. Use headphones.
+- **New: headphone virtualization** ("Virtual 7.1" in Creative's guide):
+  on headphones with Direct Mode off the DSP now runs in its headphone
+  mode, as Windows does, and SBX Surround places 5.1 sources around you.
+  We used to send the speaker layout on headphones. "Headphone
+  Virtualization Switch", on by default.
+- **New: "Apply Headphones Virtualization to Line Out"** ("Line Out
+  Virtualization Switch", off by default): with Headphones selected, the
+  virtualized headphone mix plays on the card's RCA out and the headphone
+  jack is silent. Turn the knob down first: it uses the headphone volume.
+- **New: your own headphone profiles** (DarkNikGr's idea). The new
+  `ae9-hp-profile` command makes one from a published measurement: it
+  takes AutoEQ's correction for your model (thousands of headphones,
+  measured by oratory1990, crinacle, Rtings and others) and turns it into
+  the same kind of filter as Creative's profiles (two 512-tap
+  linear-phase FIRs at 48 kHz). `sudo ae9-hp-profile add "Beyerdynamic DT
+  990 Pro" DT990` saves it as `DT990.bin` and lists it in "Headphone
+  Profile" (and SbAe9-SBC) as "Beyerdynamic DT 990 Pro"; up to four,
+  `list` and `remove` manage them. Like Creative's, they work on
+  headphones with Direct Mode off; they never boost, so they play a few
+  dB quieter.
+- **Checked: the speaker setup** with a measurement on the card's C/Sub
+  jack: the crossover lands on its setting (50-200 Hz), bass redirection
+  off leaves the sub silent, Sub Boost adds about 15 dB.
+- **Fix: live mic monitoring ("Listen") sounded chopped up** with the
+  optional fixed 256-frame PipeWire headroom: PipeWire resynced the output
+  dozens of times a second while the mic drove the clock. The README now
+  points to the per-rate headroom service (64 at 48 kHz) instead.
+- Driver v0.12.1 now pairs with SbAe9-SBC v0.16.1 (its encoder fix).
+
+**Thanks** 🙏 to **DarkNikGr** (custom headphone profiles, the reason the
+optical out has two lives) and to everyone sending dumps. The Voice
+Clarity, Virtual 7.1 and Line Out work came from Windows captures read
+alongside Creative's own app and driver code.
+
 ## 0.12.1 (2026-11-08)
 Two outputs, two streams. 🔀
 Pairs with [SbAe9-SBC v0.16.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out mirror toggle on Playback > Digital, Encoder page: AC-3, or experimental DTS, to optical) and [SbAe9-AudioMon v0.4.3](https://github.com/3xHelix/SbAe9-AudioMon) (Optical Out meter, bits/kHz per stream; thanks DarkNikGr).

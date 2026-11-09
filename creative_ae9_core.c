@@ -1030,7 +1030,12 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	}
 	/* the feed repair is for the stereo layout (00 -> 90, 01 -> 80); in
 	 * the 6-ch one those SRCs carry HDA 04/05 */
+	/* not while the voice processor is in: its mic path uses these SRCs,
+	 * and "repairing" them mixed the playback into the recording
+	 * (cv-talk take 3, 2026-11-08; Windows writes no router entries at a
+	 * playback start during Voice Clarity) */
 	if (n == AE9_RT_ENTRIES && l == 0xc0 && r == 0xc1 && chip->in05_ch != 6 &&
+	    !chip->cv.route_on &&
 	    !(chip->pcm_start_sent && (chip->pcm_start_fmt & 0xf) == 5)) {
 		for (i = 0; i < 2; i++) {
 			u32 want = 0x10000 | hda_src[i] << 8 | i;
@@ -1540,10 +1545,13 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 			u8 *c = cmds[n];
 
 			memcpy(c, ae9_cold_ca0113_pcm[i], 3);
+			/* the jack in use: Line Out Virtualization keeps
+			 * headphone mode (map 0xa1) on the line out, or a new
+			 * stream would turn the headphone jack back on */
 			if (c[0] == 0x48 && c[1] == 0x1d)
-				c[2] = hp ? 0x80 : 0x40;
+				c[2] = hp && !chip->lo_virt_phys ? 0x80 : 0x40;
 			else if (c[0] == 0x48 && c[1] == 0x19)
-				c[2] = hp ? 0x01 : 0x00;
+				c[2] = hp && !chip->lo_virt_phys ? 0x01 : 0x00;
 			else if (c[0] == 0x48 && c[1] == 0x01 && fam441)
 				c[2] = 0xc1;
 			else if (c[0] == 0x48 && c[1] == 0x0a) {
@@ -2868,6 +2876,88 @@ static void creative_ae9_ops_replay(struct creative_chip *chip,
  * f0 22 02 01 01 / 00 on the head unit, which is the SBX light (item 01):
  * it flashes, then ends off. The heartbeat puts the real state back.
  */
+/*
+ * "Apply Headphones Virtualization to Line Out" (Sound Blaster Command;
+ * CtxHda property 0x75 HeadphoneOutput = 1, FUN_00020bdc): with Headphones
+ * selected and Direct Mode off, the card stays in headphone mode (map 0xa1,
+ * DSP speaker config 0, the headphone SBX/EQ/profile) but the head unit
+ * plays it out of the card's RCA out, so the headphone jack is silent.
+ * Switching to Headphones with it on (capture 4 s11 00:58:27.54 #16040-
+ * 16500): the speaker switch, except ChipIO 0x0d = 0xa1, pin 0x0f pinctl
+ * 0x00 and no GPIO 0x320 write. Toggling it while on Headphones (00:57:53,
+ * 00:58:37, 00:59:43, 01:00:11): only the jack select (creative_ae9_hu_jack).
+ */
+static bool ae9_lo_virt_on(struct creative_chip *chip)
+{
+	return chip->lo_virt && !chip->fx.direct;
+}
+
+static void creative_ae9_hu_route(struct creative_chip *chip, bool hp)
+{
+	struct ae9_bar2_op *ops;
+	size_t i, n = 0;
+
+	chip->lo_virt_phys = hp && ae9_lo_virt_on(chip);
+	if (hp && !chip->lo_virt_phys) {
+		creative_ae9_ops_replay(chip, ae9_sw_to_hp, ARRAY_SIZE(ae9_sw_to_hp),
+					"head unit: switch to headphones");
+		return;
+	}
+	if (!hp) {
+		creative_ae9_ops_replay(chip, ae9_sw_to_sp, ARRAY_SIZE(ae9_sw_to_sp),
+					"head unit: switch to speakers");
+		return;
+	}
+	ops = kmalloc_array(ARRAY_SIZE(ae9_sw_to_sp), sizeof(*ops), GFP_KERNEL);
+	if (!ops) {	/* plain headphones, so the state matches the hardware */
+		chip->lo_virt_phys = false;
+		creative_ae9_ops_replay(chip, ae9_sw_to_hp, ARRAY_SIZE(ae9_sw_to_hp),
+					"head unit: switch to headphones");
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(ae9_sw_to_sp); i++) {
+		struct ae9_bar2_op o = ae9_sw_to_sp[i];
+
+		if (o.type == 'W' && o.off == 0x320)
+			continue;		/* GPIO stays as it was */
+		if (o.type == 'V' && o.val == 0x115718a4)
+			o.val = 0x115718a1;	/* map: headphone (DualHP) */
+		else if (o.type == 'V' && o.val == 0x10f707c0)
+			o.val = 0x10f70700;	/* pin 0x0f off */
+		ops[n++] = o;
+	}
+	creative_ae9_ops_replay(chip, ops, n,
+				"head unit: headphone mode on the card's RCA out (Line Out Virtualization)");
+	kfree(ops);
+}
+
+/*
+ * Windows' HeadphoneOutput toggle while on Headphones (capture 4 s11
+ * 00:57:53.650, 00:58:37.991, 00:59:43.788, 01:00:11.723): the jack select
+ * only (CtxHda FUN_000357fc index 0xb); no pins, GPIO, volume or switch
+ * list. A whole switch list would also send its mid-list DSP messages
+ * (config 8, unmute), the switch-table state of the output-switch fault.
+ */
+static void creative_ae9_hu_jack(struct creative_chip *chip, bool lo)
+{
+	const struct ae9_bar2_op ops[] = {
+		{'C', 0, 0x48, lo ? 0x1d40 : 0x1d80, 0, {0}},
+		{'V', 0, 0, 0x1157170d, 0, {0}},
+		{'V', 0, 0, 0x115718a1, 0, {0}},
+		{'S', 0, 0, 0, 7, {0xf0, 0x03, 0x03, 0x02, lo ? 0x00 : 0x40, 0x40, 0xf7}},
+		{'C', 0, 0x48, 0x0d00, 0, {0}}, {'C', 0, 0x48, 0x1600, 0, {0}},
+		{'C', 0, 0x48, 0x1700, 0, {0}}, {'C', 0, 0x48, 0x1800, 0, {0}},
+		{'C', 0, 0x48, lo ? 0x1900 : 0x1901, 0, {0}},
+		{'C', 0, 0x48, 0x11ff, 0, {0}}, {'C', 0, 0x48, 0x12ff, 0, {0}},
+		{'C', 0, 0x48, 0x13ff, 0, {0}}, {'C', 0, 0x48, 0x147f, 0, {0}},
+	};
+
+	chip->lo_virt_phys = lo;
+	creative_ae9_ops_replay(chip, ops, ARRAY_SIZE(ops), lo ?
+				"head unit: headphone mode to the card's RCA out" :
+				"head unit: headphone mode to the headphone jack");
+}
+
 static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 {
 	u8 resp[24];
@@ -2876,12 +2966,7 @@ static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 	if (hp == chip->hu_output)
 		return;
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;
-	if (hp)
-		creative_ae9_ops_replay(chip, ae9_sw_to_hp, ARRAY_SIZE(ae9_sw_to_hp),
-					"head unit: switch to headphones");
-	else
-		creative_ae9_ops_replay(chip, ae9_sw_to_sp, ARRAY_SIZE(ae9_sw_to_sp),
-					"head unit: switch to speakers");
+	creative_ae9_hu_route(chip, hp);
 	chip->hu_output = hp;
 	chip->hu_att = chip->hu_att_out[hp];
 	creative_ae9_fx_output_changed(chip);	/* headphone profile back on */
@@ -2939,8 +3024,10 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 	sbx_led = !chip->fx.direct && chip->fx.sbx;
 	if (sbx_led != chip->hu_sbx_led) {
 		u8 f[6] = { 0xf0, 0x22, 0x02, 0x01, sbx_led, 0xf7 };
+		/* the jack in use: Line Out Virtualization = speakers (00) */
 		u8 mode[7] = { 0xf0, 0x03, 0x03, 0x02,
-			       chip->hu_output ? 0x40 : 0x00, 0x40, 0xf7 };
+			       chip->hu_output && !chip->lo_virt_phys ? 0x40 : 0x00,
+			       0x40, 0xf7 };
 
 		if (hu_sbx_mode)
 			creative_spi_frame_win(chip, mode, sizeof(mode), resp, sizeof(resp));
@@ -2969,7 +3056,21 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 		int to = chip->hu_switch_to;
 
 		chip->hu_switch_to = -1;
+		chip->hu_reroute = false;	/* the switch routes it */
 		creative_ae9_hu_switch(chip, to);
+	}
+	/* Line Out Virtualization or Direct Mode changed while on headphones:
+	 * route the headphone mode to the jack it now belongs on */
+	if (chip->hu_reroute) {
+		chip->hu_reroute = false;
+		if (chip->hu_output &&
+		    chip->lo_virt_phys != ae9_lo_virt_on(chip)) {
+			creative_ae9_hu_jack(chip, ae9_lo_virt_on(chip));
+			creative_ae9_fx_output_changed(chip);	/* Windows' pass B */
+			dev_info(chip->dev, "head unit: headphones on the %s\n",
+				 chip->lo_virt_phys ? "card's RCA out (Line Out Virtualization)" :
+				 "headphone jack");
+		}
 	}
 	if (press_ms >= 1500 && press_ms < 3000) {
 		creative_ae9_hu_switch(chip, !chip->hu_output);
@@ -3391,6 +3492,44 @@ static const struct snd_kcontrol_new hu_out_control = {
 	.put = hu_out_put,
 };
 
+/* pending re-route for the heartbeat (head unit traffic runs only there) */
+void creative_ae9_hu_reroute_request(struct creative_chip *chip)
+{
+	chip->hu_reroute = true;
+}
+
+static int lo_virt_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->lo_virt;
+	return 0;
+}
+
+static int lo_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (on == chip->lo_virt)
+		return 0;
+	chip->lo_virt = on;
+	dev_info(chip->dev, "Line Out Virtualization %s%s\n", on ? "on" : "off",
+		 !chip->hu_output ? " (takes effect on headphones)" :
+		 chip->fx.direct ? " (takes effect with Direct Mode off)" : "");
+	creative_ae9_hu_reroute_request(chip);
+	return 1;
+}
+
+/* Sound Blaster Command: "Apply Headphones Virtualization to Line Out" */
+static const struct snd_kcontrol_new lo_virt_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Line Out Virtualization Switch",
+	.info = snd_ctl_boolean_mono_info,
+	.get = lo_virt_get,
+	.put = lo_virt_put,
+};
+
 /* "Head Unit 3.5mm Phones Plugged" (head unit's 3.5 mm headphone jack,
  * status bit 5), "Head Unit 3.5mm Mic Plugged" (head unit's 3.5 mm mic
  * jack, bit 4; not the XLR/TRS jack) and "Head Unit Phantom Power" (48 V
@@ -3494,6 +3633,7 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_light = 1;
 	chip->hu_light_sent = 1;	/* the head unit starts lit */
 	chip->hu_sbx_led = -1;
+	snd_ctl_add(chip->card, snd_ctl_new1(&lo_virt_control, chip));
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
 		chip->hu_out_ctl = NULL;
@@ -4194,6 +4334,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 		snd_ctl_add(chip->card, snd_ctl_new1(&dac_filter_control, chip));
 		creative_ae9_fx_init(chip);
 		creative_ae9_fx_controls_add(chip);
+		chip->cv.sent_voicefx = chip->cv.sent_miceq = -1;
+		creative_ae9_cv_controls_add(chip);
 	}
 
 	/* IRQ before the card goes public: playback/capture need period
@@ -4238,6 +4380,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	return 0;
 
 err_card:
+	creative_ae9_fx_remove(chip);
 	snd_card_free(chip->card);
 	chip->card = NULL;
 err_hw:
@@ -4420,6 +4563,7 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 		return;
 
 	creative_ae9_stop_works(chip);
+	creative_ae9_fx_remove(chip);
 	debugfs_remove_recursive(chip->dbg_dir);
 	g_dbg_chip = NULL;
 	vlog_bar0 = vlog_bar2 = NULL;
@@ -4495,10 +4639,18 @@ static void creative_ae9_resume_work(struct work_struct *work)
 
 	chip->dac_start_key = 0;	/* the card lost power */
 	chip->spdif_out_sent = 0;	/* and the boot replay reset 0x05 */
+	chip->cv.route_on = false;	/* the bring-up came back with the plain route */
+	chip->cv.sent_voicefx = chip->cv.sent_miceq = -1;	/* and the DSP's defaults */
+	chip->cv.mon_bound = false;	/* and ADC 0x07 unbound */
+	if (chip->cv.on)
+		creative_ae9_cv_apply(chip);
+	if (chip->cv.monitor)
+		creative_ae9_mic_monitor_apply(chip);
 
 	/* the boot replay brings the head unit up on speakers */
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;
 	chip->hu_output = 0;
+	chip->lo_virt_phys = false;
 	chip->hu_att = chip->hu_att_out[0];
 
 	for (attempt = 1; attempt <= max(resume_tries, 1U); attempt++) {

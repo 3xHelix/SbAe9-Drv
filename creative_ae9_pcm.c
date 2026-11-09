@@ -1287,7 +1287,6 @@ static void creative_ae9_opt_new(struct creative_chip *chip)
 /* format on node 0x07, nothing else (VM capture 2026-11-05).		  */
 /* ------------------------------------------------------------------ */
 #define CREATIVE_CAP_STREAM_BASE	0x80	/* input stream descriptor 0 */
-#define CREATIVE_CAP_STREAM_TAG		1
 #define CREATIVE_CAP_BDL_MAX		8
 
 /*
@@ -1348,6 +1347,11 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000;
 	runtime->hw.rate_min = 48000;
 	runtime->hw.rate_max = 96000;
+	/* Voice Clarity: Windows records at 48 kHz (format 0x31) with it on */
+	if (AE9_CV_WANT(chip)) {
+		runtime->hw.rates = SNDRV_PCM_RATE_48000;
+		runtime->hw.rate_max = 48000;
+	}
 	runtime->hw.buffer_bytes_max = 128 * 1024;	/* ~170 ms at 96 kHz */
 	runtime->hw.period_bytes_min = 1920;	/* 5 ms */
 	runtime->hw.period_bytes_max = 32 * 1024;
@@ -1364,6 +1368,8 @@ static int creative_ae9_cap_close(struct snd_pcm_substream *substream)
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 
 	chip->capture_substream = NULL;
+	if (chip->cv.monitor)	/* the monitor keeps the mic input after it */
+		creative_ae9_mic_monitor_apply(chip);
 	return 0;
 }
 
@@ -1408,6 +1414,11 @@ static int creative_ae9_cap_hw_free(struct snd_pcm_substream *substream)
 	if (chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, false);
 		chip->cap_start_sent = 0;
+	}
+	chip->cv.mon_bound = false;	/* the stop block unbound it */
+	if (chip->cv.route_on) {	/* Windows: ~30 ms after the ADC unbind */
+		msleep(30);
+		creative_ae9_cv_route(chip, false);
 	}
 	creative_ae9_cap_bdl_free(chip);
 	return snd_pcm_lib_free_pages(substream);
@@ -1461,6 +1472,11 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	 * before its bind (see creative_ae9_cap_replay) */
 	chip->cap_format = creative_ae9_stream_format(runtime->channels, cap_bits_now(),
 						      runtime->rate);
+	/* Voice Clarity: the voice processor in BEFORE Windows' start block
+	 * binds the ADC (Windows: format, route, bind; it never moves the mic
+	 * route while 0x07 is bound - unicorn router report, 25 captures) */
+	if (!chip->cap_start_sent && AE9_CV_WANT(chip) && !chip->cv.route_on)
+		creative_ae9_cv_route(chip, true);
 	if (!chip->cap_start_sent) {
 		creative_ae9_cap_replay(chip, true);
 		if (chip->mic_level != 99)

@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+"""ae9-hp-profile: make your own AE-9 headphone profile from a measurement.
+
+The AE-9's headphone profiles (Sound Blaster Command's headphone list) are
+correction filters run by the card's DSP: two 512-tap linear-phase FIR
+filters at 48 kHz, left and right. This builds one in the same format from
+a frequency-response correction, such as the ones the AutoEQ project
+publishes for thousands of headphones (https://github.com/jaakkopasanen/AutoEq,
+MIT licence; the measurements are by oratory1990, crinacle, Rtings and others),
+and installs it into one of the four custom slots of the driver's
+"Headphone Profile" control (driver 0.12.2 or later), where it shows under
+its own name, in SbAe9-SBC too.
+
+  sudo ae9-hp-profile add "Beyerdynamic DT 990 Pro" DT990
+        all in one: fetch AutoEQ's correction, make the filter, install it
+        as /lib/firmware/creative-ae9/hp/DT990.bin, listed as
+        "Beyerdynamic DT 990 Pro"
+  ae9-hp-profile fetch "Beyerdynamic DT 990 Pro"      download the correction (CSV)
+  ae9-hp-profile make "Beyerdynamic DT 990 Pro.csv" dt990.bin
+  sudo ae9-hp-profile install dt990.bin DT990 "Beyerdynamic DT 990 Pro"
+  ae9-hp-profile list                                 the custom slots
+  sudo ae9-hp-profile remove DT990
+  ae9-hp-profile show dt990.bin                       its response, in dB
+
+The key (DT990) is the file name: letters, digits, "-", "_" or ".", up to
+24 characters, not one of Creative's. The name is what the list shows (up
+to 40 characters). The slots are kept in /etc/modprobe.d/creative-ae9-hp.conf
+and set in the running driver at once.
+
+Then pick it in SbAe9-SBC or with
+  amixer -c AE9 cset name='Headphone Profile' 'Beyerdynamic DT 990 Pro'
+It works like Creative's profiles: with the output on headphones and Direct
+Mode off, and it loads once nothing has played for a few seconds. To load a
+new file for a profile that's already picked, pick "Off" and then it again.
+
+The CSV can also be your own: two columns, frequency (Hz) and gain (dB), or
+AutoEQ's result file (its "equalization" column). The filter never boosts:
+the whole curve is moved down until its highest point is just below 0 dB
+(the DSP stage clips on boosts), so the profile plays quieter than without
+it; turn the volume up to match.
+"""
+import csv
+import math
+import os
+import re
+import shutil
+import struct
+import sys
+import urllib.parse
+import urllib.request
+
+FS = 48000
+TAPS = 512           # per channel; linear phase around tap 256 (taps 1..511)
+HALF = 255
+GRID = 8192          # design grid (FFT size)
+CHIP_ADDR = 0x40000
+FW_DIR = '/lib/firmware/creative-ae9/hp'
+CONF = '/etc/modprobe.d/creative-ae9-hp.conf'
+PARAM = '/sys/module/snd_hda_codec_creative_ae9/parameters/hp_custom'
+SLOTS = 4
+CREATIVE_KEYS = {k.lower() for k in (
+    'AKGM220 IP3EP IP5EP ATHM50 HS50 CTAVNA CTAVNG CTAVNL CTAVNL2 CTEP3NC '
+    'CTFATGHS CTFlex OUTLIER OUTLIERB CTSBINF SXFIAIR SXFIAIRC EMUTEAK WALNUT '
+    'HXHSCF ETHERC PFX2HR GS3EP HD201 HD280Pro HD457 MDR1R SBBLAZE H3 H5 H7 P5 '
+    'custom1 custom2 custom3 custom4').split()}
+AUTOEQ_RAW = 'https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/'
+# AutoEQ result folders, best sources first
+AUTOEQ_DIRS = [
+    'oratory1990/over-ear', 'oratory1990/in-ear',
+    'crinacle/GRAS 43AG-7 over-ear', 'crinacle/EARS + 711 over-ear',
+    'crinacle/711 in-ear', 'crinacle/Bruel & Kjaer 4620 in-ear',
+    'Rtings/Bruel & Kjaer 5128 over-ear', 'Rtings/HMS II.3 over-ear',
+    'Innerfidelity/over-ear', 'Innerfidelity/in-ear',
+    'Headphone.com Legacy/over-ear', 'Headphone.com Legacy/in-ear',
+    'Super Review/over-ear', 'Super Review/in-ear',
+    'Auriculares Argentina/over-ear', 'Kuulokenurkka/over-ear',
+]
+
+
+def die(msg):
+    print(f'ae9-hp-profile: {msg}', file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(name, out=None):
+    """AutoEQ's result CSV for a headphone, by its AutoEQ name."""
+    for d in AUTOEQ_DIRS:
+        url = AUTOEQ_RAW + urllib.parse.quote(f'{d}/{name}/{name}.csv')
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = r.read()
+        except Exception:
+            continue
+        out = out or f'{name}.csv'
+        with open(out, 'wb') as f:
+            f.write(data)
+        print(f'{out}: AutoEQ, measured by {d.split("/")[0]} ({d.split("/", 1)[1]})')
+        return
+    die(f'"{name}" not found in AutoEQ\'s results; check the exact name at '
+        'https://github.com/jaakkopasanen/AutoEq/tree/master/results')
+
+
+def read_curve(path):
+    """(frequencies, gains in dB), sorted by frequency."""
+    with open(path, newline='') as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        die(f'{path}: empty')
+    head = [c.strip().lower() for c in rows[0]]
+    if 'frequency' in head:
+        fi = head.index('frequency')
+        for col in ('equalization', 'gain', 'eq'):
+            if col in head:
+                gi = head.index(col)
+                break
+        else:
+            die(f'{path}: no "equalization" (AutoEQ) or "gain" column')
+        rows = rows[1:]
+    else:
+        fi, gi = 0, 1
+    pts = []
+    for r in rows:
+        try:
+            f, g = float(r[fi]), float(r[gi])
+        except (ValueError, IndexError):
+            continue
+        if f > 0 and math.isfinite(g):
+            pts.append((f, g))
+    if len(pts) < 10:
+        die(f'{path}: fewer than 10 frequency/gain points')
+    pts.sort()
+    return [p[0] for p in pts], [p[1] for p in pts]
+
+
+def interp_log(f, fs, gs):
+    """Gain at f, interpolated on a log-frequency axis; held flat outside."""
+    if f <= fs[0]:
+        return gs[0]
+    if f >= fs[-1]:
+        return gs[-1]
+    lo, hi = 0, len(fs) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if fs[mid] <= f:
+            lo = mid
+        else:
+            hi = mid
+    t = (math.log(f) - math.log(fs[lo])) / (math.log(fs[hi]) - math.log(fs[lo]))
+    return gs[lo] + t * (gs[hi] - gs[lo])
+
+
+def i0(x):
+    s, term, k = 1.0, 1.0, 1
+    while term > 1e-12 * s:
+        term *= (x / (2 * k)) ** 2
+        s += term
+        k += 1
+    return s
+
+
+def design(fs, gs):
+    """Half of a symmetric FIR (centre tap first) for the curve."""
+    mag = [10 ** (interp_log(max(k * FS / GRID, 1.0), fs, gs) / 20) for k in range(GRID // 2 + 1)]
+    beta = 5.0                     # Kaiser window: smooth, ~1/3 octave at 100 Hz
+    w0 = i0(beta)
+    half = []
+    for n in range(HALF + 1):
+        acc = mag[0] + mag[-1] * (-1) ** n
+        c = 2 * math.pi * n / GRID
+        for k in range(1, GRID // 2):
+            acc += 2 * mag[k] * math.cos(c * k)
+        win = i0(beta * math.sqrt(1 - (n / (HALF + 1)) ** 2)) / w0
+        half.append(acc / GRID * win)
+    return half
+
+
+def taps_from_half(half):
+    t = [0.0] * TAPS
+    for n, v in enumerate(half):
+        t[256 + n] = v
+        t[256 - n] = v
+    return t
+
+
+def response(taps, freqs):
+    out = []
+    for f in freqs:
+        c = 2 * math.pi * f / FS
+        re = sum(v * math.cos(c * (n - 256)) for n, v in enumerate(taps) if v)
+        out.append(20 * math.log10(abs(re) + 1e-12))
+    return out
+
+
+def log_freqs(n=120, lo=20.0, hi=20000.0):
+    return [lo * (hi / lo) ** (i / (n - 1)) for i in range(n)]
+
+
+def write_bin(path, left, right):
+    data = b'MXFL' + struct.pack('<II', CHIP_ADDR, 2 * TAPS)
+    data += struct.pack(f'<{2 * TAPS}f', *(left + right))
+    data += b'MXFL' + b'\xde\xad\xbe\xef' + struct.pack('<I', 0)
+    with open(path, 'wb') as f:
+        f.write(data)
+
+
+def read_bin(path):
+    b = open(path, 'rb').read()
+    if len(b) != 12 + 8 * TAPS + 12 or b[:4] != b'MXFL' or \
+            struct.unpack('<II', b[4:12]) != (CHIP_ADDR, 2 * TAPS):
+        die(f'{path}: not an AE-9 headphone profile (MXFL, 0x40000, 1024 words)')
+    w = list(struct.unpack(f'<{2 * TAPS}f', b[12:12 + 8 * TAPS]))
+    return w[:TAPS], w[TAPS:]
+
+
+def make(src, out):
+    fs, gs = read_curve(src)
+    half = design(fs, gs)
+    taps = taps_from_half(half)
+    check = log_freqs()
+    got = response(taps, check)
+    peak = max(got)
+    scale = 10 ** (-(peak + 0.3) / 20)          # highest point at -0.3 dB
+    taps = [v * scale for v in taps]
+    got = [g - peak - 0.3 for g in got]
+    want = [interp_log(f, fs, gs) for f in check]
+    off = sum(w - g for f, w, g in zip(check, want, got) if 1000 <= f <= 3000) / \
+        max(1, sum(1 for f in check if 1000 <= f <= 3000))
+    err = max(abs(w - g - off) for f, w, g in zip(check, want, got) if 150 <= f <= 16000)
+    write_bin(out, taps, list(taps))
+    print(f'{out}: 2 x {TAPS} taps at 48 kHz from {os.path.basename(src)}; '
+          f'level {-(peak + 0.3):+.1f} dB at its loudest point (never boosts), '
+          f'shape within {err:.1f} dB of the curve from 150 Hz to 16 kHz')
+
+
+def show(path):
+    left, right = read_bin(path)
+    pts = [31, 63, 125, 250, 500, 1000, 2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000]
+    for name, t in (('left', left), ('right', right)):
+        r = response(t, pts)
+        print(f'{name:5s} ' + ' '.join(f'{p if p < 1000 else str(p // 1000) + "k":>5}' for p in pts))
+        print('      ' + ' '.join(f'{g:+5.1f}' for g in r))
+
+
+def read_slots():
+    """[(key, name) or None] * SLOTS, from the config file."""
+    slots = [None] * SLOTS
+    try:
+        txt = open(CONF).read()
+    except FileNotFoundError:
+        return slots
+    m = re.search(r'hp_custom="([^"]*)"', txt)
+    if m:
+        for n, ent in enumerate(m.group(1).split(';')[:SLOTS]):
+            if '=' in ent:
+                k, v = ent.split('=', 1)
+                slots[n] = (k.strip(), v.strip())
+    return slots
+
+
+def write_slots(slots):
+    val = ';'.join(f'{s[0]}={s[1]}' if s else '' for s in slots).rstrip(';')
+    try:
+        with open(CONF, 'w') as f:
+            f.write('# Written by ae9-hp-profile: the AE-9\'s custom headphone profiles\n'
+                    '# (slot = position; KEY loads /lib/firmware/creative-ae9/hp/KEY.bin)\n'
+                    f'options snd-hda-codec-creative-ae9 hp_custom="{val}"\n')
+    except PermissionError:
+        die(f'no permission to write {CONF}; run it with sudo')
+    if os.path.exists(PARAM):
+        try:
+            with open(PARAM, 'w') as f:
+                f.write(val)
+        except OSError as e:
+            print(f'note: the running driver didn\'t take it ({e}); it applies at the next boot')
+    else:
+        print('note: the driver isn\'t loaded (or is older than 0.12.2); applies at the next boot')
+
+
+def check_key(key, name):
+    if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,23}', key):
+        die(f'key "{key}": letters, digits, "-", "_" or ".", up to 24 characters')
+    if key.lower() in CREATIVE_KEYS:
+        die(f'key "{key}" is taken by one of Creative\'s profiles; pick another')
+    if not name or len(name) > 40 or any(c in name for c in ';="\n') or not name.isprintable():
+        die(f'name "{name}": 1 to 40 characters, without ; = or "')
+
+
+def install(path, key, name=None):
+    read_bin(path)
+    name = name or key
+    check_key(key, name)
+    slots = read_slots()
+    n = next((i for i, s in enumerate(slots) if s and s[0].lower() == key.lower()), None)
+    if n is None:
+        n = next((i for i, s in enumerate(slots) if not s), None)
+    if n is None:
+        die('all 4 custom slots are in use (ae9-hp-profile list); remove one first')
+    dst = os.path.join(FW_DIR, f'{key}.bin')
+    try:
+        os.makedirs(FW_DIR, exist_ok=True)
+        shutil.copyfile(path, dst)
+        os.chmod(dst, 0o644)
+    except PermissionError:
+        die(f'no permission to write {dst}; run it with sudo')
+    slots[n] = (key, name)
+    write_slots(slots)
+    print(f'{dst}: installed as "{name}" (custom slot {n + 1}). Pick it in SbAe9-SBC or with\n'
+          f"  amixer -c AE9 cset name='Headphone Profile' '{name}'\n"
+          '(if it was already picked: pick "Off", then it again, to load the new file)')
+
+
+def remove(key):
+    slots = read_slots()
+    n = next((i for i, s in enumerate(slots) if s and s[0].lower() == key.lower()), None)
+    if n is None:
+        die(f'"{key}" is not installed (ae9-hp-profile list)')
+    slots[n] = None
+    write_slots(slots)
+    try:
+        os.remove(os.path.join(FW_DIR, f'{key}.bin'))
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        die('no permission; run it with sudo')
+    print(f'removed "{key}" (slot {n + 1} shows "Custom {n + 1}" again)')
+
+
+def list_slots():
+    for n, s in enumerate(read_slots()):
+        if s:
+            f = os.path.join(FW_DIR, f'{s[0]}.bin')
+            print(f'slot {n + 1}: {s[1]}  ({f}{"" if os.path.exists(f) else ", MISSING"})')
+        else:
+            print(f'slot {n + 1}: empty ("Custom {n + 1}")')
+
+
+def add(model, key, name=None):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        csvp, binp = os.path.join(d, 'curve.csv'), os.path.join(d, 'p.bin')
+        fetch(model, csvp)
+        make(csvp, binp)
+        install(binp, key, name or model)
+
+
+def main(a):
+    if len(a) >= 2 and a[0] == 'fetch':
+        fetch(a[1], a[2] if len(a) > 2 else None)
+    elif len(a) == 3 and a[0] == 'make':
+        make(a[1], a[2])
+    elif len(a) == 2 and a[0] == 'show':
+        show(a[1])
+    elif len(a) in (3, 4) and a[0] == 'install':
+        install(*a[1:])
+    elif len(a) in (3, 4) and a[0] == 'add':
+        add(*a[1:])
+    elif len(a) == 2 and a[0] == 'remove':
+        remove(a[1])
+    elif a == ['list']:
+        list_slots()
+    else:
+        print(__doc__.strip())
+        sys.exit(0 if a[:1] in (['-h'], ['--help']) else 2)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
