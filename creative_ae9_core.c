@@ -109,10 +109,15 @@ MODULE_PARM_DESC(codec_probe_delay_ms, "Delay between controller reset and codec
  * subsystem 0x11020071/0x11020072, as under Windows (where starting the VM
  * bus-resets the card); after only a power-on reset, or a PM (D3hot) reset,
  * they report the generic 0x11020010.
+ * Behind an ASMedia bridge it was skipped from 0.9.8 to 0.12.4 (it seemed to
+ * take the bridge down; the real cause was the posted-write wedge that
+ * posted_flush fixes). Without it a hot reload there starts on stale card
+ * state (BAR2 0x304/0xc0c/0xc14) and stays silent; with it a reload, a warm
+ * and a cold boot all work (Kaiba, 2026-11-09).
  */
 static int bus_reset = -1;
 module_param(bus_reset, int, 0444);
-MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM start does (1=on, 0=off, -1=auto: on, except behind an ASMedia bridge; default)");
+MODULE_PARM_DESC(bus_reset, "Secondary bus reset of the card at probe, as a VM start does (1=on, 0=off, -1=auto: on, every bridge; default)");
 
 /*
  * win_reset2: Windows (cold capture) does 4 ICW reads after the first
@@ -1292,6 +1297,40 @@ static int ae9_8051_xram_byte(struct creative_chip *chip, u16 addr)
 	return v;
 }
 
+/*
+ * Stream 0x18 (host -> DSP) is reference-counted in the 8051: XRAM
+ * 0x072f + 10 * id + 5 (0x0824), +1 per enable (param 28 = 1), -1 per
+ * disable; it connects only on 0 -> 1 and tears down only at 0. The count
+ * survives warm restarts (the AFG reset doesn't touch the 8051). We
+ * enabled it at every DSP-mode switch without looking and disabled it
+ * once, so it sat at 1 in Direct Mode and 2 in DSP mode, and after a warm
+ * restart the new DSP-mode enable never connected: DSP mode and What U
+ * Hear silent until a power cut (Kaiba, ASMedia, 0.12.4; .tmp/unicorn/r5/
+ * router-8051.md). Windows (FUN_000341e4 / FUN_000343d8) enables only at
+ * count 0 and drains it to 0 at device stop. Release ours to 0 here.
+ */
+#define AE9_XRAM_STREAM18_REFS	0x0824
+#define AE9_XRAM_STREAM0C_REFS	0x07ac
+
+static int ae9_stream18_drain(struct creative_chip *chip, const char *why)
+{
+	static const u32 off18[] = {
+		0x115f0100, 0x11571718, 0x11571818, 0x1157101c,
+	};
+	int first = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_REFS), v = first;
+	unsigned int n = 0;
+
+	while (v > 0 && n++ < 8) {
+		creative_ae9_verb_block_replay(chip, off18, ARRAY_SIZE(off18), false,
+					       "stream 0x18 release");
+		v = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_REFS);
+	}
+	if (first != 0)
+		dev_info(chip->dev, "router: stream 0x18 references %d -> %d (%s; stream 0x0c %d)\n",
+			 first, v, why, ae9_8051_xram_byte(chip, AE9_XRAM_STREAM0C_REFS));
+	return v;
+}
+
 static void ae9_dsp_mode_start(struct creative_chip *chip, u16 format,
 			       bool count_ff)
 {
@@ -1402,12 +1441,14 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 		0x11571718, 0x11571818, 0x1157101c, 0x115f0100,
 	};
 	u32 zero = 0;	/* 0.0f: 0 dB, and "not muted" */
+	int refs18;
 
 	if (!chip->corb_buf || !chip->dsp_done)
 		return;
 	if (!dsp) {
 		creative_ae9_verb_block_replay(chip, off, ARRAY_SIZE(off), false,
 					       "SBX: direct mode (DSP stream 0x18 off)");
+		ae9_stream18_drain(chip, "Direct Mode on");
 		/*
 		 * Stop stream 0x05 too: we start it in DSP mode (Windows doesn't),
 		 * and left running it keeps the HDA -> SRC 0x90/0x80 -> DSP path
@@ -1420,8 +1461,21 @@ void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp)
 		return;
 	}
 	chip->dsp_active = true;
+	refs18 = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_REFS);
 	creative_ae9_verb_block_replay(chip, head, ARRAY_SIZE(head), false,
 				       "SBX: DSP mode (host audio -> DSP -> DAC at 96 kHz)");
+	/* the head block enables stream 0x18; Windows (FUN_000341e4) enables
+	 * it only when its count is 0 (the start-up tail's connection still
+	 * stands after a boot): take that extra reference back, so DSP mode
+	 * on/off leaves the count where it was */
+	if (refs18 > 0) {
+		static const u32 off18[] = {
+			0x115f0100, 0x11571718, 0x11571818, 0x1157101c,
+		};
+
+		creative_ae9_verb_block_replay(chip, off18, ARRAY_SIZE(off18), false,
+					       "stream 0x18: already connected");
+	}
 	/* the DAC follows the new I2S clock: Windows sends these right after
 	 * the descriptors (captures 5, 6), as every playback start does */
 	creative_dsp_ca0113_replay_quiet(chip, dac_relock, ARRAY_SIZE(dac_relock));
@@ -1862,6 +1916,7 @@ MODULE_PARM_DESC(warm_reset, "Windows' codec recovery cycle before the DSP downl
 #define AE9_COLD_AFG_F05	384	/* codec 1 AFG power state read */
 #define AE9_COLD_AFG_RESET	395	/* first of the two AFG resets (7ff) */
 #define AE9_COLD_SETTLE		774	/* after Windows' 1.5 s timer */
+#define AE9_COLD_DSP_INIT	521	/* DSPIO 0x703 (DSP_INIT) after the codec init */
 
 /*
  * Windows' two start-up checks, logged only (no behaviour change yet;
@@ -2030,6 +2085,18 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 			creative_dsp_chipio_addr_invalidate();
 		}
 		ret = ae9_cold_verb(chip, ae9_cold_prefw[i], &resp);
+		/* Windows' dsp_reset (CtxHda FUN_0001b024) sends DSP_INIT again
+		 * while the DSP answers 1 (busy); every capture answered 0 at
+		 * once. Same here, capped at ~1 s, and logged if it was busy */
+		if (i == AE9_COLD_DSP_INIT && ret == 0 && resp == 1) {
+			unsigned int n = 0;
+
+			while (ret == 0 && resp == 1 && n++ < 50) {
+				usleep_range(20000, 21000);
+				ret = ae9_cold_verb(chip, ae9_cold_prefw[i], &resp);
+			}
+			dev_info(chip->dev, "DSP_INIT at start-up: busy, %u more tries -> %u\n", n, resp);
+		}
 		if (ret < 0)
 			errs++;
 		ae9_bootchk_note(&chk, ae9_cold_prefw[i], resp, ret);
@@ -2173,6 +2240,13 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 		dev_info(chip->dev, "fw_split: boot handshake %s (%d)\n",
 			 ret ? "INCOMPLETE" : "complete", ret);
 	}
+
+	/* the tail enables stream 0x18 once (Windows' boot, index 1446): a
+	 * card that was running still holds references from the earlier run,
+	 * which would swallow that enable (no connection, DSP mode and even
+	 * Direct Mode silent: Kaiba 0.12.4). Release them first, so the tail
+	 * connects from 0 as on a cold card (which reads 0 here) */
+	ae9_stream18_drain(chip, "before the start-up tail, left by an earlier run");
 
 	for (i = AE9_INITSEQ1_TAIL; i < ARRAY_SIZE(ae9_initseq_codec1); i++) {
 		const struct ae9_initverb *e = &ae9_initseq_codec1[i];
@@ -2519,6 +2593,23 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 	/* "chipior <hex_addx>" — ChipIO read */
+	/* "xram 0824": one 8051 XRAM byte, read-only, two agreeing reads under
+	 * replay_mutex (ae9_8051_xram_byte); for the router state report
+	 * (stream reference counts 0x0824/0x07ac/0x0766, 0x0822, 0x00b6) */
+	if (!strncmp(buf, "xram ", 5)) {
+		unsigned int a;
+		int v;
+
+		if (sscanf(buf + 5, "%x", &a) != 1 || a > 0xffff)
+			return -EINVAL;
+		if (!g_dbg_chip->corb_buf)
+			return -ENODEV;
+		v = ae9_8051_xram_byte(g_dbg_chip, a);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result),
+			  v < 0 ? "xram[0x%04x] read failed (%d)\n" : "xram[0x%04x]=0x%02x\n",
+			  a, v);
+		return len;
+	}
 	if (!strncmp(buf, "chipior", 7)) {
 		unsigned int a, v = 0;
 		int ret;
@@ -3959,14 +4050,12 @@ static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
 static int creative_ae9_hw_bringup(struct creative_chip *chip)
 {
 	struct pci_dev *pdev = chip->pci;
-	bool do_reset = bus_reset > 0 || (bus_reset < 0 && !chip->asmedia);
+	bool do_reset = bus_reset != 0;
 	int ret;
 
 	creative_ae9_log_state(chip, "before bring-up");
 	chip->card_gone = false;
 	creative_ae9_bridge_log(chip, "before bring-up");
-	if (bus_reset < 0 && chip->asmedia)
-		dev_info(&pdev->dev, "ASMedia bridge: skipping the secondary bus reset (it takes the bridge down at ring start; bus_reset=1 forces it)\n");
 
 	if (do_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {
 		dev_warn(&pdev->dev, "other devices behind %s: skipping the secondary bus reset\n",
@@ -4628,6 +4717,8 @@ static void creative_ae9_streams_down(struct creative_chip *chip)
 	creative_ae9_cv_down(chip);	/* Voice Clarity's route and mic connections */
 	if (chip->dsp_active)
 		creative_ae9_dsp_mode(chip, false);	/* streams 0x18, 0x05 off */
+	else
+		ae9_stream18_drain(chip, "shutdown");	/* Windows: drained at device stop */
 }
 
 static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *why)

@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.4
+Version:        0.12.5
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -51,6 +51,7 @@ install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}%{_bindir}/ae9-dsp-snapshot
@@ -89,6 +90,8 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir %{_datadir}/wireplumber
 %dir %{_datadir}/wireplumber/wireplumber.conf.d
 %{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+%dir %{_datadir}/wireplumber/main.lua.d
+%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
 %{_bindir}/ae9-get-firmware
 %{_bindir}/ae9-full-dump
 %{_bindir}/ae9-dsp-snapshot
@@ -98,6 +101,11 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Nov 10 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.5-1
+- Driver 0.12.5: restarts fixed for real (router stream count kept as
+  Windows), bus reset on ASMedia-bridge cards too, a DSP word refused as
+  full is resent until it goes in, WirePlumber 0.4 safe start volume
+  (51-ae9-safe-volume.lua), optical without 176.4 kHz
 * Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.4-1
 - Driver 0.12.4: warm restarts as Windows (wake + recovery cycle), Voice
   Clarity starts in Windows' order (no DSP stall), Voice Clarity off goes

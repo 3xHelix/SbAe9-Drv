@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.4
+Version:        0.12.5
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -54,6 +54,7 @@ install -D -m 644 config/ae9-omit.conf %{buildroot}/usr/lib/dracut/dracut.conf.d
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}/usr/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}/usr/bin/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}/usr/bin/ae9-dsp-snapshot
@@ -106,6 +107,8 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir /usr/share/wireplumber
 %dir /usr/share/wireplumber/wireplumber.conf.d
 /usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+%dir /usr/share/wireplumber/main.lua.d
+/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
 /usr/bin/ae9-get-firmware
 /usr/bin/ae9-full-dump
 /usr/bin/ae9-dsp-snapshot
@@ -115,6 +118,11 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Tue Nov 10 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.5-1
+- Driver 0.12.5: restarts fixed for real (router stream count kept as
+  Windows), bus reset on ASMedia-bridge cards too, a DSP word refused as
+  full is resent until it goes in, WirePlumber 0.4 safe start volume
+  (51-ae9-safe-volume.lua), optical without 176.4 kHz
 * Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.4-1
 - Driver 0.12.4: warm restarts as Windows (wake + recovery cycle), Voice
   Clarity starts in Windows' order (no DSP stall), Voice Clarity off goes

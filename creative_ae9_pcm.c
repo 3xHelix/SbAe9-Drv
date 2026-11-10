@@ -524,7 +524,11 @@ static void ae9_spdif_out_apply_locked(struct creative_chip *chip)
 	u8 dig1 = AE9_SPDIF_DIG1_PCM | (nonaudio ? AE9_SPDIF_DIG1_NONAUDIO : 0);
 	u32 want = 0;
 
-	if (chip->spdif_out && fmt && (fmt & 0xf) == 1 && ((fmt >> 4) & 0x7) <= 3)
+	/* 2 channels, up to 32-bit, and not 176.4 kHz (44.1k x 4: base bit 14,
+	 * multiplier 3 in bits 13:11), which converter 0x05 can't take; a
+	 * 176.4 kHz main stream simply isn't mirrored */
+	if (chip->spdif_out && fmt && (fmt & 0xf) == 1 && ((fmt >> 4) & 0x7) <= 3 &&
+	    ((fmt >> 11) & 0xf) != 0xb)
 		want = (u32)nonaudio << 24 | (u32)fmt << 8 | (tag << 4);
 	if (want && want != chip->spdif_out_sent) {
 		/* unbound first: Windows changes format and flag only on an
@@ -1007,9 +1011,11 @@ static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
+	/* no 176.4 kHz: converter 0x05's rate list (param 0x0a = 0x000a05e0,
+	 * Windows' boot read) has 44.1/48/88.2/96/192 */
 	runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 			    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
-			    SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000;
+			    SNDRV_PCM_RATE_192000;
 	runtime->hw.rate_min = 44100;
 	runtime->hw.rate_max = 192000;
 	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
@@ -1578,13 +1584,16 @@ struct ae9_xcap {
 };
 
 static const struct ae9_xcap ae9_xcaps[3] = {
+	/* no 176.4 kHz: converter 0x09's rate list (param 0x0a = 0x000a05f0,
+	 * Windows' boot read, capture 2026-11-09) has 32/44.1/48/88.2/96/192 */
 	{ "AE-9 Optical", 0xa0, 2, AE9_SPDIF_CAD, AE9_SPDIF_IN_NID,
 	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
-	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_192000,
 	  44100, 192000, AE9_SPDIF_IN_PIN },
 	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
 	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
-	/* no 176.4 kHz: ADC 0x08's rate list (param 0x0a = 0x000a05e4) has
+	/* no 176.4 kHz: ADC 0x08's rate list (param 0x0a = 0x000a05e4, also in
+	 * Windows' boot read) has
 	 * 44.1/48/88.2/96/192 but not 176.4 (bit 9) */
 	{ "AE-9 Rear RCA In", 0xe0, 4, 2, 0x08,
 	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |

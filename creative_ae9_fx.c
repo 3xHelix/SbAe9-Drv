@@ -467,14 +467,16 @@ static int __fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
 	ret = creative_dsp_scp_send(chip, ((u32)req << 17) | (0x20 << 8) | mid,
 				    &val, 1);
 	if (ret < 0)
-		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x FAILED\n", mid, req, val);
+		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x FAILED (%d)\n", mid, req, val, ret);
 	else if (log)
 		ae9_dbg(chip, "fx: 0x%02x/0x%02x = 0x%08x\n", mid, req, val);
 	if (ret >= 0) {
 		fx->fails = 0;
-	} else if (soft) {
-		/* a setting the DSP may refuse in some states: not a sign of
-		 * a stuck DSP */
+	} else if (soft || ret == -EBUSY) {
+		/* a setting the DSP may refuse in some states, or a word the
+		 * DSP had no room for (nothing was written, dsp.c
+		 * dspio_write_wait): not a sign of a stuck DSP; a halted
+		 * DSP is caught by dsp_kick */
 	} else if (++fx->fails >= 3) {
 		fx->dead = true;
 		dev_warn(chip->dev, "fx: the DSP stopped answering; no more effect changes until the next bring-up (sleep/wake or reboot)\n");
@@ -898,6 +900,7 @@ void creative_ae9_fx_dsp_reset(struct creative_chip *chip)
 	chip->hp_tries = 0;
 	chip->scp_fail_logged = false;
 	chip->dsp_halted = false;	/* a new firmware start */
+	chip->scp_rest_n = 0;		/* nothing half-sent to the new DSP */
 	chip->cap_level_sent = false;	/* Windows' level block again */
 	chip->scp_quiet_until = jiffies;
 }

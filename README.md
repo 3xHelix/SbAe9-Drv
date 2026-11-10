@@ -7,7 +7,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-09, v0.12.4):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-10, v0.12.5):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -40,9 +40,10 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.4 (restarts and Voice Clarity as Windows) and v0.12.3
-> (code-review fixes) pair with SbAe9-SBC v0.17.1 and SbAe9-AudioMon
-> v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
+> Driver v0.12.5 (restarts fixed for real, DSP queue resend) pairs with
+> SbAe9-SBC v0.18.0 and SbAe9-AudioMon v0.4.6; v0.12.4 (restarts and Voice
+> Clarity as Windows) with SbAe9-SBC v0.17.2 and SbAe9-AudioMon v0.4.5; v0.12.3 (code-review
+> fixes) with SbAe9-SBC v0.17.1 and AudioMon v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
 > Clarity, Voice Morphing, mic monitor and virtualization pages, the
 > "Optical out plays" selector); v0.12.1 paired with SbAe9-SBC
 > v0.16.1 and AudioMon v0.4.3. Older
@@ -434,8 +435,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
     an encoder), don't switch the card profile: PipeWire then builds it
     without the "Optical Out" output, which comes back at the next profile
     change.
-  - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1 to
-    192 kHz, so it records alongside the XLR mic
+  - In is its own capture device, `hw:AE9,1` ("AE-9 Optical"), 44.1, 48,
+    88.2, 96 or 192 kHz (not 176.4: its converter doesn't offer it), so it
+    records alongside the XLR mic
     (`arecord -D hw:AE9,1 -c 2 -r 48000 -f S32_LE in.wav`). In PipeWire
     it's the "Optical In" source of the AE-9's card profile (since 0.11.0;
     nothing to copy). S/PDIF input can't resample, so record at the
@@ -612,7 +614,8 @@ your card.
 
 ### Testing after a rebuild
 
-`bus_reset=1` makes a module reload behave close to a cold start, which is
+The bus reset at every load (`bus_reset`, on by default) makes a module
+reload behave close to a cold start, which is
 good for a quick check of a new build. It can disrupt streams, though
 (recording especially, see Known issues), so reboot for good measure
 before trusting the results:
@@ -666,6 +669,12 @@ the card's chip during playback can freeze the audio until a full power-off
 
 ### Known issues
 
+- What U Hear and the optical out: switching Direct Mode on or off while
+  the optical out plays (for example SbAe9-SBC's effects-to-optical loop)
+  can leave What U Hear recordings stopping about a second after the next
+  playback starts. Playback itself is fine. It stays that way until the
+  driver reloads or the PC reboots; avoid Direct Mode switches while the
+  optical out is in use. Cause in the card's router not found yet.
 - Mic monitor and Voice Clarity (since 0.12.2): after the card's mic
   monitor has been on, Voice Clarity recordings with it off are wrong
   until a power-off. See "Mic monitoring" above.
@@ -675,20 +684,26 @@ the card's chip during playback can freeze the audio until a full power-off
   never woke from. Since 0.12.4 the driver restarts the card the way
   Windows does (light sleep at unload, wake + 2 s, Windows' recovery
   cycle when needed): 6 restarts in a row on one power-up came up clean.
+  0.12.5 fixes what 0.12.4 missed: DSP mode and What U Hear could stay
+  silent after a restart (a stream count the card keeps until power-off),
+  and ASMedia-bridge cards were silent after a driver reload.
   If the card is ever stuck anyway (`DSP health:` warns), try a short
   sleep before powering off: `sudo rtcwake -m mem -s 25` (suspend to RAM
   for 25 s) cuts the card's power like a power-off does; otherwise power
-  off at the PSU for ~30 s.
-- Even a clean reload (no failures, `DSP health: ok`) can leave recording
-  silent: the stream runs but every sample is zero. A reboot fixes it.
+  off at the PSU for ~30 s. If the sleep doesn't help, check that it
+  happened: `journalctl -b | grep -i "aborting suspend"`. Another driver can
+  refuse it (seen with NVIDIA's while a model filled the VRAM), and then
+  the card never loses power.
+- Before 0.12.4 even a clean reload (no failures, `DSP health: ok`) could
+  leave recording silent: the stream ran but every sample was zero. Not
+  seen since 0.12.4's restart changes (6 reloads in a row all recorded
+  normally); if it happens, a reboot or a short sleep (below) fixes it.
 - A very small PipeWire quantum (64) can drop out under heavy CPU load
   (`pw-top` ERR column); 128 or more is fine.
 - The first stream after a sample-rate or output change can hiccup briefly
   about half a second in: the DAC re-locking to its new settings (Windows
   sends them at every start; we only when something changed,
   `dac_start_skip`).
-- After one warm reboot the first playback was silent until a new stream
-  started (the card itself was working). Not reproduced yet.
 - Suspend can be blocked by other programs stuck on network file I/O (seen
   with Plex reading from a CIFS share); not driver-related.
 - Rarely, playback restarting after a pause comes up silent even though
@@ -700,19 +715,22 @@ the card's chip during playback can freeze the audio until a full power-off
 - No sound from one app while others play: check whether it has a stream at
   all with `pactl list sink-inputs | grep -E "Sink:|application.name"`. Seen
   with Chrome Canary after output switches or a reboot (no stream; VLC
-  played fine); restarting the app fixes it. The earlier "silent first
-  playback after a warm reboot" was most likely this.
+  played fine); restarting the app fixes it. A "silent first playback
+  after a warm reboot" seen once was most likely this.
 - Now and then a warm reboot leaves the card dark (lights off, no head
   unit, no sound); Windows sees the same at times, so it's the card. The
   driver notices within a second (`codec 1 (DSP) not answering after the
   bus reset`), tries a few times, and if it says `never answered`, power
   off at the PSU for ~20 s; only that clears it (a warm reboot sometimes
-  does, a reload doesn't).
+  does, a reload doesn't). A 25 s suspend (`sudo rtcwake -m mem -s 25`)
+  cuts the card's power too and is worth a try first; it hasn't been
+  tried on a dark card yet.
 - Lots of rapid switching in a row (sample rates, Direct Mode, stereo/5.1,
   bit depth, dozens of times) can wear the card into a bad state: a stream
   that stutters more and more, or plays nothing while the player runs.
-  A warm reboot doesn't clear it, a PSU power-off does. Normal use doesn't
-  get there; it showed up during heavy testing.
+  A warm reboot doesn't clear it, a PSU power-off (or, probably, a 25 s
+  suspend: `sudo rtcwake -m mem -s 25`) does. Normal use doesn't get there;
+  it showed up during heavy testing.
 - SBX: if Direct Mode off ever gives silence or echoey, crunched audio
   that toggling doesn't fix, the card's audio router is in a bad state;
   only a PSU power-off clears it (a warm reboot doesn't). Seen often while
@@ -741,6 +759,7 @@ the card's chip during playback can freeze the audio until a full power-off
 | `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources for optical in, What U Hear and the rear RCA input. Since 0.11.0 the card profile opens them; don't copy these any more |
 | `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear" (stereo and 5.1), "AE-9 Optical In", "AE-9 Optical Out", "AE-9 Analog Out" (the main output) |
 | `config/50-ae9-safe-volume.conf` | Installed by the packages (WirePlumber): the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (100% is the head unit at 0.0 dB) |
+| `config/51-ae9-safe-volume.lua` | Installed by the packages (WirePlumber 0.4's main.lua.d; Ubuntu 24.04 / Mint 22, Debian 12, openSUSE Leap): the same -36 dB start volume, but 0.4 can only set it for every output, so any output WirePlumber has no saved volume for starts at -36 dB (quieter, never louder). WirePlumber 0.5 ignores it |
 
 ## Module parameters
 
@@ -750,7 +769,9 @@ what's left is tuning and diagnostics:
 
 - `enable_pcm=1`, `load_fw=1` — PCM device and DSP firmware.
 - `bus_reset` — secondary bus reset at probe (codec SSIDs only read
-  0x11020071/72 after one; a VM start does the same).
+  0x11020071/72 after one; a VM start does the same). On by default on every
+  card; since 0.12.5 also behind an ASMedia bridge, which fixes silence after
+  a module reload there. `bus_reset=0` turns it off.
 - `win_reset2`, `scp_event` (both 1) — Windows' second controller reset and
   announced DSP replies; kept switchable for cards behind other bridges.
 - `sentinel_clear` (0) — clear the DSP's 0x0bad0add sentinel area.
@@ -794,8 +815,9 @@ what's left is tuning and diagnostics:
   2 = always);
   `dsp_soft_tries` (3) DSP downloads per bring-up when one fails, with
   Windows' DSP_INIT + 0.5 s between them (0.12.4; 1 = no soft retry);
-  `dsp_fail_inject` (test only, clears itself) fails the next DSP load
-  once (1 = download, 2 = handshake) to exercise that retry;
+  `dsp_fail_inject` (test only, needs `debug=1`, clears itself) fails
+  the next DSP load once (1 = download, 2 = handshake) to exercise that
+  retry;
   `vc_quiet_ms` (0, writable at runtime) holds DSP messages this long
   after Voice Clarity routes the mic in (0.12.4; not needed since the
   start follows Windows' order);

@@ -3,9 +3,63 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.5 (2026-11-10)
+Restarts, for real this time. 🔁
+
+Pairs with [SbAe9-SBC v0.18.0](https://github.com/3xHelix/SbAe9-SBC) (a hint when headphones are plugged in but the card plays on speakers; fixes for PipeWire 1.0 / WirePlumber 0.4 on Ubuntu 24.04 and Mint 22) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (meters work on PipeWire 1.0.x).
+
+Thanks to Kaiba (round after round of ASMedia restart tests: the logs that
+found both restart bugs below), DarkNikGr (Dolby Digital and DTS confirmed on
+a real receiver through the optical out, plus his reports) and s3boun3t (for
+hanging out and cheering us on, plus the PipeWire 1.0 reports from
+Linux Mint).
+
+- **Fixed: 0.12.4's restart fix was incomplete. After a warm reboot or a
+  driver reload, DSP mode and What U Hear could stay silent**, and after a
+  reload even Direct Mode. The card's router chip counts how often each
+  stream was switched on and keeps that count until the power goes off; the
+  driver switched the DSP stream on at every DSP-mode switch but off only
+  once, so the leftovers kept the next start from connecting it. The driver
+  now keeps the count the way Windows does: it switches the stream on only
+  when it's off, and hands every leftover back at shutdown, at start-up and
+  when you leave DSP mode.
+- **Fixed: ASMedia-bridge cards were silent after a driver reload.** The
+  driver skipped the card reset at start-up behind that bridge (since 0.9.8,
+  when the reset seemed to take the bridge down; the real cause was fixed
+  later), so a reload started on the card's leftover state. The reset now
+  runs on every card. Tested by Kaiba: hot reloads, a cold and a warm boot,
+  and Voice Clarity now works after a warm reboot too. `bus_reset=0` turns
+  it off.
+- **Fixed: a DSP message could lose a word when the DSP's command queue was
+  busy** (seen a few times per boot on some cards with Voice Clarity on).
+  The card's router chip refuses a word while the DSP's queue is full and
+  keeps saying "full" until the next word. The driver used to wait 2 s and
+  then send the next word, losing the refused one. Now it waits out "busy",
+  sends a refused word again after a short pause (up to 2 s) until it goes
+  in, and logs how many tries it took. `scp_full_resend=0` is the old
+  behaviour, for diagnosis only. Tested by Kaiba on an ASMedia card: the
+  word that used to jam goes in after one resend (4 ms).
+- **Fixed: on Ubuntu 24.04 / Mint 22, Debian 12 and openSUSE Leap the AE-9
+  started 12 dB louder than intended** (-24 dB instead of -36 dB). Their
+  WirePlumber 0.4 ignores the packages' safe-volume rule, which is written
+  for WirePlumber 0.5. The packages now also install a WirePlumber 0.4
+  version (`51-ae9-safe-volume.lua`). 0.4 can only set the start volume for
+  every output at once, so there any output without a saved volume starts
+  at -36 dB. Volumes you set are still kept.
+- Optical out and optical in no longer offer 176.4 kHz (their converters
+  don't support it), and a 176.4 kHz main stream isn't mirrored to optical.
+- The DSP's start-up reset is repeated while the DSP answers busy, as
+  Windows does.
+- `dsp_fail_inject` (a test option) only acts with `debug=1`.
+- Confirmed by DarkNikGr: Dolby Digital and DTS through the optical out to a
+  receiver, both with `ae9-optical-passthrough` and SbAe9-SBC's encoder.
+- Known issue, not new: switching Direct Mode while the optical out plays
+  can leave What U Hear recordings stalling until the driver reloads (see
+  README, Known issues).
+
 ## 0.12.4 (2026-11-09)
 Restarts and Voice Clarity, the Windows way. 🔁
-Pairs with [SbAe9-SBC v0.17.1](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon). Thanks to Kaiba for the Voice Clarity report that found two of these.
+Pairs with [SbAe9-SBC v0.17.2](https://github.com/3xHelix/SbAe9-SBC) (adds the rtcwake tip) and [SbAe9-AudioMon v0.4.5](https://github.com/3xHelix/SbAe9-AudioMon) (warns when a Voice Clarity recording is hit by the mic monitor quirk). Thanks to Kaiba for the Voice Clarity report that found two of these.
 
 - **Fixed: restarting the driver without a power cut could break the
   card.** Reloading the driver (or a warm reboot) got riskier each time:

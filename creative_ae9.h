@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.4"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.5"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -340,7 +340,12 @@ struct creative_chip {
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
-	unsigned int		scp_busy_writes;	/* DSP words written into a busy queue */
+	unsigned int		scp_busy_words;	/* DSP words not sent: no room after 2 s */
+	unsigned int		scp_full_words;	/* DSP words answered "command queue full" */
+	/* the unsent rest of a cut SCP message (header + up to 16 data
+	 * words): goes out before the next message (dsp.c, scp_send_words) */
+	u32			scp_rest[17];
+	unsigned int		scp_rest_n;
 	int			pcm_started;  /* set after first PCM start — skips one-time ChipIO setup */
 	int			relay_engaged; /* set after relay fires — skip on repeated prepares */
 

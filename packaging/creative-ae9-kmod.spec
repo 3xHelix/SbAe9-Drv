@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.4
+Version:        0.12.5
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,11 @@ done
 %{?akmod_install}
 
 %changelog
+* Tue Nov 10 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.5-1
+- Driver 0.12.5: restarts fixed for real (router stream count kept as
+  Windows), bus reset on ASMedia-bridge cards too, a DSP word refused as
+  full is resent until it goes in, WirePlumber 0.4 safe start volume
+  (51-ae9-safe-volume.lua), optical without 176.4 kHz
 * Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.4-1
 - Driver 0.12.4: warm restarts as Windows (wake + recovery cycle), Voice
   Clarity starts in Windows' order (no DSP stall), Voice Clarity off goes

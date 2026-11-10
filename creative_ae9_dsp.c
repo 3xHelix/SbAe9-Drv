@@ -164,11 +164,12 @@ MODULE_PARM_DESC(dsp_soft_tries, "DSP downloads per bring-up when one fails, wit
  * Test only: make the next DSP load(s) fail on purpose, to exercise the
  * retry. 1 = stop the download after its first chunk (DSP never started),
  * 2 = start the DSP but skip the boot handshake (as a DSP that never
- * answered). Cleared when used; set it again for each test.
+ * answered). Cleared when used; set it again for each test. Only acts with
+ * debug >= 1, so a stray setting can't fail a normal start.
  */
 static unsigned int dsp_fail_inject;
 module_param(dsp_fail_inject, uint, 0644);
-MODULE_PARM_DESC(dsp_fail_inject, "Test: fail the next DSP load once (1 = download, 2 = handshake); cleared when used");
+MODULE_PARM_DESC(dsp_fail_inject, "Test (needs debug=1): fail the next DSP load once (1 = download, 2 = handshake); cleared when used");
 
 /* a retry (soft or a whole bring-up) comes after this attempt: don't sit
  * out every timeout */
@@ -510,53 +511,82 @@ static int dspio_send(struct creative_chip *chip, unsigned int reg,
 	return -EIO;
 }
 
-static void dspio_write_wait(struct creative_chip *chip)
+/*
+ * The DSP's command queue, word by word (Windows: CtxHda FUN_00027af4;
+ * mainline ca0132 dspio_write). Each word is the low half (verb 0x0) and
+ * the high half (verb 0x1, which queues it), then the status (0xF01):
+ * 1 = busy, 2 = "command queue full".
+ *
+ * What the router chip does (its 8051 program, PMEM 0x77AE, notes 63e):
+ * the high half asks whether the DSP's ring has room; if not it SKIPS the
+ * write and sets the status to 2, otherwise it writes the word and sets 0.
+ * That 2 stays until the next word (or a 0x702 read): the DSP draining its
+ * ring doesn't clear it. So:
+ * - a word answered 2 did NOT go in (Windows and mainline agree: neither
+ *   counts it as written), and sending it again is safe: it's either taken
+ *   or refused again, never written twice
+ * - a status of 2 before a word only describes the last word; it says
+ *   nothing about room now. Waiting for it to clear never ends (0.12.5-rc1
+ *   waited, so after one "full" every later word failed until a reload;
+ *   0.12.4 wrote after 2 s, which is what cleared it). Sending is the only
+ *   way to ask, so only busy (1) is waited out.
+ * Windows never saw a 1 or a 2 (32354 words in 28 captures, notes 63e).
+ *
+ * Rules here:
+ * - wait out busy (1) before a word, up to 2 s; never write into busy
+ * - a word answered 2 is sent again (low + high half) after a short pause,
+ *   1, 2, 4, 8, 16, then 20 ms, until it goes in or 2 s have passed
+ *   (scp_full_resend=1, default); scp_full_resend=0 counts it as sent
+ *   (the old reading; diagnostic only, the word is lost)
+ * - return 0 only for a word that went in, < 0 for one that did not; the
+ *   caller (scp_send_words) keeps the rest of a cut message
+ */
+static unsigned int scp_full_resend = 1;
+module_param(scp_full_resend, uint, 0644);
+MODULE_PARM_DESC(scp_full_resend, "A DSP word answered with 'command queue full' did not go in: send it again until it does (1 = default, as the router chip's program shows; 0 = count it as sent, the word is lost; diagnostic)");
+
+/* Test hook for the resend path (cards that never fill the queue): every
+ * Nth word's first send stops after the low half and reports "full", as a
+ * word the router chip refused. Needs debug=1; only after start-up
+ * (dsp_done), never before the DSP's boot handshake. */
+static unsigned int scp_full_inject;
+module_param(scp_full_inject, uint, 0644);
+MODULE_PARM_DESC(scp_full_inject, "Test (needs debug=1): every Nth DSP word is treated as refused 'queue full' once, to exercise the resend (0 = off)");
+
+#define SCP_ROOM_WAIT_MS	2000	/* busy before a word / resends of a word */
+#define SCP_RESEND_MAX_MS	20	/* longest pause between resends */
+
+static int dspio_write_wait(struct creative_chip *chip, unsigned int ms)
 {
+	unsigned long start = jiffies;
+	unsigned long timeout = start + msecs_to_jiffies(ms);
 	int status;
-	unsigned long timeout;
 
 	/*
-	 * After standup the 8051 is in audio-loop mode. dsp_read() calls
-	 * corb_send_verb_sync() which waits 1s for RIRB — multiple calls
-	 * fill the CORB ring. Use a single fast attempt post-standup,
-	 * same as chipio_send(). If not immediately ready, proceed anyway.
+	 * Go on anything but busy (1) or a failed read: 0 = OK, 3 = response
+	 * queue empty, 2 = the last word was refused (sticky, see above; the
+	 * next send asks again). Short polls first, then 20 ms ones.
 	 */
-	if (chip->standup_done) {
-		dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
-		return;
-	}
-
-	/*
-	 * Wait until the SCP command queue has space before writing the next
-	 * word. Match the decompiled driver's dspio_scp pre-write poll:
-	 *   - Exit on OK (0x00) or RESPONSE_QUEUE_EMPTY (0x03)
-	 *   - Sleep 20ms between retries (decompiled uses msleep(1) in the
-	 *     pre-send poll and msleep(20) in dspio_send; we use 20ms here
-	 *     to give the 8051 enough time to drain queued commands)
-	 *
-	 * The previous version exited only on 0x00 (both queues clear), which
-	 * often timed out because the response queue refilled continuously.
-	 * Accepting 0x03 (response empty, command queue may have space) and
-	 * using 20ms sleep matches the decompiled's timing and gives 0x32/0x00
-	 * (source select = FLOAT_TWO) a clear command queue slot to land in.
-	 */
-	timeout = jiffies + msecs_to_jiffies(2000);
-	do {
+	for (;;) {
 		status = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
 		if (status == VENDOR_STATUS_DSPIO_OK ||
-		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY)
+		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY ||
+		    status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
+			return 0;
+		if (chip->card_gone)
+			return -ENODEV;
+		if (!time_before(jiffies, timeout))
 			break;
-		msleep(20); /* match decompiled: give 8051 time to drain commands */
-	} while (time_before(jiffies, timeout));
-	/* still busy after 2 s: the word goes into a busy queue and can be
-	 * lost or misframed (the "not a reply header" lines that follow);
-	 * this used to be silent (Kaiba's distorted take, 0.12.3) */
-	if (status != VENDOR_STATUS_DSPIO_OK &&
-	    status != VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY) {
-		chip->scp_busy_writes++;
-		dev_warn_ratelimited(chip->dev, "DSP command queue still busy after 2 s (status 0x%x): writing anyway, the message may be lost (%u so far)\n",
-				     status, chip->scp_busy_writes);
+		if (time_before(jiffies, start + msecs_to_jiffies(50)))
+			usleep_range(1000, 2000);
+		else
+			msleep(20);
 	}
+	/* never write into a busy queue */
+	chip->scp_busy_words++;
+	dev_warn_ratelimited(chip->dev, "DSP command queue still busy after %u ms (status 0x%x): word not sent (%u so far)\n",
+			     ms, status, chip->scp_busy_words);
+	return -EBUSY;
 }
 
 static void dspio_clear_response_queue(struct creative_chip *chip);
@@ -566,76 +596,96 @@ static int dsp_kick(struct creative_chip *chip);
 
 static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 {
+	static unsigned int inject_n;
+	unsigned long start = jiffies;
+	unsigned int tries, pause = 1;
+	bool kicked = false, inject = false;
 	int status;
-	unsigned long timeout;
-	int kicked = 0;
 
-	dspio_write_wait(chip);
-
-	status = dspio_send(chip, VENDOR_DSPIO_SCP_WRITE_DATA_LOW,
-			    scp_data & 0xffff);
+	status = dspio_write_wait(chip, SCP_ROOM_WAIT_MS);
 	if (status < 0)
 		return status;
-	/*
-	 * DATA_HIGH carries scp_data bits [31:16]; dspio_send() already puts
-	 * the upper byte in the verb field. Windows sends header 0x08180080
-	 * as verb 0x108 payload 0x18 (capture seq 4570). The Jun 3 change
-	 * (bf7ab3d) took bits [23:20] instead and dropped bits [31:24]: the
-	 * header's data size and flags, and the top byte of every data word.
-	 */
-	status = dspio_send(chip, VENDOR_DSPIO_SCP_WRITE_DATA_HIGH,
-			    scp_data >> 16);
-	if (status < 0)
-		return status;
+	if (scp_full_inject && ae9_debug && chip->dsp_done &&
+	    ++inject_n >= scp_full_inject) {
+		inject_n = 0;
+		inject = true;
+	}
 
-	/*
-	 * If the SCP COMMAND queue is full, the DSP hasn't drained prior
-	 * commands yet. Intermittently (slightly slower DSP) the standup's
-	 * burst of dspio_set_uint_param calls overruns it, leaving the queue
-	 * stuck full and every later SCP op failing -EIO. Wait for the DSP to
-	 * drain the command queue (status != QUEUE_FULL) before returning,
-	 * instead of giving up. Drains the response queue too to help it move.
-	 */
-	/*
-	 * If the command queue is full, the DSP (8051) has stopped draining
-	 * it. This happens intermittently when the 8051 falls into a halt
-	 * state after the standup (DBGCNTL STATE!=0). Kick the DSP run-state
-	 * to un-halt it so it resumes consuming the queue, then wait. Without
-	 * this the queue stays full and every later SCP op fails -EIO
-	 * (select_lineout etc).
-	 *
-	 * Since the DSP has answered its boot handshake, dsp_kick() only
-	 * looks: a running DSP (halt state 0, every Voice Clarity route-in
-	 * stall) is left alone, a halted one is marked broken, never set
-	 * running again (see dsp_kick).
-	 */
-	timeout = jiffies + msecs_to_jiffies(500);
-	do {
-		status = dsp_read(chip, WIDGET_DSP_CTRL,
-				  VENDOR_DSPIO_STATUS, 0);
-		if (status != VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
+	for (tries = 1; ; tries++) {
+		/* dspio_send() returns -EIO for a half the DSP answers busy */
+		status = dspio_send(chip, VENDOR_DSPIO_SCP_WRITE_DATA_LOW,
+				    scp_data & 0xffff);
+		if (status < 0)
+			return status;
+		if (inject) {
+			/* the test hook: the high half never sent = refused */
+			inject = false;
+			status = VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL;
+		} else {
+			/*
+			 * DATA_HIGH carries scp_data bits [31:16]; dspio_send()
+			 * puts the upper byte in the verb field. Windows sends
+			 * header 0x08180080 as verb 0x108 payload 0x18 (capture
+			 * seq 4570). The Jun 3 change (bf7ab3d) took bits
+			 * [23:20] instead and dropped bits [31:24].
+			 */
+			status = dspio_send(chip, VENDOR_DSPIO_SCP_WRITE_DATA_HIGH,
+					    scp_data >> 16);
+			if (status < 0)
+				return status;
+			status = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
+		}
+		if (status != VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL) {
+			if (tries > 1)
+				dev_info_ratelimited(chip->dev, "DSP word 0x%08x went in after %u resend(s) (%u ms)\n",
+						     scp_data, tries - 1,
+						     jiffies_to_msecs(jiffies - start));
 			return 0;
+		}
 		if (!kicked) {
 			unsigned int dbg = ~0U;
 
-			/* Logged: before the handshake this writes DBGCNTL,
-			 * a suspect in the one Linux DSP halt (2026-11-07
-			 * 22:25, note 52d). */
+			chip->scp_full_words++;
+			/*
+			 * Once per word, look whether the DSP halted itself:
+			 * since the boot handshake dsp_kick() only looks (a
+			 * running DSP is left alone; a halted one is marked
+			 * broken). Before the handshake it sets it running.
+			 * DBGCNTL logged: before the handshake dsp_kick writes
+			 * it, a suspect in the one Linux DSP halt (note 52d).
+			 */
 			creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
-			dev_warn_ratelimited(chip->dev, "DSP command queue full (DBGCNTL 0x%08x): kicking the DSP's run state\n",
-					     dbg);
-			kicked = 1;
+			dev_warn_ratelimited(chip->dev, "DSP command queue full after word 0x%08x (DBGCNTL 0x%08x): %s (%u so far)\n",
+					     scp_data, dbg,
+					     scp_full_resend ? "sending it again" :
+					     "counted as sent", chip->scp_full_words);
+			kicked = true;
 			if (dsp_kick(chip) == -EIO)
 				return -EIO;	/* halted itself: don't wait */
 		}
-		usleep_range(50, 100);
-	} while (time_before(jiffies, timeout));
-
-	return -EIO;
+		if (!scp_full_resend)
+			return 0;
+		if (chip->card_gone)
+			return -ENODEV;
+		if (!time_before(jiffies, start + msecs_to_jiffies(SCP_ROOM_WAIT_MS))) {
+			chip->scp_busy_words++;
+			dev_warn_ratelimited(chip->dev, "DSP word 0x%08x refused as 'queue full' for %u ms (%u sends): not sent\n",
+					     scp_data, jiffies_to_msecs(jiffies - start),
+					     tries);
+			return -EBUSY;
+		}
+		if (pause < 2)
+			usleep_range(1000, 1500);
+		else
+			msleep(pause);
+		pause = min(pause * 2, (unsigned int)SCP_RESEND_MAX_MS);
+	}
 }
 
+/* Words of one message; *sent = how many went in (all of them on 0). */
 static int dspio_write_multiple(struct creative_chip *chip,
-				unsigned int *buffer, unsigned int size)
+				const unsigned int *buffer, unsigned int size,
+				unsigned int *sent)
 {
 	int status = 0;
 	unsigned int count = 0;
@@ -648,7 +698,53 @@ static int dspio_write_multiple(struct creative_chip *chip,
 			break;
 		count++;
 	}
+	*sent = count;
 	return status;
+}
+
+/*
+ * Send one SCP message (header + data words). A message cut after its
+ * header leaves the DSP waiting for the rest: it would take the next
+ * message's header as data and that message's data as a header (an
+ * all-zero data word reads as header 0 -> error reply 0x04000000). So the
+ * rest of a cut message is kept and goes out first, before any new header;
+ * while it can't, no new message is started (-EBUSY, nothing written).
+ * A message that failed at its first word left nothing behind.
+ */
+static int scp_send_words(struct creative_chip *chip, const u32 *w,
+			  unsigned int n)
+{
+	unsigned int sent = 0;
+	int ret;
+
+	BUILD_BUG_ON(ARRAY_SIZE(chip->scp_rest) < SCP_MAX_DATA_WORDS + 1);
+	if (n > ARRAY_SIZE(chip->scp_rest))
+		return -EINVAL;
+	if (chip->scp_rest_n) {
+		unsigned int left = chip->scp_rest_n;
+
+		ret = dspio_write_multiple(chip, chip->scp_rest, left, &sent);
+		if (sent) {
+			memmove(chip->scp_rest, chip->scp_rest + sent,
+				(left - sent) * sizeof(u32));
+			chip->scp_rest_n = left - sent;
+		}
+		if (ret < 0) {
+			dev_warn_ratelimited(chip->dev, "scp: %u word(s) of a cut message still not sent (%d); message 0x%08x not started\n",
+					     chip->scp_rest_n, ret, w[0]);
+			return ret == -EIO || ret == -ENODEV ? ret : -EBUSY;
+		}
+		dev_info_ratelimited(chip->dev, "scp: the rest of a cut message (%u word(s)) went out\n",
+				     left);
+	}
+	ret = dspio_write_multiple(chip, w, n, &sent);
+	if (ret < 0 && sent) {
+		memcpy(chip->scp_rest, w + sent, (n - sent) * sizeof(u32));
+		chip->scp_rest_n = n - sent;
+		dev_warn_ratelimited(chip->dev, "scp: message 0x%08x cut after %u of %u words (%d): the rest goes out before the next message\n",
+				     w[0], sent, n, ret);
+	}
+	return ret;
 }
 
 static int dspio_read(struct creative_chip *chip, unsigned int *data)
@@ -982,10 +1078,12 @@ static int dspio_scp(struct creative_chip *chip, int mod_id, int src_id,
 		sts = dsp_read(chip, WIDGET_DSP_CTRL, VENDOR_DSPIO_STATUS, 0);
 		creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
 		creative_dsp_chipio_addr_invalidate();
-		dev_warn(chip->dev, "DSP: first failed message since start: %s mid 0x%02x src 0x%02x req 0x%02x (%u data words) -> %d; DSPIO status 0x%x, DBGCNTL 0x%08x, verb timeouts %u, replies announced %d/read %u\n",
+		dev_warn(chip->dev, "DSP: first failed message since start: %s mid 0x%02x src 0x%02x req 0x%02x (%u data words) -> %d; DSPIO status 0x%x, DBGCNTL 0x%08x, verb timeouts %u, replies announced %d/read %u, words busy %u/full %u, cut-message words left %u\n",
 			 dir == SCP_GET ? "GET" : "SET", mod_id, src_id, req,
 			 len / 4, ret, sts, dbg, chip->corb_timeouts,
-			 atomic_read(&chip->scp_unsol), chip->scp_unsol_done);
+			 atomic_read(&chip->scp_unsol), chip->scp_unsol_done,
+			 chip->scp_busy_words, chip->scp_full_words,
+			 chip->scp_rest_n);
 	}
 	mutex_unlock(&chip->scp_mutex);
 	return ret;
@@ -1030,8 +1128,7 @@ static int dspio_scp_unlocked(struct creative_chip *chip, int mod_id,
 				     ((scp_send.hdr >> 8) & 0xff);
 	chip->dsp_wait_scp = (dir == SCP_GET);
 
-	status = dspio_write_multiple(chip, (unsigned int *)&scp_send,
-				      scp_send_size);
+	status = scp_send_words(chip, (const u32 *)&scp_send, scp_send_size);
 	if (status < 0) {
 		chip->dsp_wait_scp = 0;
 		return status;
@@ -1272,7 +1369,7 @@ int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
 		m.hdr = make_scp_header(mid, src, 1, req, 0, 0, 0, 0);
 		want = (m.hdr & 0xffff0000) | ((m.hdr & 0xff) << 8) | ((m.hdr >> 8) & 0xff);
 		t0 = ktime_get();
-		if (dspio_write_multiple(chip, &m.hdr, 1) < 0) {
+		if (scp_send_words(chip, &m.hdr, 1) < 0) {
 			dev_info(chip->dev, "scpprobe %u: send failed\n", i);
 			break;
 		}
@@ -2897,7 +2994,7 @@ static int dspxfr_image(struct creative_chip *chip,
 					port_map_mask);
 		if (status < 0)
 			break;
-		if (dsp_fail_inject == 1) {
+		if (dsp_fail_inject == 1 && ae9_debug) {
 			dsp_fail_inject = 0;
 			dev_warn(chip->dev, "dspxfr: dsp_fail_inject=1: stopping the download after its first segment (test)\n");
 			status = -ETIMEDOUT;
@@ -3028,7 +3125,7 @@ static int dspload_image(struct creative_chip *chip,
 		 * and the first bring-up failed on 5 of 13 boots (2026-11-07).
 		 */
 		msleep(250);
-		if (dsp_fail_inject == 2) {
+		if (dsp_fail_inject == 2 && ae9_debug) {
 			dsp_fail_inject = 0;
 			dev_warn(chip->dev, "dspload: dsp_fail_inject=2: skipping the boot handshake (test)\n");
 			msleep(2000);	/* Windows' wait for state 3 */
@@ -3223,6 +3320,7 @@ static void dsp_soft_reset(struct creative_chip *chip, unsigned int attempt,
 	chip->hs_ok = false;
 	atomic_set(&chip->scp_unsol, 0);
 	chip->scp_unsol_done = 0;
+	chip->scp_rest_n = 0;	/* a cut message belongs to the old DSP */
 }
 
 /* ------------------------------------------------------------------ */
@@ -3235,6 +3333,8 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	unsigned int attempt, tries = max(dsp_soft_tries, 1U);
 	unsigned long timeout;
 	int ret;
+
+	chip->scp_rest_n = 0;	/* nothing half-sent goes to a new DSP */
 
 	/* If the DSP already has firmware running (e.g. warm reboot — the DSP
 	 * isn't power-cycled), don't try to reload over it (that crashes it).
@@ -3643,10 +3743,12 @@ static u32 cv_float(int v)	/* small integer -> IEEE float bits */
  * apart, capture 4 s8): sent back to back, a voice change (9 values) plus
  * the route-in filled the DSP's command queue (cv-morph, 2026-11-09:
  * "queue full ... kicking the DSP" on 3 of 6 voices). */
-static void cv_set(struct creative_chip *chip, int mid, int req, u32 val)
+static int cv_set(struct creative_chip *chip, int mid, int req, u32 val)
 {
-	dspio_set_uint_param(chip, mid, req, val);
+	int ret = dspio_set_uint_param(chip, mid, req, val);
+
 	usleep_range(2000, 3000);
+	return ret;
 }
 
 /*
@@ -3680,7 +3782,8 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 		if (chip->cv.mon_used && !chip->cv.monitor)
 			dev_warn_ratelimited(chip->dev, "Voice Clarity: the mic monitor was used since the card started; the DSP now records Voice Clarity right only while the monitor is on (left low, right empty). Power the PC off to clear it, or use a software monitor with Voice Clarity\n");
 		cv_conns(chip, true);
-		cv_set(chip, 0x80, 0x05, FLOAT_ONE);
+		if (cv_set(chip, 0x80, 0x05, FLOAT_ONE) < 0)
+			dev_warn(chip->dev, "Voice Clarity: the DSP didn't take the voice processor switch; this recording may be the plain mic\n");
 		scp_get_u32(chip, MASTERCONTROL, 0x3d, &st);	/* Windows' status read */
 		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 1);
 		/* the DSP now sets the voice processor up and takes no
@@ -3755,15 +3858,19 @@ void creative_ae9_cv_apply(struct creative_chip *chip)
 	/* the multi-value presets only when they change: resending all 17
 	 * at every switch filled the DSP's command queue (cv-talk take 3,
 	 * 2026-11-08); Windows sends them only on a preset change */
+	/* a preset that didn't fully go out is sent again next time (-1) */
 	if (cv->on && cv->voicefx) {
-		if (cv->sent_voicefx != (int)cv->voicefx)
+		if (cv->sent_voicefx != (int)cv->voicefx) {
+			int err = 0;
+
 			for (i = 0; i < 9; i++)
-				cv_set(chip, CV_MID, CV_VOICEFX_REQ + i,
-						     cv_voicefx[cv->voicefx].vals[i]);
-		cv->sent_voicefx = cv->voicefx;
+				err |= cv_set(chip, CV_MID, CV_VOICEFX_REQ + i,
+					      cv_voicefx[cv->voicefx].vals[i]);
+			cv->sent_voicefx = err ? -1 : (int)cv->voicefx;
+		}
 	} else {
-		cv_set(chip, CV_MID, CV_VOICEFX_REQ, FLOAT_ZERO);
-		cv->sent_voicefx = 0;
+		cv->sent_voicefx = cv_set(chip, CV_MID, CV_VOICEFX_REQ,
+					  FLOAT_ZERO) ? -1 : 0;
 	}
 	cv_set(chip, CV_MID, CV_NR_REQ,
 			     cv->on && cv->fx[1] ? FLOAT_ONE : FLOAT_ZERO);
@@ -3776,10 +3883,12 @@ void creative_ae9_cv_apply(struct creative_chip *chip)
 	cv_set(chip, CV_MID, CV_MICEQ_ON_REQ,
 			     cv->on && cv->miceq ? FLOAT_ONE : FLOAT_ZERO);
 	if (cv->on && cv->sent_miceq != (int)cv->miceq) {
+		int err = 0;
+
 		for (i = 0; i < 8; i++)
-			cv_set(chip, CV_MID, CV_MICEQ_REQ + i,
-					     cv_float(cv_miceq[cv->miceq].db[i]));
-		cv->sent_miceq = cv->miceq;
+			err |= cv_set(chip, CV_MID, CV_MICEQ_REQ + i,
+				      cv_float(cv_miceq[cv->miceq].db[i]));
+		cv->sent_miceq = err ? -1 : (int)cv->miceq;
 	}
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
