@@ -575,6 +575,7 @@ void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what);
 void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
 				      const u8 (*cmds)[3], size_t n);
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg);
 
 /* ------------------------------------------------------------------ */
 /* MMIO accessor helpers (with mandated memory barriers)		  */
