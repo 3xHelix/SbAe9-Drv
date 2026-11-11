@@ -3,6 +3,40 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.6 (2026-11-11)
+Clean routes, clean sound. 🔀
+
+Pairs with [SbAe9-SBC v0.18.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed on their side).
+
+- **Fixed: What U Hear could stall after a Direct Mode switch while the
+  optical out played** (the known issue in 0.12.5). Direct Mode playback
+  wrote into fixed router slots that the card's router chip may have given
+  to What U Hear. It now uses the slots the chip hands out, as Windows does.
+  `rt_chain_walk=0` is the old behaviour.
+- **Fixed: a router stream count went one too high** after switching Direct
+  Mode on while playing (until the next reload). The driver no longer
+  switches the DSP's host stream on itself (the router chip does it, as on
+  Windows), and it hands every leftover count back at shutdown and
+  start-up. `stream_drain`, `in05_host`.
+- **Found and fixed in testing (never in a release): leftover router routes
+  could make the analog out sound gated and metallic** (48/192 kHz), or 96
+  kHz very quiet, until a power-off. A DSP-mode route the What U Hear fix
+  moved, plus an input route the driver adds in DSP mode, were never
+  switched off. The driver now switches such routes off when Direct Mode
+  starts and at shutdown, and keeps one feed per output in DSP mode.
+  `rt_dac_clean`.
+- DSP mode: the output unmute is read back and resent until it takes, and
+  sent at every playback start and stop, as Windows does (`unmute_check`,
+  `pcm_unmute`).
+- `ae9-full-dump` has a read-only "Driver state" section (debugfs
+  `state`): mode, counters, router stream counts, GPIO pin levels, the
+  head unit's unanswered start-up frames, the routes feeding the DACs.
+  It lists one line per control.
+- Every step the driver replays from Windows now has a known meaning (1633
+  of 1633): the last one, 0x100e34, is a fixed setting in the DSP's debug
+  block (read on the card). The decoder also names the card's clock
+  registers.
+
 ## 0.12.5 (2026-11-10)
 Restarts, for real this time. 🔁
 

@@ -9,7 +9,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-10, v0.12.5):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-11, v0.12.6):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -42,8 +42,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.5 (restarts fixed for real, DSP queue resend) pairs with
-> SbAe9-SBC v0.18.0 and SbAe9-AudioMon v0.4.6; v0.12.4 (restarts and Voice
+> Driver v0.12.6 (What U Hear stall fixed, router clean-up) and v0.12.5
+> (restarts fixed for real, DSP queue resend) pair with SbAe9-SBC v0.18.0
+> and SbAe9-AudioMon v0.4.6; v0.12.4 (restarts and Voice
 > Clarity as Windows) with SbAe9-SBC v0.17.2 and SbAe9-AudioMon v0.4.5; v0.12.3 (code-review
 > fixes) with SbAe9-SBC v0.17.1 and AudioMon v0.4.4; v0.12.2 paired with SbAe9-SBC v0.17.0 (Voice
 > Clarity, Voice Morphing, mic monitor and virtualization pages, the
@@ -56,7 +57,7 @@ playback.
 - Creative Sound Blaster AE-9 — PCI `1102:0010`, subsystem `0x0071`
   (CA0132 Sound Core3D, behind a PCIe-to-PCI bridge), with the ACM head unit
   connected.
-- Developed/tested on Fedora 44 KDE, kernels `7.2.13`, `7.2.14` and `7.2.15`
+- Developed/tested on Fedora 44 KDE, kernels `7.2.13` to `7.2.15` and `7.3.3`
   (`-200.fc44.x86_64`).
 - No `iommu=pt` needed: tested on an AMD system with the IOMMU in its
   default translated mode, with no IOMMU page faults from the card. (Drivers
@@ -137,7 +138,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.4-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.6-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -652,7 +653,12 @@ without changing anything. Stop all audio first: while something plays it
 skips the chip readings, which can freeze the audio during playback. Take
 one while the problem is happening (and one when it's fine, if you can)
 and attach them to your report. It only names the apps that are playing;
-look it over before posting.
+look it over before posting. Since 0.12.6 it also has a "Driver state"
+section (read-only, also while playing): mode, error counters, the router
+chip's stream counts, the GPIO pin levels, which head-unit start-up frames
+went unanswered, and the routes feeding the DACs ("STALE" there means a
+leftover route; the driver switches those off at the next Direct Mode
+start).
 
 Two more tools for volunteers (packaged since 0.11.2, read-only):
 
@@ -676,7 +682,9 @@ the card's chip during playback can freeze the audio until a full power-off
   can leave What U Hear recordings stopping about a second after the next
   playback starts. Playback itself is fine. It stays that way until the
   driver reloads or the PC reboots; avoid Direct Mode switches while the
-  optical out is in use. Cause in the card's router not found yet.
+  optical out is in use. Cause found: the driver writes playback into fixed
+  router slots that the router chip may have given to What U Hear; fixed in
+  the next release (0.12.6).
 - Mic monitor and Voice Clarity (since 0.12.2): after the card's mic
   monitor has been on, Voice Clarity recordings with it off are wrong
   until a power-off. See "Mic monitoring" above.
@@ -847,6 +855,19 @@ what's left is tuning and diagnostics:
   commands only when the rate or output changed (each send makes it
   re-lock, a brief hiccup); 0 sends them at every start, as Windows.
 
+- Router (0.12.6; kept switchable for diagnosis):
+  `rt_chain_walk` (1, writable at runtime) Direct Mode starts use the router
+  slots the router chip gave the stream, as Windows (0 = the old fixed
+  slots, which stalled What U Hear); `stream_drain` (1, writable at runtime)
+  release the router chip's stream counts at shutdown and start-up;
+  `in05_host` (0, load-time) 1 = the old host enable of stream 0x05;
+  `rt_dac_clean` (1, writable at runtime) switch off leftover DSP-mode routes
+  at Direct Mode on, the first Direct start and shutdown (left on, they
+  made the analog out gated/metallic until a power-off).
+- DSP output unmute (0.12.6, writable at runtime): `unmute_check` (1) read
+  the unmute back after effect changes and resend it (up to 10 times), as
+  Windows; `pcm_unmute` (1) unmute at every DSP-mode playback start and
+  stop, as Windows.
 - Recording: `cap_bits` (24, writable at runtime; also the "Capture Bit
   Depth" control) 24- or 32-bit recording samples.
 - Optical: `spdif_out` (1, writable at runtime; also the "Optical Out

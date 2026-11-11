@@ -685,6 +685,77 @@ static bool fx_hp_virt(struct creative_chip *chip)
 	return !chip->fx.direct && chip->hu_output && chip->fx.hp_virt;
 }
 
+/*
+ * The closing unmute of a mute ... unmute bracket, as Windows does it
+ * (CtxHda FUN_000196d0, note 64c): unmute, read the mute back, and while
+ * it still reads muted (or the read fails) unmute again after 10 ms, at
+ * most 10 times. Sent even when the DSP was marked as not answering: the
+ * opening mute may already be in, and a lost unmute leaves DSP-mode
+ * playback silent until the next effect change.
+ * unmute_check=0: one unmute, no read-back (before 0.12.6).
+ */
+static unsigned int unmute_check = 1;
+module_param(unmute_check, uint, 0644);
+MODULE_PARM_DESC(unmute_check, "DSP output unmute after effect changes: read it back and resend until it took, as Windows (1 = yes, default; 0 = one unmute, no check)");
+
+static void fx_unmute_verify(struct creative_chip *chip)
+{
+	u32 hdr = (0x3a << 17) | (0x20 << 8) | FX_MID_OUT, zero = 0, val = ~0U, val0 = 0;
+	int i, ret = 0, got = 0, got0 = 0, fails = 0;
+
+	for (i = 0; i < 10; i++) {
+		if (i) {
+			chip->unmute_resends++;
+			usleep_range(10000, 11000);
+		}
+		usleep_range(5000, 6000);	/* fx_send's pacing */
+		ret = creative_dsp_scp_send(chip, hdr, &zero, 1);
+		if (ret < 0)
+			dev_info(chip->dev, "fx: unmute (0x96/0x3a = 0) FAILED (%d)\n", ret);
+		/* a DSP that stopped answering gets the one unmute, no
+		 * read-backs (each failed read waits up to 1 s) */
+		if (!unmute_check || chip->dsp_halted || chip->fx.dead)
+			return;
+		usleep_range(3000, 4000);	/* Windows reads 2-3 ms after the unmute */
+		got = creative_dsp_out_mute_get(chip, &val);
+		if (!i) {
+			got0 = got;
+			val0 = val;
+		}
+		if (got < 0 && ++fails >= 3) {
+			dev_info(chip->dev, "fx: DSP output mute can't be read back (%d); unmute sent %d times\n",
+				 got, i + 1);
+			return;
+		}
+		if (got >= 0 && val == 0) {
+			if (i)
+				dev_info(chip->dev, "fx: DSP output unmuted after %d resend%s (first read %d: 0x%08x)\n",
+					 i, i == 1 ? "" : "s", got0, val0);
+			return;
+		}
+	}
+	chip->unmute_stuck++;
+	dev_warn(chip->dev, "fx: DSP output still muted after 10 unmutes (last send %d, read %d: 0x%08x); DSP mode may play silence until the next effect change\n",
+		 ret, got, val);
+}
+
+/*
+ * Windows unmutes the DSP output at every stream start and stop (CtxHda
+ * FUN_0001964c from the stream SetState, no read-back). In DSP mode only:
+ * Direct Mode doesn't pass the DSP output. pcm_unmute=0: not sent.
+ */
+static unsigned int pcm_unmute = 1;
+module_param(pcm_unmute, uint, 0644);
+MODULE_PARM_DESC(pcm_unmute, "DSP mode: unmute the DSP output at every playback start and stop, as Windows (1 = yes, default; 0 = no)");
+
+void creative_ae9_fx_unmute(struct creative_chip *chip)
+{
+	if (!pcm_unmute || chip->fx.direct || !fx_ready(chip) ||
+	    chip->fx.dead || chip->dsp_halted)
+		return;
+	__fx_send(chip, FX_MID_OUT, 0x3a, 0, false, true);
+}
+
 static void fx_apply_all_locked(struct creative_chip *chip)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
@@ -757,7 +828,7 @@ effects:
 	if (on)
 		fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), false);
 	fx_send(chip, FX_MID_OUT, 0x09, fx_f32(on, 1), false);
-	fx_send(chip, FX_MID_OUT, 0x3a, 0, false);
+	fx_unmute_verify(chip);
 }
 
 static void fx_apply_all(struct creative_chip *chip)
@@ -1191,6 +1262,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			 * silent until the player reopened (2026-11-07).
 			 */
 			chip->dsp_switch_pending = false;
+			/* the next Direct start checks the router again */
+			chip->rt_direct_swept = false;
 			dev_info(chip->dev, "Direct Mode on (DSP mode hadn't started; the stream stays as it is)\n");
 		} else {
 			bool was_dsp = chip->dsp_active;

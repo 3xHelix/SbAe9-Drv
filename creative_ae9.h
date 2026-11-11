@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.5"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.6"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -338,10 +338,25 @@ struct creative_chip {
 	unsigned long		scp_quiet_until;
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
+	/* router slots our DSP-mode front/surround routes were moved to
+	 * (ae9_rt_put: the usual slot held a recording route), switched off
+	 * again when Direct Mode turns on and at shutdown */
+	u8			rt_moved[6];
+	u8			rt_moved_n;
+	bool			rt_direct_swept;	/* Direct Mode: stale DSP -> DAC routes swept */
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
 	unsigned int		scp_busy_words;	/* DSP words not sent: no room after 2 s */
 	unsigned int		scp_full_words;	/* DSP words answered "command queue full" */
+	unsigned int		unmute_resends;	/* DSP output unmutes resent: read back still muted (or the read failed) */
+	unsigned int		unmute_stuck;	/* times it stayed muted after 10 unmutes */
+	/* post-boot head-unit replay: frame count, frames without reply and
+	 * the first ones (frame number from 1, the two bytes after the f0
+	 * start byte), for debugfs */
+	u16			hu_boot_frames;
+	u16			hu_noreply_n;
+	u16			hu_noreply_idx[8];
+	u16			hu_noreply_head[8];
 	/* the unsent rest of a cut SCP message (header + up to 16 data
 	 * words): goes out before the next message (dsp.c, scp_send_words) */
 	u32			scp_rest[17];
@@ -362,7 +377,7 @@ struct creative_chip {
 	u32			dac_start_key;	/* rate row + output the DAC start commands
 						 * were last sent for; 0 = unknown (any DAC
 						 * command or a resume clears it) */
-	unsigned int		in05_ch;	/* DSP input stream 0x05 channels, 0 = off */
+	unsigned int		in05_ch;	/* DSP input stream 0x05 channels (DSP-mode bind), 0 = off */
 	bool			dsp_primed;
 	bool			dsp_active;	/* DSP mode routing is up */	/* a full start block ran since bring-up */
 	unsigned int		pcm_bits;	/* 24 or 32, latched at open */
@@ -488,6 +503,7 @@ int creative_ae9_hw_reset(struct creative_chip *chip);
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
 			      unsigned int addx, unsigned int data);
+void creative_dsp_dbg_block_log(struct creative_chip *chip, const char *when);
 int creative_dsp_chipio_read(struct creative_chip *chip,
 			     unsigned int addx, unsigned int *data);
 int creative_dsp_prepare(struct creative_chip *chip);
@@ -503,6 +519,7 @@ void creative_ae9_cap_irq(struct creative_chip *chip);
 void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
 void creative_ae9_opt_irq(struct creative_chip *chip);
 extern unsigned int ae9_sentinel_clear;
+int creative_dsp_out_mute_get(struct creative_chip *chip, u32 *val);
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
 void creative_dsp_chipio_addr_invalidate(void);
@@ -546,6 +563,7 @@ void creative_ae9_fx_defer(struct creative_chip *chip);
 void creative_ae9_fx_dsp_reset(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
 void creative_ae9_fx_output_changed(struct creative_chip *chip);
+void creative_ae9_fx_unmute(struct creative_chip *chip);
 void creative_ae9_hu_reroute_request(struct creative_chip *chip);
 void creative_ae9_fx_hp_work(struct work_struct *w);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);

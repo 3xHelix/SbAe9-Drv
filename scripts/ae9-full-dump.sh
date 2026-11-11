@@ -43,10 +43,15 @@ sec "ALSA capture stream"
 cat /proc/asound/AE9/pcm0c/sub0/hw_params /proc/asound/AE9/pcm0c/sub0/status 2>/dev/null
 
 sec "ALSA controls"
-amixer -c AE9 contents 2>/dev/null | grep -E "^numid|: values=|Item #" | paste - - | sed -E "s/numid=[0-9]+,iface=MIXER,//"
+# one line per control: name + values (enum item lists dropped; pairing lines two at a time broke on them)
+amixer -c AE9 contents 2>/dev/null | awk '/^numid=/{if(l)print l; sub(/numid=[0-9]+,iface=MIXER,/,""); l=$0; next}
+	/: values=/{sub(/^ *: /,""); l=l"  "$0} END{if(l)print l}'
 
 sec "Driver parameters"
 for f in $P/*; do printf '%-22s %s\n' "$(basename $f)" "$(cat $f 2>/dev/null)"; done
+
+sec "Driver state (debugfs state: modes, counters, router streams, chip flags)"
+cat /sys/kernel/debug/creative_ae9/state 2>/dev/null || echo "(no state file: driver older than 0.12.6)"
 
 sec "PipeWire"
 asuser pactl list sinks short

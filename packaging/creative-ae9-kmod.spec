@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.5
+Version:        0.12.6
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,12 @@ done
 %{?akmod_install}
 
 %changelog
+* Wed Nov 11 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.6-1
+- Driver 0.12.6: What U Hear no longer stalls after a Direct Mode switch
+  (Direct starts follow the router chip's slot list), router stream counts
+  released at shutdown/start-up, leftover DSP-mode routes switched off
+  (gated/metallic analog out until a power-off), DSP output unmute read
+  back and resent, debugfs state readout in ae9-full-dump
 * Tue Nov 10 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.5-1
 - Driver 0.12.5: restarts fixed for real (router stream count kept as
   Windows), bus reset on ASMedia-bridge cards too, a DSP word refused as

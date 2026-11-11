@@ -1449,6 +1449,21 @@ static int scp_get_u32(struct creative_chip *chip, unsigned int mid,
 	return dspio_scp(chip, mid, 0, req, SCP_GET, NULL, 0, val, &rl);
 }
 
+/*
+ * Read the DSP output mute (0x96/0x3a, 1.0 = muted) the way Windows does
+ * (CtxHda FUN_000196d0: GET from source 0x20 with one data word 0, reply
+ * header 0x0a759620). *val = the reply's data word.
+ */
+int creative_dsp_out_mute_get(struct creative_chip *chip, u32 *val)
+{
+	u32 zero = 0;
+	unsigned int rl = sizeof(*val);
+
+	*val = ~0U;
+	return dspio_scp(chip, 0x96, 0x20, 0x3a, SCP_GET, &zero, sizeof(zero),
+			 val, &rl);
+}
+
 static int scp_set_u32(struct creative_chip *chip, unsigned int mid,
 		       unsigned int req, u32 val)
 {
@@ -2409,6 +2424,32 @@ static int dsp_dbgcntl_read_stable(struct creative_chip *chip, unsigned int *reg
 	return -EIO;
 }
 
+/*
+ * DSP debug block, read only: 0x100e2c (low half = the live program
+ * counter), DBGCNTL 0x100e30 (top half = the program counter) and 0x100e34
+ * (0xf1000000 at run time: the firmware header and Windows write it; what
+ * the DSP uses it for is open). Logged at the bring-up steps to learn its
+ * power-on value and when it changes (debug_block_log=1, default 0).
+ */
+static bool debug_block_log;
+module_param(debug_block_log, bool, 0644);
+MODULE_PARM_DESC(debug_block_log, "Log the DSP debug block (0x100e2c/30/34) at each bring-up step, read only (1 = yes; default 0)");
+
+void creative_dsp_dbg_block_log(struct creative_chip *chip, const char *when)
+{
+	static const unsigned int a[] = { 0x100e2c, 0x100e30, 0x100e34, 0x100e38 };
+	unsigned int v[ARRAY_SIZE(a)], i;
+
+	if (!debug_block_log)
+		return;
+	for (i = 0; i < ARRAY_SIZE(a); i++) {
+		v[i] = 0xdeadbeef;
+		creative_dsp_chipio_read(chip, a[i], &v[i]);
+	}
+	dev_info(chip->dev, "DSP debug block (%s): e2c=0x%08x e30=0x%08x e34=0x%08x e38=0x%08x\n",
+		 when, v[0], v[1], v[2], v[3]);
+}
+
 static int dsp_set_run_state(struct creative_chip *chip)
 {
 	unsigned int reg, halt_state;
@@ -2421,6 +2462,7 @@ static int dsp_set_run_state(struct creative_chip *chip)
 	if (halt_state != 0)
 		dev_info(chip->dev, "DSP halt state %u (DBGCNTL 0x%08x): setting it running\n",
 			 halt_state, reg);
+	creative_dsp_dbg_block_log(chip, halt_state ? "downloaded, halted" : "downloaded, running");
 	if (halt_state != 0) {
 		reg &= ~((halt_state << DSP_DBGCNTL_SS_LOBIT) &
 			 DSP_DBGCNTL_SS_MASK);
@@ -3391,6 +3433,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	}
 	fls = (const struct ae9_dsp_image_seg *)fw->data;
 
+	creative_dsp_dbg_block_log(chip, "before the download");
 	dev_info(chip->dev, "downloading DSP firmware (%zu bytes)...\n",
 		 fw->size);
 
@@ -3435,6 +3478,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	do {
 		if (dspload_is_loaded(chip)) {
 			dev_info(chip->dev, "DSP firmware downloaded and running\n");
+			creative_dsp_dbg_block_log(chip, "running");
 
 			{
 				unsigned int loop_val = 0, dbgcntl = 0;
