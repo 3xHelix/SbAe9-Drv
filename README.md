@@ -1,5 +1,7 @@
 # Creative Sound Blaster AE-9 — Linux Driver (WIP)
 
+Sound Blaster AE-9 Linux support: 100% of the features, 100 % of the Audio Control Module's, and some things Linux has that Windows doesn't. :)
+
 An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 (CA0132 "Sound Core3D" DSP + detachable ACM head unit), reverse-engineered from
 a Windows VFIO MMIO capture. The goal is functionality the in-tree
