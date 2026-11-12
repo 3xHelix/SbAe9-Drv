@@ -2880,6 +2880,26 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	chip->rt_direct_swept = false;
 }
 
+/* the head unit's first frame: up to ~3 s of tries, 100 ms apart */
+#define AE9_HU_FIRST_TRIES	30
+
+/*
+ * Bytes waiting in the head-unit UART before its first frame (with the
+ * board-D0 step the head unit is powered seconds earlier, as in Windows):
+ * read them out (LSR 0xc14 bit 0 = byte received, RBR 0xc00), so that the
+ * first reply is the head unit's answer. Returns the count.
+ */
+static unsigned int creative_ae9_hu_drain(struct creative_chip *chip)
+{
+	unsigned int n = 0;
+
+	while (n < 64 && (creative_ext_readl(chip, 0xc14) & 0x01)) {
+		creative_ext_readl(chip, 0xc00);
+		n++;
+	}
+	return n;
+}
+
 static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 {
 	unsigned int frames = 0, noreply = 0, cmds = 0, writes = 0;
@@ -2902,9 +2922,42 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			return;
 		}
 		switch (o->type) {
-		case 'S':
-			if (creative_spi_frame_win(chip, o->data, o->len,
-						   resp, sizeof(resp)) < 0) {
+		case 'S': {
+			int n;
+
+			if (!frames) {
+				unsigned int stale = creative_ae9_hu_drain(chip);
+
+				if (stale)
+					dev_info(chip->dev, "post_windows: %u byte%s waiting from the head unit, read out\n",
+						 stale, stale == 1 ? "" : "s");
+			}
+			n = creative_spi_frame_win(chip, o->data, o->len,
+						   resp, sizeof(resp));
+
+			/*
+			 * The head unit's first frame (its probe): wait until
+			 * it answers, before its init frames. Without the
+			 * board-D0 step the first 10 frames, the handshake
+			 * 03 03 05 03 03 among them, went unanswered on one card
+			 * (0.12.4 on 2026-11-10, a 0.12.5 cold boot on 2026-11-12):
+			 * reg 5 stayed 00 and the XLR mic silent until the
+			 * handshake was resent. With the step the head unit
+			 * answered at the first try; this is the fallback.
+			 */
+			if (!frames && n < 0) {
+				unsigned int tries = 1;
+
+				while (n < 0 && tries < AE9_HU_FIRST_TRIES) {
+					msleep(100);
+					n = creative_spi_frame_win(chip, o->data, o->len,
+								   resp, sizeof(resp));
+					tries++;
+				}
+				dev_info(chip->dev, "post_windows: head unit %s its first frame after %u tries\n",
+					 n < 0 ? "did not answer" : "answered", tries);
+			}
+			if (n < 0) {
 				if (noreply < ARRAY_SIZE(chip->hu_noreply_idx)) {
 					chip->hu_noreply_idx[noreply] = frames + 1;
 					chip->hu_noreply_head[noreply] =
@@ -2915,6 +2968,7 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			}
 			frames++;
 			break;
+		}
 		case 'C': {
 			u8 cmd[1][3] = { { o->off, o->val >> 8, o->val & 0xff } };
 
