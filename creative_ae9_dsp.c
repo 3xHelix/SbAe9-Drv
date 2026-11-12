@@ -3285,6 +3285,53 @@ void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
 }
 
 /*
+ * One CA0113 register read, Windows' HdIc READ (CtxHdb 0x14590; sb-ae9
+ * docs/reverse-engineering/ctxhda-acm-analysis.md 11.1, and sb-ae9's
+ * ca0132 driver, ca0113_mmio_command_get): the register number as a
+ * one-byte transfer (0x20c bits 2:1 = 1), then the read strobe 0x208 =
+ * 0xffff; the byte comes back in 0x208. Every write is read back, as
+ * Windows does. A device that does not answer reads 0xff (0x20c bit 16 is
+ * then set, 2026-11-10).
+ */
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg)
+{
+	static const unsigned int status[] = { 0x860, 0x854, 0x840 };
+	size_t i;
+	u32 val;
+
+	mutex_lock(&chip->ca0113_mutex);
+	creative_ext_writel(chip, 0x210, 0x0000007e);
+	creative_ext_readl(chip, 0x210);
+	creative_ext_writel(chip, 0x210, 0x0000005a);
+	creative_ext_readl(chip, 0x210);
+	creative_ext_writel(chip, 0x20c, 0x00800001);
+	creative_ext_readl(chip, 0x20c);
+	creative_ext_writel(chip, 0x804, group);
+	creative_ext_readl(chip, 0x804);
+	creative_ext_writel(chip, 0x20c, 0x00800003);
+	creative_ext_readl(chip, 0x20c);
+	creative_ext_writel(chip, 0x204, reg);
+	creative_ext_readl(chip, 0x204);
+	usleep_range(CA0113_SETTLE_US, CA0113_SETTLE_US + 500);
+	for (i = 0; i < ARRAY_SIZE(status); i++)
+		creative_ext_readl(chip, status[i]);
+	creative_ext_writel(chip, 0x20c, 0x00800003);
+	creative_ext_readl(chip, 0x20c);
+	creative_ext_writel(chip, 0x208, 0x0000ffff);
+	creative_ext_readl(chip, 0x208);
+	usleep_range(CA0113_SETTLE_US, CA0113_SETTLE_US + 500);
+	for (i = 0; i < ARRAY_SIZE(status); i++)
+		creative_ext_readl(chip, status[i]);
+	val = creative_ext_readl(chip, 0x208);
+	creative_ext_writel(chip, 0x20c, 0x00800002);
+	creative_ext_readl(chip, 0x20c);
+	creative_ext_writel(chip, 0x210, 0x00000000);
+	creative_ext_readl(chip, 0x210);
+	mutex_unlock(&chip->ca0113_mutex);
+	return val & 0xff;
+}
+
+/*
  * Head-unit DAC routing, replayed byte-exact from the 0x0071 capture's
  * AUDIO-PLAYBACK window (ae9_mmio_capture.txt ~195s). These program the
  * head-unit audio router/DAC (targets 0x48 control + 0x49 DAC channels).

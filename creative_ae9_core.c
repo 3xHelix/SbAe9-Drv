@@ -2404,6 +2404,24 @@ MODULE_PARM_DESC(warm_reset, "Windows' codec recovery cycle before the DSP downl
 #define AE9_COLD_AFG_RESET	395	/* first of the two AFG resets (7ff) */
 #define AE9_COLD_SETTLE		774	/* after Windows' 1.5 s timer */
 #define AE9_COLD_DSP_INIT	521	/* DSPIO 0x703 (DSP_INIT) after the codec init */
+#define AE9_COLD_BOARD_D0	383	/* codec 1's first verb after codec 2's set-up */
+#define AE9_COLD_BOARD_D0_VERB	0x100f0004
+
+/*
+ * Windows' board-D0 GPIO step (CtxHda 0x364b0, 0x35de4, 0x35e58), which it
+ * runs once, between codec 2's set-up and codec 1's first verb (sb-ae9's
+ * capture ae9-20260903-210512, ops lines 1264-1288): pins 4-7 to GPIO and
+ * all pins enabled, pin 5 = 1 (head-unit power), pin 0 = 0, ~16 ms, pin 0
+ * = 1 ("AntiPop"), both DAC devices muted, pin 2 = 0, DAC 48/1d = 0x40,
+ * pin 3 = 1. The post-boot replay is Windows' post-DSP block, which has no
+ * pin 0 because Windows set it here. Without it, on a card behind an
+ * ASM1083 rev 03 bridge neither DAC device answered (every read 0xff,
+ * every DAC command lost, analog outputs silent) until pin 0 was pulsed
+ * (2026-11-10).
+ */
+static unsigned int board_d0 = 1;
+module_param(board_d0, uint, 0644);
+MODULE_PARM_DESC(board_d0, "Windows' board-D0 GPIO step before codec 1's set-up (GPIO pin 0 pulse, DACs muted): 1=on (default), 0=off");
 
 /*
  * Windows' two start-up checks, logged only (no behaviour change yet;
@@ -2528,6 +2546,31 @@ static bool ae9_recovery_pass(struct creative_chip *chip, struct ae9_bootchk *ch
 	return ae9_bootchk_ramp_failed(chk);
 }
 
+/* Windows' board-D0 GPIO step (see board_d0), then whether the DAC answers. */
+static void creative_ae9_board_d0(struct creative_chip *chip)
+{
+	static const u8 mute[][3] = { { 0x48, 0x07, 0x81 }, { 0x49, 0x0a, 0x07 } };
+	static const u8 front[][3] = { { 0x48, 0x1d, 0x40 } };
+	u8 id;
+
+	creative_ext_writel(chip, 0x100, creative_ext_readl(chip, 0x100) & ~0x0fU);
+	creative_ext_writeb(chip, 0x304, 0xff);
+	creative_ext_writew(chip, 0x320, 0x0105);	/* pin 5 = 1: head-unit power */
+	creative_ext_writew(chip, 0x320, 0x0000);	/* pin 0 = 0 */
+	msleep(16);	/* Windows' 1 ms wait comes out at ~16 ms (its timer tick) */
+	creative_ext_writew(chip, 0x320, 0x0100);	/* pin 0 = 1 */
+	creative_dsp_ca0113_replay_quiet(chip, mute, ARRAY_SIZE(mute));
+	creative_ext_writew(chip, 0x320, 0x0002);	/* pin 2 = 0 */
+	creative_dsp_ca0113_replay_quiet(chip, front, ARRAY_SIZE(front));
+	creative_ext_writew(chip, 0x320, 0x0103);	/* pin 3 = 1 */
+	id = creative_dsp_ca0113_read(chip, 0x48, 0x40);	/* ES9038 chip ID, bits 7:2 */
+	if (id >> 2 == 0x1c)
+		dev_info(chip->dev, "board D0: GPIO pin 0 pulsed, the DAC answers (48/40 = 0x%02x)\n", id);
+	else
+		dev_warn(chip->dev, "board D0: GPIO pin 0 pulsed, but the DAC does not answer (48/40 = 0x%02x): the analog outputs will be silent\n",
+			 id);
+}
+
 /* Replay the cold-boot pre-download verbs; via CORB once it is running. */
 static void creative_ae9_replay_cold(struct creative_chip *chip)
 {
@@ -2538,6 +2581,13 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 	for (i = 0; i < ARRAY_SIZE(ae9_cold_prefw); i++) {
 		u32 resp = 0;
 		int ret;
+
+		if (board_d0 && i == AE9_COLD_BOARD_D0) {
+			if (ae9_cold_prefw[i] != AE9_COLD_BOARD_D0_VERB)
+				dev_warn(chip->dev, "board D0: cold table entry %zu is 0x%08x, not codec 1's first verb 0x%08x\n",
+					 i, ae9_cold_prefw[i], AE9_COLD_BOARD_D0_VERB);
+			creative_ae9_board_d0(chip);
+		}
 
 		/* (A) codec 1's AFG asleep (a card that was running: our
 		 * shutdown left it in D3): wake it and give it 2 s before
@@ -2611,6 +2661,8 @@ static void creative_ae9_replay_both(struct creative_chip *chip)
 	/* fallback when the table layout changed: the warm tables */
 	creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
 				 ARRAY_SIZE(ae9_initseq_codec2));
+	if (board_d0)
+		creative_ae9_board_d0(chip);
 	creative_ae9_replay_init(chip, 1, ae9_initseq_codec1, n1);
 }
 
@@ -2828,6 +2880,26 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	chip->rt_direct_swept = false;
 }
 
+/* the head unit's first frame: up to ~3 s of tries, 100 ms apart */
+#define AE9_HU_FIRST_TRIES	30
+
+/*
+ * Bytes waiting in the head-unit UART before its first frame (with the
+ * board-D0 step the head unit is powered seconds earlier, as in Windows):
+ * read them out (LSR 0xc14 bit 0 = byte received, RBR 0xc00), so that the
+ * first reply is the head unit's answer. Returns the count.
+ */
+static unsigned int creative_ae9_hu_drain(struct creative_chip *chip)
+{
+	unsigned int n = 0;
+
+	while (n < 64 && (creative_ext_readl(chip, 0xc14) & 0x01)) {
+		creative_ext_readl(chip, 0xc00);
+		n++;
+	}
+	return n;
+}
+
 static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 {
 	unsigned int frames = 0, noreply = 0, cmds = 0, writes = 0;
@@ -2850,9 +2922,42 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			return;
 		}
 		switch (o->type) {
-		case 'S':
-			if (creative_spi_frame_win(chip, o->data, o->len,
-						   resp, sizeof(resp)) < 0) {
+		case 'S': {
+			int n;
+
+			if (!frames) {
+				unsigned int stale = creative_ae9_hu_drain(chip);
+
+				if (stale)
+					dev_info(chip->dev, "post_windows: %u byte%s waiting from the head unit, read out\n",
+						 stale, stale == 1 ? "" : "s");
+			}
+			n = creative_spi_frame_win(chip, o->data, o->len,
+						   resp, sizeof(resp));
+
+			/*
+			 * The head unit's first frame (its probe): wait until
+			 * it answers, before its init frames. Without the
+			 * board-D0 step the first 10 frames, the handshake
+			 * 03 03 05 03 03 among them, went unanswered on one card
+			 * (0.12.4 on 2026-11-10, a 0.12.5 cold boot on 2026-11-12):
+			 * reg 5 stayed 00 and the XLR mic silent until the
+			 * handshake was resent. With the step the head unit
+			 * answered at the first try; this is the fallback.
+			 */
+			if (!frames && n < 0) {
+				unsigned int tries = 1;
+
+				while (n < 0 && tries < AE9_HU_FIRST_TRIES) {
+					msleep(100);
+					n = creative_spi_frame_win(chip, o->data, o->len,
+								   resp, sizeof(resp));
+					tries++;
+				}
+				dev_info(chip->dev, "post_windows: head unit %s its first frame after %u tries\n",
+					 n < 0 ? "did not answer" : "answered", tries);
+			}
+			if (n < 0) {
 				if (noreply < ARRAY_SIZE(chip->hu_noreply_idx)) {
 					chip->hu_noreply_idx[noreply] = frames + 1;
 					chip->hu_noreply_head[noreply] =
@@ -2863,6 +2968,7 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			}
 			frames++;
 			break;
+		}
 		case 'C': {
 			u8 cmd[1][3] = { { o->off, o->val >> 8, o->val & 0xff } };
 
