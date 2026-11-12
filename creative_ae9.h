@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.6"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.7"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -287,11 +287,9 @@ struct creative_chip {
 		int		sent_miceq;
 		bool		monitor;	/* "Mic Monitor": the DSP mixes the mic into the output */
 		bool		mon_bound;	/* ADC 0x07 bound for the monitor, no recording */
-		/* the monitor has been on since this DSP load: from then on the
-		 * DSP feeds Voice Clarity's right channel only while it is on
-		 * (firmware side effect; Windows never turns it on) */
+		/* the monitor has been on since this DSP load: its off then also
+		 * sends 0x37/0x23 = 1.0 (creative_ae9_mic_monitor_apply) */
 		bool		mon_used;
-		struct snd_kcontrol *mon_used_kc;
 	} cv;
 
 	/* debugfs */
@@ -575,6 +573,7 @@ void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what);
 void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
 				      const u8 (*cmds)[3], size_t n);
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 
 /* ------------------------------------------------------------------ */
 /* MMIO accessor helpers (with mandated memory barriers)		  */

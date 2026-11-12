@@ -3317,6 +3317,56 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
 }
 
 /*
+ * One CA0113 register READ, as Windows reads 48/07, 48/0b, 48/0e and 49/0e
+ * (capture 6, notes 33/33v): mode 0x800003 before 0x204 (register only),
+ * then 0x20c = 0x800003, 0x208 = 0xffff and two 0x208 reads: the first
+ * returns the previous result, the second (Windows: 13-30 ms later) this
+ * one in the low byte. Ends with 0x20c = 0x800002. Debug use (debugfs
+ * "dacr").
+ */
+static u32 ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *first)
+{
+	u32 v;
+
+	creative_ext_writel(chip, 0x210, 0x0000007e);
+	creative_ext_readl(chip, 0x210);
+	creative_ext_writel(chip, 0x210, 0x0000005a);
+	creative_ext_readl(chip, 0x210);
+	creative_ext_writel(chip, 0x20c, 0x00800005);
+	creative_ext_writel(chip, 0x804, group);
+	creative_ext_writel(chip, 0x20c, 0x00800003);
+	creative_ext_writel(chip, 0x204, reg);
+	usleep_range(5000, 6000);		/* Windows: ~4 ms here */
+	creative_ext_writel(chip, 0x20c, 0x00800003);
+	creative_ext_writel(chip, 0x208, 0x0000ffff);
+	*first = creative_ext_readl(chip, 0x208);
+	usleep_range(20000, 21000);
+	v = creative_ext_readl(chip, 0x208);
+	creative_ext_writel(chip, 0x20c, 0x00800002);
+	creative_ext_writel(chip, 0x210, 0x00000000);
+	creative_ext_readl(chip, 0x210);
+	return v;
+}
+
+/*
+ * uv34 (2026-11-12, no settle after 0x204): each read returned the
+ * previous read's result, and the first after a pause returned junk; the
+ * value was right from the third read of a register on. So: the same
+ * register three times, the last one counts (raw[] = the 2nd and 3rd).
+ */
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
+{
+	u32 first;
+
+	mutex_lock(&chip->ca0113_mutex);
+	ca0113_read_once(chip, group, reg, &first);
+	raw[0] = ca0113_read_once(chip, group, reg, &first);
+	raw[1] = ca0113_read_once(chip, group, reg, &first);
+	mutex_unlock(&chip->ca0113_mutex);
+	return raw[1] & 0xff;
+}
+
+/*
  * Windows' verbs at the top of each download (FUN_0012d914; the last 20 of
  * ae9_cold_prefw, idx 795-814): PLL/PMU 0x00 = 0xff, the 96 kHz flags
  * 9/8/6/7/11, connection points 0x0a/0x0b at 48 kHz. The cold replay sent
@@ -3823,8 +3873,6 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 	u32 st = 0;
 
 	if (on) {
-		if (chip->cv.mon_used && !chip->cv.monitor)
-			dev_warn_ratelimited(chip->dev, "Voice Clarity: the mic monitor was used since the card started; the DSP now records Voice Clarity right only while the monitor is on (left low, right empty). Power the PC off to clear it, or use a software monitor with Voice Clarity\n");
 		cv_conns(chip, true);
 		if (cv_set(chip, 0x80, 0x05, FLOAT_ONE) < 0)
 			dev_warn(chip->dev, "Voice Clarity: the DSP didn't take the voice processor switch; this recording may be the plain mic\n");
@@ -4048,9 +4096,20 @@ static int cv_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
  * only with the DSP running; 0 at every boot. Windows re-applies the
  * voice processor route after it when that is in (FUN_000161fc). The DSP
  * mixes the mic into the output with no host round trip (zero delay).
+ *
+ * Monitor off after use, then SCP 0x37/0x23 = 1.0 (notes 68a-c, card test
+ * uv32 2026-11-12, twice): 0x80/0x0d = 0 makes the DSP send 0x37/0x23 = 0,
+ * which sets the mic tap's route word (module 0x44, S44+2) to 0 = nobody
+ * drains its FIFO; 0x44 then returns before its left-to-right copy and
+ * Voice Clarity records left ~20 dB low, right stale, until a DSP reload.
+ * 0x23 = 1.0 puts the route back to 1, as a fresh DSP has it; the 0x37
+ * mute stays 1.0 (monitor silent). Windows never turns this monitor on, so
+ * it has no such message to copy.
  */
 void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 {
+	bool restored;
+
 	if (!chip->dsp_done)
 		return;
 	/*
@@ -4076,18 +4135,26 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 			     chip->cv.monitor ? FLOAT_ONE : FLOAT_ZERO);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
-	if (chip->cv.monitor && !chip->cv.mon_used) {
-		chip->cv.mon_used = true;
-		if (chip->cv.mon_used_kc)
-			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
-				       &chip->cv.mon_used_kc->id);
+	restored = !chip->cv.monitor && chip->cv.mon_used;
+	if (restored) {
+		/* after the DSP's own rebuild for 0x0d (it sends 0x37/0x23 = 0);
+		 * uv32 sent this seconds later, so give it a moment (uv37: route
+		 * read back 1 after every off, 3 cycles) */
+		msleep(50);
+		mutex_lock(&chip->replay_mutex);
+		dspio_set_uint_param(chip, 0x37, 0x23, FLOAT_ONE);	/* route back */
+		creative_dsp_chipio_addr_invalidate();
+		mutex_unlock(&chip->replay_mutex);
 	}
+	if (chip->cv.monitor)
+		chip->cv.mon_used = true;	/* since this DSP load */
 	if (!chip->cv.monitor && chip->cv.mon_bound && !chip->capture_substream) {
 		creative_ae9_cap_replay(chip, false);
 		chip->cv.mon_bound = false;
 	}
-	dev_info(chip->dev, "Mic Monitor %s%s\n", chip->cv.monitor ? "on" : "off",
-		 chip->cv.mon_bound ? " (mic input held for it)" : "");
+	dev_info(chip->dev, "Mic Monitor %s%s%s\n", chip->cv.monitor ? "on" : "off",
+		 chip->cv.mon_bound ? " (mic input held for it)" : "",
+		 restored ? " (mic tap route restored: 0x37/0x23 = 1.0)" : "");
 }
 
 static int mic_monitor_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
@@ -4111,19 +4178,15 @@ static int mic_monitor_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *u
 }
 
 /*
- * Read-only: the hardware mic monitor has been on since the DSP was last
- * loaded (power-up, wake). Once it has, the DSP firmware feeds Voice
- * Clarity's right channel only while the monitor is on: with it off, Voice
- * Clarity recordings get the left channel ~20 dB low and no right channel
- * (2026-11-09, UVFindings1.md). Nothing but a DSP reload clears it; Windows
- * never turns this monitor on. SbAe9-SBC reads this to warn / use its
- * software Listen with Voice Clarity.
+ * Read-only, 0.12.3: "the monitor has been on since the DSP load, so Voice
+ * Clarity records wrong with it off". Since 0.12.7 the monitor-off path
+ * puts the DSP back (creative_ae9_mic_monitor_apply), so that never holds:
+ * always 0. Kept so SbAe9-SBC (which shows a "power off" note while it
+ * reads 1) and scripts reading it keep working.
  */
 static int mic_monitor_used_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
-	struct creative_chip *chip = snd_kcontrol_chip(kc);
-
-	uv->value.integer.value[0] = chip->cv.mon_used;
+	uv->value.integer.value[0] = 0;
 	return 0;
 }
 
@@ -4150,8 +4213,8 @@ int creative_ae9_cv_controls_add(struct creative_chip *chip)
 	{
 		struct snd_kcontrol *kc = snd_ctl_new1(&mic_monitor_used_control, chip);
 
-		if (kc && !snd_ctl_add(chip->card, kc))	/* frees kc on error */
-			chip->cv.mon_used_kc = kc;
+		if (kc)
+			snd_ctl_add(chip->card, kc);	/* frees kc on error */
 	}
 	/* Creative's names (Sound Blaster Command > Recording) */
 	static const char * const names[6] = {

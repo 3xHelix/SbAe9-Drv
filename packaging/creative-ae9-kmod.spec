@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.6
+Version:        0.12.7
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,12 @@ done
 %{?akmod_install}
 
 %changelog
+* Thu Nov 12 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.7-1
+- Driver 0.12.7: the card's mic monitor no longer breaks Voice Clarity
+  until a power-off (monitor off restores the DSP's mic route), optional
+  +30 dB Mic Gain (mic_boost_30=1), optional clean-mic PipeWire example,
+  source install puts the tools in /usr/local/bin and refuses next to a
+  packaged build, DAC register read/write in debugfs
 * Wed Nov 11 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.6-1
 - Driver 0.12.6: What U Hear no longer stalls after a Direct Mode switch
   (Direct starts follow the router chip's slot list), router stream counts

@@ -55,7 +55,7 @@ install -Dm755 "$SRC/scripts/ae9-optical-passthrough" "$R/usr/bin/ae9-optical-pa
 install -Dm755 "$SRC/scripts/ae9-hp-profile" "$R/usr/bin/ae9-hp-profile"
 install -d "$R/usr/share/creative-ae9/examples"
 install -m 644 "$SRC"/extract_firmware.py "$SRC"/extract_overlay.py "$SRC"/extract_hpeq.py "$R/usr/share/creative-ae9/"
-for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do
+for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf ae9-clean-mic.conf; do
 	install -m 644 "$SRC/config/$f" "$R/usr/share/creative-ae9/examples/"
 done
 install -d "$R/usr/share/doc/$PKG"

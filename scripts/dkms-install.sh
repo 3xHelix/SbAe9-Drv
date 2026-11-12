@@ -25,8 +25,20 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 
 # every copy of the module for a kernel, wherever it came from
 copies() { find "/lib/modules/$1" -name "$NAME.ko*" 2>/dev/null | sort; }
-# packaged builds (akmods / kmod RPMs), if any
-packaged() { command -v rpm >/dev/null && rpm -qa "akmod-$NAME*" "kmod-$NAME*" 2>/dev/null || true; }
+# packaged builds, if any: the COPR akmod/kmod RPMs (akmod-creative-ae9,
+# kmod-creative-ae9-<kernel>) and the DKMS packages (creative-ae9-dkms: RPM,
+# .deb/PPA, AUR). Until 0.12.7 this asked rpm for "akmod-$NAME*", which no
+# package is called, so it never refused.
+packaged() {
+	{
+		command -v rpm >/dev/null &&
+			rpm -qa 'akmod-creative-ae9*' 'kmod-creative-ae9*' 'creative-ae9-dkms*'
+		command -v dpkg-query >/dev/null &&
+			dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' creative-ae9-dkms 2>/dev/null |
+			awk '$1 ~ /^ii/ {print $2}'
+		command -v pacman >/dev/null && pacman -Q creative-ae9-dkms 2>/dev/null
+	} 2>/dev/null | grep . || true
+}
 
 if [ "${1:-}" = "--check" ]; then
 	k=$(uname -r)
@@ -49,6 +61,14 @@ if [ "${1:-}" != "--remove" ] && [ -n "$(packaged)" ]; then
 	exit 1
 fi
 
+# The command-line tools the packages put in /usr/bin (SbAe9-SBC looks for
+# ae9-hp-profile on the PATH); a source install puts them in /usr/local/bin.
+TOOLS=(ae9-get-firmware.sh ae9-full-dump.sh ae9-dsp-snapshot.sh ae9-read-stress.sh
+       ae9-optical-passthrough ae9-hp-profile)
+BIN=/usr/local/bin
+tools_install() { local t; for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done; }
+tools_remove() { local t; for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done; }
+
 registered() { dkms status -m "$NAME" 2>/dev/null | sed -n "s#^$NAME/\([^,: ]*\).*#\1#p" | sort -u; }
 
 # Take a version out of DKMS and /usr/src. dkms remove can return non-zero
@@ -62,7 +82,8 @@ drop() {
 if [ "${1:-}" = "--remove" ]; then
 	for v in $(registered); do drop "$v"; done
 	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
-	echo "removed from DKMS; build and copy the module by hand again if you still want it"
+	tools_remove
+	echo "removed from DKMS (and its tools from $BIN); build and copy the module by hand again if you still want it"
 	left=$(copies "$(uname -r)")
 	[ -z "$left" ] || { echo "still installed for $(uname -r) (not by DKMS):"; echo "$left" | sed 's/^/  /'; }
 	exit 0
@@ -115,6 +136,8 @@ dkms status -m "$NAME"
 if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
 	echo "note: not installed for the running kernel $(uname -r) (no headers?); built for: ${kernels[*]}" >&2
 fi
+tools_install
+echo "tools: $(printf '%s ' "${TOOLS[@]%.sh}")in $BIN"
 echo "done: $NAME $VER is in DKMS, built for $built kernel(s);"
 echo "new kernels get it built automatically. Reboot to load it."
 for k in "${kernels[@]}"; do

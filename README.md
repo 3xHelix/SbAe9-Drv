@@ -9,7 +9,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-11, v0.12.6):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-12, v0.12.7):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -42,7 +42,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.6 (What U Hear stall fixed, router clean-up) and v0.12.5
+> Driver v0.12.7 (mic monitor and Voice Clarity together, +30 dB Mic Gain,
+> clean-mic example) pairs with SbAe9-SBC v0.19.0 and SbAe9-AudioMon v0.4.6;
+> v0.12.6 (What U Hear stall fixed, router clean-up) and v0.12.5
 > (restarts fixed for real, DSP queue resend) pair with SbAe9-SBC v0.18.0
 > and SbAe9-AudioMon v0.4.6; v0.12.4 (restarts and Voice
 > Clarity as Windows) with SbAe9-SBC v0.17.2 and SbAe9-AudioMon v0.4.5; v0.12.3 (code-review
@@ -138,7 +140,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.6-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.7-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -230,13 +232,16 @@ The scripts refuse a different image unless you pass `--force`.
 redo after a kernel update.
 
 ```sh
-sudo dnf install dkms kernel-devel     # once
+sudo dnf install dkms kernel-devel     # once (Fedora; Debian/Ubuntu: sudo apt install dkms linux-headers-$(uname -r); Arch: sudo pacman -S dkms linux-headers)
 sudo scripts/dkms-install.sh
 ```
 
 Run the script again after updating the driver source (it replaces the
-old version). `sudo scripts/dkms-install.sh --remove` takes it out of
-DKMS. `dkms status` shows what's built for which kernel.
+old version). It also puts the command-line tools (`ae9-hp-profile`,
+`ae9-full-dump`, `ae9-get-firmware` and the others the packages install)
+in `/usr/local/bin`; SbAe9-SBC's "Make custom profile…" needs
+`ae9-hp-profile`. `sudo scripts/dkms-install.sh --remove` takes it all out
+of DKMS. `dkms status` shows what's built for which kernel.
 
 **By hand:**
 
@@ -245,7 +250,9 @@ make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 sudo cp snd-hda-codec-creative-ae9.ko /lib/modules/$(uname -r)/extra/ && sudo depmod -a
 ```
 
-Redo both after every code change and kernel update.
+Redo both after every code change and kernel update. For the tools
+(SbAe9-SBC's "Make custom profile…" needs `ae9-hp-profile`):
+`sudo install -m755 scripts/ae9-hp-profile /usr/local/bin/`.
 
 **One install method per machine.** By hand, DKMS and a packaged build
 (akmod/kmod) each put their own copy of the module under `/lib/modules`;
@@ -256,7 +263,9 @@ the other's old copy in charge. To switch:
   hand-copied module first);
 - DKMS to by hand: `sudo scripts/dkms-install.sh --remove`, then copy;
 - to or from a package: remove the other method first (the DKMS script
-  refuses to run next to an installed `akmod-`/`kmod-` package).
+  refuses to run next to an installed package: the Fedora `akmod-`/`kmod-`
+  ones or `creative-ae9-dkms` from the .deb, PPA, AUR or COPR; before
+  0.12.7 its check missed them).
 
 `scripts/dkms-install.sh --check` (no root needed) shows what's installed
 for the running kernel, every copy of the module, and which one loads.
@@ -355,7 +364,9 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   `systemctl --user restart wireplumber`: the source shows as "AE-9 Head Unit
   Mic / Aux" (node names stay the same). "Mic Gain" (was "XLR Gain") sets
   the mic preamp to 0/+10/+20 dB (default +10, like Windows); set it with
-  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'Mic Gain' 0|1|2`. "Capture"
+  `alsamixer -c AE9` (F4) or `amixer -c AE9 sset 'Mic Gain' 0|1|2`
+  (`mic_boost_30=1` also offers 3 = +30 dB: the preamp has it, Windows
+  doesn't use it; for quiet mics, normal speech clips there). "Capture"
   is the mic level, -89 to +9 dB in 1 dB steps with mute at 0 (default +9 dB,
   what Windows' recording setup uses), set the way Windows' Recording ->
   Levels slider does it; PipeWire uses it as the mic's hardware volume, so
@@ -398,12 +409,25 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   monitoring (the desktop's "Listen", a pw-loopback) still works, with a
   short delay; if you set a PipeWire headroom, use the per-rate one (see
   "Low latency").
-  Don't mix it with Voice Clarity: once this monitor has been on since the
-  PC started, Voice Clarity recordings made with it off come out wrong
-  (left quiet, right empty) until the PC is powered off (a DSP firmware
-  quirk; Windows never turns this monitor on). Use a software monitor with
-  Voice Clarity, as SbAe9-SBC 0.17.1 does. "Mic Monitor Used Since
-  Power-up" (read-only, 0.12.3) shows whether it has been on.
+  With Voice Clarity: before 0.12.7, Voice Clarity recordings made after
+  this monitor had been on came out wrong (left quiet, right empty) until
+  the PC was powered off (a DSP firmware state; Windows never turns this
+  monitor on). Since 0.12.7 turning the monitor off puts the DSP back, so
+  they mix freely. "Mic Monitor Used Since Power-up" (read-only) now
+  always reads off; it stays for older SbAe9-SBC versions.
+- Clean mic (optional example, 0.12.7): Windows' cleaner-sounding mic is
+  Microsoft's software noise suppression, not the card. The same idea on
+  Linux: `config/ae9-clean-mic.conf` (packages:
+  `/usr/share/creative-ae9/examples/`) adds an input "AE-9 Mic (clean)",
+  the AE-9 mic through PipeWire's built-in WebRTC noise suppression and
+  low-cut, mono, no automatic gain. On the card: room hiss and hum 20-30 dB
+  lower, speech level unchanged, about 35 ms extra delay (fine for calls
+  and recording, not for monitoring yourself). Put your mic's name in it
+  (`pactl list short sources | grep 'pci-.*analog-stereo$'`), copy it to
+  `~/.config/pipewire/pipewire.conf.d/`, run
+  `systemctl --user restart pipewire pipewire-pulse wireplumber` and pick
+  "AE-9 Mic (clean)" in the app. Don't use it together with the card's
+  Voice Clarity (two noise suppressors fight).
 - DAC filter (seven since 0.11.0, thanks to DarkNikGr): the ES9038's
   digital filters with the Creative app's names: Apodizing Fast Roll Off
   (Windows' startup filter, the default), Fast Roll Off, Slow Roll Off,
@@ -677,16 +701,12 @@ the card's chip during playback can freeze the audio until a full power-off
 
 ### Known issues
 
-- What U Hear and the optical out: switching Direct Mode on or off while
-  the optical out plays (for example SbAe9-SBC's effects-to-optical loop)
-  can leave What U Hear recordings stopping about a second after the next
-  playback starts. Playback itself is fine. It stays that way until the
-  driver reloads or the PC reboots; avoid Direct Mode switches while the
-  optical out is in use. Cause found: the driver writes playback into fixed
-  router slots that the router chip may have given to What U Hear; fixed in
-  the next release (0.12.6).
-- Mic monitor and Voice Clarity (since 0.12.2): after the card's mic
-  monitor has been on, Voice Clarity recordings with it off are wrong
+- Fixed in 0.12.6: switching Direct Mode on or off while the optical out
+  played could leave What U Hear recordings stopping about a second after
+  the next playback started (Direct Mode playback used fixed router slots
+  the router chip may have given to What U Hear).
+- Fixed in 0.12.7: after the card's mic monitor had been on, Voice
+  Clarity recordings made with it off were wrong (left quiet, right empty)
   until a power-off. See "Mic monitoring" above.
 - Reloading the driver (or a warm reboot) used to get riskier with each
   restart until the DSP stalled ("tail replay done: ... N failed",
@@ -768,6 +788,7 @@ the card's chip during playback can freeze the audio until a full power-off
 | `scripts/ae9-hp-profile` | Makes and installs your own headphone profiles (see "Headphone Profile") |
 | `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources for optical in, What U Hear and the rear RCA input. Since 0.11.0 the card profile opens them; don't copy these any more |
 | `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear" (stereo and 5.1), "AE-9 Optical In", "AE-9 Optical Out", "AE-9 Analog Out" (the main output) |
+| `config/ae9-clean-mic.conf` | Optional "AE-9 Mic (clean)" input: the mic through PipeWire's WebRTC noise suppression (see "Clean mic") |
 | `config/50-ae9-safe-volume.conf` | Installed by the packages (WirePlumber): the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (100% is the head unit at 0.0 dB) |
 | `config/51-ae9-safe-volume.lua` | Installed by the packages (WirePlumber 0.4's main.lua.d; Ubuntu 24.04 / Mint 22, Debian 12, openSUSE Leap): the same -36 dB start volume, but 0.4 can only set it for every output, so any output WirePlumber has no saved volume for starts at -36 dB (quieter, never louder). WirePlumber 0.5 ignores it |
 
@@ -864,6 +885,10 @@ what's left is tuning and diagnostics:
   `rt_dac_clean` (1, writable at runtime) switch off leftover DSP-mode routes
   at Direct Mode on, the first Direct start and shutdown (left on, they
   made the analog out gated/metallic until a power-off).
+- Mic (0.12.7, load-time): `mic_boost_30` (0) 1 = Mic Gain also goes to
+  +30 dB, the mic preamp's top step (Windows stops at +20 dB). It adds a
+  clean 10 dB, but normal speech into a typical mic clips there: it's for
+  quiet mics.
 - DSP output unmute (0.12.6, writable at runtime): `unmute_check` (1) read
   the unmute back after effect changes and resend it (up to 10 times), as
   Windows; `pcm_unmute` (1) unmute at every DSP-mode playback start and

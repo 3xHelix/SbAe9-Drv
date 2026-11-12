@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.6
+Version:        0.12.7
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -63,7 +63,7 @@ install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}/usr/bin/ae9-optic
 install -D -m 755 scripts/ae9-hp-profile %{buildroot}/usr/bin/ae9-hp-profile
 install -d %{buildroot}/usr/share/creative-ae9/examples
 install -m 644 extract_firmware.py extract_overlay.py extract_hpeq.py %{buildroot}/usr/share/creative-ae9/
-for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf; do
+for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf ae9-clean-mic.conf; do
 	install -m 644 config/$f %{buildroot}/usr/share/creative-ae9/examples/
 done
 
@@ -118,6 +118,12 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Thu Nov 12 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.7-1
+- Driver 0.12.7: the card's mic monitor no longer breaks Voice Clarity
+  until a power-off (monitor off restores the DSP's mic route), optional
+  +30 dB Mic Gain (mic_boost_30=1), optional clean-mic PipeWire example,
+  source install puts the tools in /usr/local/bin and refuses next to a
+  packaged build, DAC register read/write in debugfs
 * Wed Nov 11 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.6-1
 - Driver 0.12.6: What U Hear no longer stalls after a Direct Mode switch
   (Direct starts follow the router chip's slot list), router stream counts

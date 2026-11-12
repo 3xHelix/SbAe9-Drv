@@ -3,6 +3,39 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.7 (2026-11-12)
+Monitor yourself, keep your Voice Clarity. 🎙️
+
+Pairs with [SbAe9-SBC v0.19.0](https://github.com/3xHelix/SbAe9-SBC) (the card's own mic monitor, with no delay, together with Voice Clarity; a monitor warm-up that works after a Direct Mode switch or driver reload; a +30 dB Mic Gain button when `mic_boost_30` is on) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed).
+
+Thanks to HandsomeHans (the report behind the source-install tools fix) and
+s3boun3t (the questions behind the +30 dB option, and a round of output
+routing measurements).
+
+- **Fixed: the card's mic monitor broke Voice Clarity until a power-off.**
+  Once "Mic Monitor" had been on, Voice Clarity recordings made with it off
+  came out wrong (left quiet, right empty). Turning the monitor off left
+  the DSP's mic tap with nothing reading it. The driver now puts that route
+  back when the monitor goes off, so the monitor and Voice Clarity can be
+  used together. "Mic Monitor Used Since Power-up" stays for older
+  SbAe9-SBC versions but always reads off.
+- New, optional: **Mic Gain up to +30 dB** with `mic_boost_30=1`. The mic
+  preamp has a +30 dB step that Windows doesn't use. It's clean, but
+  normal speech into a typical mic clips there: it's for quiet mics.
+- New, optional: **a "clean mic" example**, `config/ae9-clean-mic.conf`
+  (packages: `/usr/share/creative-ae9/examples/`). It adds an input "AE-9
+  Mic (clean)": the mic through PipeWire's built-in WebRTC noise
+  suppression, like the software clean-up Windows applies. On the card:
+  room hiss and hum 20-30 dB lower, speech level unchanged, about 35 ms
+  extra delay. See "Clean mic" in the README.
+- Source install (`scripts/dkms-install.sh`): it now also installs the
+  command-line tools (`ae9-hp-profile`, `ae9-get-firmware`,
+  `ae9-full-dump`, ...) in `/usr/local/bin`, so SbAe9-SBC's custom
+  headphone profiles work without a package. And it really refuses to run
+  next to a packaged build (COPR, .deb/PPA, AUR): the check looked for the
+  wrong package names, so a source install could leave two copies.
+- Debugging: debugfs `dacr` / `dacw` read or write one DAC register (root).
+
 ## 0.12.6 (2026-11-11)
 Clean routes, clean sound. 🔀
 

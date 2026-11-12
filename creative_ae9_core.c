@@ -3028,6 +3028,30 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 
+	/* "dacr 48 1d": one DAC (CA0113 I2C) register read, Windows' read
+	 * sequence; "dacw 48 19 0": one DAC register write. Groups 0x48
+	 * (ES9038Q2M) and 0x49 (SABRE9006A) only. */
+	if (!strncmp(buf, "dacr ", 5) || !strncmp(buf, "dacw ", 5)) {
+		unsigned int grp, reg, v = 0;
+		bool wr = buf[3] == 'w';
+		u32 raw[2] = { 0, 0 };
+
+		if (sscanf(buf + 5, "%x %x %x", &grp, &reg, &v) != (wr ? 3 : 2) ||
+		    (grp != 0x48 && grp != 0x49) || reg > 0xff || v > 0xff)
+			return -EINVAL;
+		if (wr) {
+			const u8 cmd[1][3] = { { grp, reg, v } };
+
+			creative_dsp_ca0113_replay_quiet(g_dbg_chip, cmd, 1);
+			dev_info(g_dbg_chip->dev, "dbg dacw 0x%02x/0x%02x = 0x%02x\n", grp, reg, v);
+		} else {
+			v = creative_dsp_ca0113_read(g_dbg_chip, grp, reg, raw);
+			dev_info(g_dbg_chip->dev, "dbg dacr 0x%02x/0x%02x = 0x%02x (0x208 0x%08x 0x%08x)\n",
+				 grp, reg, v, raw[0], raw[1]);
+		}
+		return len;
+	}
+
 	/* "hutext ABCD": hold text on the head-unit display (shown at the
 	 * next poll, within ~0.5 s); "hutext" alone goes back to the normal
 	 * volume/MUTE display. Printable ASCII only. The frame carries 8
@@ -4116,17 +4140,30 @@ static const struct snd_kcontrol_new hu_controls[] = {
  * (the head unit's input pin: XLR/TRS jack and 3.5 mm mic jack, both
  * boosted, checked 2026-11-06)
  * amp, 0/1/2 = 0/+10/+20 dB, both channels, exactly as Windows sets it.
+ * The amp itself goes to +30 dB (input amp caps 0x00270300: 10 dB steps,
+ * 0-3; read 2026-11-11, uv29); Windows never uses step 3, so it's only
+ * offered with mic_boost_30=1 (card-tested uv30: +10 dB on voice and noise
+ * alike, but normal speech clips there; for quiet mics).
  * Not called "Mic Boost" on purpose: PipeWire's mixer paths know that name
  * and would tie it to the mic slider. With this name PipeWire leaves it
  * alone and the slider is software gain only. */
 static const DECLARE_TLV_DB_SCALE(mic_boost_tlv, 0, 1000, 0);
+
+static bool mic_boost_30;
+module_param(mic_boost_30, bool, 0444);
+MODULE_PARM_DESC(mic_boost_30, "Mic Gain: also offer +30 dB (the amp's top step; Windows stops at +20 dB; for quiet mics, normal speech clips) (0 = no, default; 1 = yes)");
+
+static unsigned int mic_boost_max(void)
+{
+	return mic_boost_30 ? 3 : 2;
+}
 
 static int mic_boost_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	ui->count = 1;
 	ui->value.integer.min = 0;
-	ui->value.integer.max = 2;
+	ui->value.integer.max = mic_boost_max();
 	return 0;
 }
 
@@ -4151,7 +4188,7 @@ static void creative_ae9_mic_boost_apply(struct creative_chip *chip)
 static int mic_boost_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
-	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, 2);
+	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, mic_boost_max());
 
 	if (v == chip->mic_boost)
 		return 0;
@@ -4937,12 +4974,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		}
 
 		creative_ae9_fx_dsp_reset(chip);	/* fresh DSP: upload latch, first-failure log */
-		if (chip->cv.mon_used) {		/* and the monitor's side effect gone */
-			chip->cv.mon_used = false;
-			if (chip->cv.mon_used_kc)
-				snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
-					       &chip->cv.mon_used_kc->id);
-		}
+		chip->cv.mon_used = false;	/* fresh DSP: the mic tap route is fresh too */
 		fret = creative_dsp_load_firmware(chip);
 		if (chip->rings_deferred && !chip->card_gone) {
 			/* the load failed before the stream finished */
