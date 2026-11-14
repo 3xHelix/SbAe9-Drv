@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.8"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.9"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -70,9 +70,13 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 /* ------------------------------------------------------------------ */
 /* Creative extension register offsets (relative to BAR2)		  */
 /* ------------------------------------------------------------------ */
-#define CREATIVE_REG_HW_CTRL		0x1c
-/* HW_CTRL bit fields */
-#define   CREATIVE_HW_CTRL_INIT		0x880480   /* ae9_mmio_capture.txt:65 */
+/* 0x1c (no Creative name for the register; "HW_CTRL" was ours): reset value
+ * 0x880480. Bit 9 = second codec (SDI2) off (uv62: set, the next link reset
+ * drops codec 2); bits 23:16 = Creative's MX_BSIZE byte (0x80 | 8); bit 7 =
+ * UART enable; bit 10 open. */
+#define CREATIVE_REG_1C			0x1c
+#define   CREATIVE_1C_INIT		0x880480   /* ae9_mmio_capture.txt:65 */
+#define   CREATIVE_1C_SDI2_OFF		0x200
 
 #define CREATIVE_REG_STREAM_CTRL	0x100	/* main stream parameter ctrl */
 #define CREATIVE_REG_STREAM_ENABLE	0x304	/* stream enable bitmask */
@@ -421,6 +425,7 @@ struct creative_chip {
 	bool			hu_display;	/* display on (SBX 5 s hold toggles) */
 	int			hu_display_to;	/* pending display on/off, -1 none */
 	struct snd_kcontrol	*hu_disp_ctl;
+	struct snd_kcontrol	*answer_ctl;	/* "Card Answering" */
 	bool			hu_st07_valid;
 	u8			hu_st07;	/* 83 01 07 reply byte, logged on change */
 	struct snd_kcontrol	*hu_out_ctl;
@@ -456,6 +461,8 @@ struct creative_chip {
  * machine froze. Checked where a timeout or an all-ones read suggests it;
  * once set, every command path returns -ENODEV straight away.
  */
+void creative_ae9_dead_notify(struct creative_chip *chip);
+
 /* For control writes: the card dropped off the bus or stopped answering
  * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing
  * a setting that never reaches it. */
@@ -476,6 +483,7 @@ static inline bool creative_ae9_gone(struct creative_chip *chip, const char *whe
 	if (vid != 0xffff)
 		return false;
 	chip->card_gone = true;
+	creative_ae9_dead_notify(chip);
 	dev_err(chip->dev, "card dropped off the bus (%s): registers and config space read all-ones; stopping\n",
 		where);
 	return true;

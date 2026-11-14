@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.8
+Version:        0.12.9
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,12 @@ done
 %{?akmod_install}
 
 %changelog
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
+- Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
+  ae9-reload command (reload the driver in one go), "Card Answering"
+  control so apps let go of a stopped card, unload no longer wedges a
+  card that answers again, BAR2 0x1c logged (bit 9 = second codec off)
+
 * Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
 - Driver 0.12.8: head unit catches its start-up handshake (board D0
   step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and

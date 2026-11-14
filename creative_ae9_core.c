@@ -3067,7 +3067,7 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 /*								  */
 /* The kernel AE-5/7 init differs from our VFIO capture version:     */
 /*   - Stream 0 enable (0x400=1) BEFORE status clears		   */
-/*   - HW_CTRL (0x1c) = 0x00000680 -> 0x00880680 (AE-7 pre-writes)  */
+/*   - 0x1c = 0x00000680 -> 0x00880680 (AE-7 pre-writes; bit 9 = codec 2 off) */
 /*   - Writes 0x804 = 0x57 (DSP config)				   */
 /*   - Writes 0x20c = 0x00800001 (AE-7) / 0x00800000 (AE-5)	   */
 /*   - Writes 0x830 = 0x0aff (not preserve)			   */
@@ -3104,8 +3104,10 @@ static void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 				    ae9_bar2_init_windows[i].val);
 		creative_ext_readl(chip, ae9_bar2_init_windows[i].reg);
 	}
-	dev_info(chip->dev, "bar2_first: Windows BAR2 init done, BAR2+0x4=0x%08x (Windows: 0x7172000a)\n",
-		 creative_ext_readl(chip, 0x4));
+	/* 0x1c: Windows keeps the low half (bit 9 set lost codec 2 on one
+	 * AE-9); every AE-9 seen reads 0x880480 before and after */
+	dev_info(chip->dev, "bar2_first: Windows BAR2 init done, BAR2+0x4=0x%08x (Windows: 0x7172000a), 0x1c=0x%08x (Windows: 0x00880480)\n",
+		 creative_ext_readl(chip, 0x4), creative_ext_readl(chip, 0x1c));
 }
 
 /* ------------------------------------------------------------------ */
@@ -4789,6 +4791,33 @@ static const struct snd_kcontrol_new hu_out_control = {
 	.put = hu_out_put,
 };
 
+/*
+ * "Card Answering" (read-only): off once the card dropped off the bus or
+ * stopped answering, with a change event, so apps that only listen (AudioMon
+ * follows controls with `amixer events`) can let go of the card: an open
+ * control device keeps "modprobe -r" from unloading the driver. A reload
+ * brings a new card where it reads on.
+ */
+static int answer_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.integer.value[0] = !creative_ae9_dead(snd_kcontrol_chip(kc));
+	return 0;
+}
+
+static const struct snd_kcontrol_new answer_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Card Answering",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = answer_get,
+};
+
+void creative_ae9_dead_notify(struct creative_chip *chip)
+{
+	if (chip->answer_ctl)
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->answer_ctl->id);
+}
+
 /* "Head Unit Display": the display on/off, as the SBX button's 5 s hold */
 static int hu_disp_get_cur(struct creative_chip *chip)
 {
@@ -4981,6 +5010,9 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
 		chip->hu_out_ctl = NULL;
+	chip->answer_ctl = snd_ctl_new1(&answer_control, chip);
+	if (snd_ctl_add(chip->card, chip->answer_ctl) < 0)
+		chip->answer_ctl = NULL;
 	chip->hu_disp_ctl = snd_ctl_new1(&hu_disp_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_disp_ctl) < 0)
 		chip->hu_disp_ctl = NULL;
@@ -5091,10 +5123,11 @@ static void creative_ae9_resume_work(struct work_struct *work);
 static void creative_ae9_log_state(struct creative_chip *chip, const char *when)
 {
 	dev_info(chip->dev,
-		 "state %s: BAR2 0x320=0x%04x 0x304=0x%02x 0x20c=0x%08x 0x4=0x%08x 0xc0c=0x%02x 0xc14=0x%02x\n",
+		 "state %s: BAR2 0x320=0x%04x 0x304=0x%02x 0x20c=0x%08x 0x4=0x%08x 0x1c=0x%08x 0xc0c=0x%02x 0xc14=0x%02x\n",
 		 when, creative_ext_readw(chip, 0x320),
 		 readb(chip->ext_regs + 0x304),
 		 creative_ext_readl(chip, 0x20c), creative_ext_readl(chip, 0x4),
+		 creative_ext_readl(chip, 0x1c),
 		 creative_ext_readl(chip, 0xc0c) & 0xff,
 		 creative_ext_readl(chip, 0xc14) & 0xff);
 }
@@ -5199,6 +5232,42 @@ static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
 	return true;
 }
 
+/*
+ * Test (load-time, bit9_test=1): BAR2 0x1c bit 9 = second codec (SDI2) off?
+ * Windows sets it only on a one-codec reference board, then resets the link
+ * and reads STATESTS (CtxHdb FUN_00012d48); on one AE-9 the AE-5 value
+ * (bit 9 on) dropped codec 2. Here, before any codec is touched: bit 9 on,
+ * link reset, STATESTS; bit 9 off, link reset, STATESTS; then the normal
+ * bring-up (which resets the link again).
+ */
+static bool bit9_test;
+module_param(bit9_test, bool, 0444);
+MODULE_PARM_DESC(bit9_test, "Test: at bring-up, read which codecs answer with BAR2 0x1c bit 9 set, then clear (default off)");
+
+static void creative_ae9_bit9_test(struct creative_chip *chip)
+{
+	u32 v = creative_ext_readl(chip, 0x1c);
+	u16 st[2];
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		u32 w = i ? v & ~0x200u : v | 0x200;
+
+		creative_ext_writel(chip, 0x1c, w);
+		writew(0x7fff, chip->hda_regs + AZX_REG_STATESTS);	/* clear */
+		creative_ae9_hw_reset(chip);
+		msleep(100);		/* codecs announce themselves within ~1 ms */
+		st[i] = readw(chip->hda_regs + AZX_REG_STATESTS);
+		dev_info(chip->dev, "bit9_test: 0x1c=0x%08x (reads 0x%08x) -> STATESTS 0x%04x\n",
+			 w, creative_ext_readl(chip, 0x1c), st[i]);
+	}
+	dev_info(chip->dev, "bit9_test: bit 9 on: codecs 0x%x, off: codecs 0x%x -> %s\n",
+		 st[0] & 0xf, st[1] & 0xf,
+		 (st[0] & 0xf) == 0x2 && (st[1] & 0xf) == 0x6 ?
+		 "bit 9 = second codec off (PROVEN on this card)" : "not as expected");
+	writew(0x7fff, chip->hda_regs + AZX_REG_STATESTS);
+}
+
 static int creative_ae9_hw_bringup(struct creative_chip *chip)
 {
 	struct pci_dev *pdev = chip->pci;
@@ -5269,6 +5338,8 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 
 	/* Windows' BAR2 init, before the controller reset as in its cold boot */
 	creative_ae9_bar2_init_windows(chip);
+	if (bit9_test)
+		creative_ae9_bit9_test(chip);
 
 	/* Reset HDA controller */
 	ret = creative_ae9_hw_reset(chip);
@@ -5597,6 +5668,11 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 			 chip->asmedia ? " (ASMedia ASM1083/1085)" : "",
 			 chip->dma_pad / 1024);
 	chip->hu_phantom_req = -1;	/* nothing to send */
+	/* before the bring-up: its post-boot replay sends "AE-9" only with the
+	 * display on (set later, in hu_controls_add, it blanked "AE-9" at
+	 * every load: 0.12.8) */
+	chip->hu_display = true;
+	chip->hu_display_to = -1;
 	chip->hda_regs = pcim_iomap_table(pdev)[layout->hda_bar];
 	chip->ext_regs = pcim_iomap_table(pdev)[layout->ext_bar];
 	vlog_bar0 = chip->hda_regs;
@@ -5878,6 +5954,26 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 {
 	u32 ctl;
 
+	/*
+	 * Marked "stopped answering" (corb.c): ask once before skipping the
+	 * power-down. A card that answers again (a test's hung_inject, or a
+	 * hang that cleared) still gets its full power-down: unloaded without
+	 * it, with streams running (uv60: 5 open for AudioMon's meters), the
+	 * next load found the DSP busy for good, until a power-off.
+	 */
+	if (chip->card_hung && !chip->card_gone && chip->corb_buf) {
+		u32 id = 0;
+
+		chip->card_hung = false;
+		chip->corb_to_run = 0;
+		if (creative_ae9_corb_send_verb_sync(chip, 0x100f0000, &id) == 0 &&
+		    id == 0x11020011) {
+			dev_info(chip->dev, "shutdown (%s): the card answers again; normal power-down\n", why);
+		} else {
+			chip->card_hung = true;
+			dev_warn(chip->dev, "shutdown (%s): the card still doesn't answer; power-down skipped\n", why);
+		}
+	}
 	creative_ae9_streams_down(chip);
 	dev_info(chip->dev, "shutdown (%s): Windows power-down sequence\n", why);
 	/* stop capture (SD0) and playback (SD4) DMA */

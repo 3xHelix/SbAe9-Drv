@@ -1,0 +1,138 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# Reload the AE-9 driver in one go: stop what holds the card (PipeWire,
+# WirePlumber, the AE-9 helper services, alsa-state), unload and load the
+# driver, wait for the card, start everything again. For a card that
+# "stopped answering", or to pick up new driver options. Packaged as
+# ae9-reload.
+#
+#   ae9-reload            as your desktop user (asks for sudo for the driver)
+#   ae9-reload --check    only show what holds the card
+#   ae9-reload --force    reload even if something else still holds it
+#
+# SbAe9-SBC and SbAe9-AudioMon let go of the card by themselves once the
+# driver says it stopped answering (driver 0.12.9+); anything else that
+# holds it is listed and the reload stops, unless --force.
+# A reload doesn't fix everything: when the card's DSP won't start again,
+# only a full power-off does (PSU switch or unplug for 15-30 s).
+set -u
+MOD=snd-hda-codec-creative-ae9
+SYSMOD=/sys/module/snd_hda_codec_creative_ae9
+OURS=(ae9-headroom.service sbae9-sbc-encoder.service)
+PW=(pipewire.socket pipewire-pulse.socket pipewire.service pipewire-pulse.service wireplumber.service)
+SYS=(alsa-state.service)
+WAIT=90		# seconds for the card to come back (a bring-up with retries can take ~70)
+
+CHECK=0 FORCE=0
+for a in "$@"; do
+	case $a in
+	--check) CHECK=1 ;;
+	--force) FORCE=1 ;;
+	-h|--help) sed -n '4,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
+	esac
+done
+
+# who runs it: as the desktop user, or with sudo (then the user is SUDO_USER)
+if [ "$(id -u)" = 0 ]; then
+	SU=""; DUSER=${SUDO_USER:-}
+else
+	SU=sudo; DUSER=$(id -un)
+fi
+ucmd() {	# systemctl --user for the desktop user
+	[ -n "$DUSER" ] && [ "$DUSER" != root ] || return 1
+	if [ "$(id -un)" = "$DUSER" ]; then
+		systemctl --user "$@"
+	else
+		local uid; uid=$(id -u "$DUSER")
+		sudo -u "$DUSER" XDG_RUNTIME_DIR=/run/user/$uid \
+			DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus systemctl --user "$@"
+	fi
+}
+
+card_nodes() {	# the AE-9's device files, while its card exists
+	local c; c=$(readlink /proc/asound/AE9 2>/dev/null) || return
+	c=${c#card}
+	ls /dev/snd/controlC"$c" /dev/snd/pcmC"$c"D* /dev/snd/hwC"$c"D* 2>/dev/null
+}
+holders() {	# processes holding the AE-9 (fuser -v lines), none = empty
+	local n; n=$(card_nodes); [ -n "$n" ] || return 0
+	local f=fuser	# without sudo, only your own processes show
+	[ -z "$SU" ] || ! sudo -n true 2>/dev/null || f="sudo fuser"
+	# shellcheck disable=SC2086
+	$f -v $n 2>&1 | grep -v '^ *USER' | grep -vE '^\s*$' || true
+}
+
+if [ $CHECK = 1 ]; then
+	[ -d "$SYSMOD" ] && echo "driver: $(cat $SYSMOD/version 2>/dev/null) loaded" || echo "driver: not loaded"
+	[ -e /proc/asound/AE9 ] && echo "card: registered" || echo "card: not registered"
+	h=$(holders); echo "holding the card:"; echo "${h:-  nothing}"
+	exit 0
+fi
+
+[ -z "$SU" ] || sudo -v || exit 1
+modinfo $MOD >/dev/null 2>&1 || { echo "$MOD isn't installed for $(uname -r)" >&2; exit 1; }
+[ -n "$DUSER" ] && [ "$DUSER" != root ] || \
+	echo "note: no desktop user (run it as yourself, or with sudo from your session): PipeWire left alone" >&2
+
+# stop what holds the card, remembering what ran
+ran_user=() ran_sys=()
+for s in "${OURS[@]}" "${PW[@]}"; do
+	ucmd is-active --quiet "$s" 2>/dev/null && ran_user+=("$s")
+done
+for s in "${SYS[@]}"; do
+	systemctl is-active --quiet "$s" 2>/dev/null && ran_sys+=("$s")
+done
+restart() {
+	local s
+	[ ${#ran_sys[@]} = 0 ] || $SU systemctl start "${ran_sys[@]}"
+	# sockets and PipeWire first, then WirePlumber, then the AE-9 services
+	for s in "${PW[@]}" "${OURS[@]}"; do
+		[[ " ${ran_user[*]} " == *" $s "* ]] && ucmd start "$s"
+	done
+	return 0
+}
+echo "stopping: ${ran_user[*]:-} ${ran_sys[*]:-}"
+[ ${#ran_user[@]} = 0 ] || ucmd stop "${ran_user[@]}"
+[ ${#ran_sys[@]} = 0 ] || $SU systemctl stop "${ran_sys[@]}"
+sleep 2
+
+h=$(holders)
+if [ -n "$h" ] && [ $FORCE = 0 ]; then
+	echo "Still holding the AE-9 (close these, or use --force):"; echo "$h"
+	restart; exit 1
+fi
+
+t=$(date +%s)
+echo "unloading the driver..."
+if [ -d "$SYSMOD" ] && ! $SU modprobe -r $MOD; then
+	echo "The driver wouldn't unload. Holding the card:"; holders
+	restart; exit 1
+fi
+echo "loading the driver (the card's start-up takes 10-25 s)..."
+$SU modprobe $MOD || { echo "modprobe $MOD failed" >&2; restart; exit 1; }
+
+ok=0
+for ((i = 0; i < WAIT; i++)); do
+	if [ -e /proc/asound/AE9 ]; then ok=1; break; fi
+	if $SU journalctl -k --since "@$t" --no-pager -o cat 2>/dev/null | \
+	   grep -q 'creative-ae9.*\(not registering the card\|probe with driver .* failed\)'; then
+		break
+	fi
+	sleep 1
+done
+restart
+
+if [ $ok = 1 ]; then
+	ans=$(amixer -c AE9 cget name='Card Answering' 2>/dev/null | sed -n 's/.*: values=//p')
+	echo "done: driver $(cat $SYSMOD/version 2>/dev/null), card back${ans:+ (Card Answering: $ans)}"
+else
+	cat >&2 <<'MSG'
+The driver loaded, but the card didn't start (its DSP stayed busy).
+A reload can't fix that: shut down, switch the PSU off (or unplug) for
+15-30 s, and boot again. The kernel log has the details:
+  journalctl -k -b | grep creative-ae9 | tail -30
+MSG
+	exit 1
+fi

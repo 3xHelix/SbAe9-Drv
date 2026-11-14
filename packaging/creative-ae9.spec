@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.8
+Version:        0.12.9
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -57,6 +57,7 @@ install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}%{_bindir}/ae9-dsp-snapshot
 install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}%{_bindir}/ae9-read-stress
 install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}%{_bindir}/ae9-optical-passthrough
+install -D -m 755 scripts/ae9-reload.sh %{buildroot}%{_bindir}/ae9-reload
 install -D -m 755 scripts/ae9-hp-profile %{buildroot}%{_bindir}/ae9-hp-profile
 install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
 install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
@@ -97,10 +98,17 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_bindir}/ae9-dsp-snapshot
 %{_bindir}/ae9-read-stress
 %{_bindir}/ae9-optical-passthrough
+%{_bindir}/ae9-reload
 %{_bindir}/ae9-hp-profile
 %{_datadir}/%{name}/
 
 %changelog
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
+- Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
+  ae9-reload command (reload the driver in one go), "Card Answering"
+  control so apps let go of a stopped card, unload no longer wedges a
+  card that answers again, BAR2 0x1c logged (bit 9 = second codec off)
+
 * Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
 - Driver 0.12.8: head unit catches its start-up handshake (board D0
   step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and

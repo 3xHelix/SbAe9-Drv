@@ -69,7 +69,7 @@ echo "--- capture streams: SD0 (mic / line-in), SD1 (optical in), SD2 (What U He
 for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
 sec "Card registers (BAR2, the ones the driver logs at bring-up)"
-for o in 0x4 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
+for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
 # ChipIO reads go through codec 1 one verb at a time; hundreds of them
 # (the router scan) while audio plays killed codec 1 on 2026-11-07 22:30

@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.8
+Version:        0.12.9
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -60,6 +60,7 @@ install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}/usr/bin/ae9-dsp-snapshot
 install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}/usr/bin/ae9-read-stress
 install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}/usr/bin/ae9-optical-passthrough
+install -D -m 755 scripts/ae9-reload.sh %{buildroot}/usr/bin/ae9-reload
 install -D -m 755 scripts/ae9-hp-profile %{buildroot}/usr/bin/ae9-hp-profile
 install -d %{buildroot}/usr/share/creative-ae9/examples
 install -m 644 extract_firmware.py extract_overlay.py extract_hpeq.py %{buildroot}/usr/share/creative-ae9/
@@ -114,10 +115,17 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/bin/ae9-dsp-snapshot
 /usr/bin/ae9-read-stress
 /usr/bin/ae9-optical-passthrough
+/usr/bin/ae9-reload
 /usr/bin/ae9-hp-profile
 /usr/share/creative-ae9/
 
 %changelog
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
+- Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
+  ae9-reload command (reload the driver in one go), "Card Answering"
+  control so apps let go of a stopped card, unload no longer wedges a
+  card that answers again, BAR2 0x1c logged (bit 9 = second codec off)
+
 * Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
 - Driver 0.12.8: head unit catches its start-up handshake (board D0
   step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and

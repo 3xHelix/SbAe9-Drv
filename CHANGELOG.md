@@ -3,6 +3,38 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.9 (2026-11-14)
+One command to bring it back. 🔁
+
+Pairs with [SbAe9-SBC v0.21.0](https://github.com/3xHelix/SbAe9-SBC) (follows "Card Answering": shows its "stopped answering" screen by itself, lets go of the card, names `ae9-reload` with a Copy button) and [SbAe9-AudioMon v0.4.7](https://github.com/3xHelix/SbAe9-AudioMon) (lets go of the card when it stops answering, names `ae9-reload`, comes back by itself after the reload).
+
+- **Fixed: the head unit showed no "AE-9" at start-up in 0.12.8** (blank,
+  then "-SP-"/"-HP-", then the volume). The new display on/off setting was
+  switched on only after the start-up had already sent its text, so the
+  start-up blanked the display instead. Now "AE-9" shows again for about
+  4.6 s at every boot and driver reload, as on Windows.
+- **New: "Card Answering"**, a read-only control: it turns off, with a
+  change event, the moment the card stops answering or drops off the bus.
+  Apps that only listen can then let go of the card, so the driver can be
+  reloaded while they're open (SbAe9-SBC and SbAe9-AudioMon use it). A
+  reload brings it back on.
+- **Fixed: unloading the driver right after it marked the card as stopped
+  could leave the card wedged** until a power-off. The unload skipped its
+  power-down for a card that had stopped answering, even when the card had
+  come back (or, in testing, was never really stuck), and the next load
+  found the DSP busy. The unload now asks the card once and runs the full
+  power-down when it answers.
+- **New: `ae9-reload`**: reloads the driver in one command. It stops what
+  holds the card (PipeWire, WirePlumber, the AE-9 helper services,
+  alsa-state), unloads and loads the driver, waits for the card and starts
+  everything again. It lists anything else still holding the card, and says
+  when only a power-off will help. `ae9-reload --check` only shows who
+  holds the card.
+- The bring-up log shows the card register `0x1c` (before, after the bus
+  reset, after Windows' start-up writes), and `ae9-full-dump` reads it: bit 9
+  of it switches the second codec off (tested on the card; the AE-9 must
+  keep it clear). `bit9_test=1` repeats that test at load.
+
 ## 0.12.8 (2026-11-14)
 The head unit says hello again. 👋
 

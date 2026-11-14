@@ -437,6 +437,7 @@ static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
 		return;
 	chip->card_hung = true;
 	chip->hung_verb = verb;
+	creative_ae9_dead_notify(chip);
 	dev_err(chip->dev, "card stopped answering: %u command timeouts in a row (last verb 0x%08x, %u in all); no more commands until the driver is reloaded (sudo modprobe -r snd-hda-codec-creative-ae9 && sudo modprobe snd-hda-codec-creative-ae9) or the PC is powered off\n",
 		chip->corb_to_run, verb, chip->corb_timeouts);
 }

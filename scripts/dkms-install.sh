@@ -64,7 +64,7 @@ fi
 # The command-line tools the packages put in /usr/bin (SbAe9-SBC looks for
 # ae9-hp-profile on the PATH); a source install puts them in /usr/local/bin.
 TOOLS=(ae9-get-firmware.sh ae9-full-dump.sh ae9-dsp-snapshot.sh ae9-read-stress.sh
-       ae9-optical-passthrough ae9-hp-profile)
+       ae9-optical-passthrough ae9-hp-profile ae9-reload.sh)
 BIN=/usr/local/bin
 tools_install() { local t; for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done; }
 tools_remove() { local t; for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done; }
