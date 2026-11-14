@@ -244,8 +244,10 @@ Run the script again after updating the driver source (it replaces the
 old version). It also puts the command-line tools (`ae9-hp-profile`,
 `ae9-full-dump`, `ae9-get-firmware` and the others the packages install)
 in `/usr/local/bin`; SbAe9-SBC's "Make custom profile…" needs
-`ae9-hp-profile`. `sudo scripts/dkms-install.sh --remove` takes it all out
-of DKMS. `dkms status` shows what's built for which kernel.
+`ae9-hp-profile`. Since 0.12.10 it also installs
+`/etc/modules-load.d/creative-ae9.conf`, so the driver loads early at boot
+as with the packages (an existing file is left alone).
+`sudo scripts/dkms-install.sh --remove` takes it all out of DKMS. `dkms status` shows what's built for which kernel.
 
 **By hand:**
 
@@ -285,8 +287,12 @@ sudo cp config/00-ae9-override.rules /etc/udev/rules.d/   # driver_override at d
 sudo cp config/ae9-override.conf /etc/modprobe.d/         # same, if snd_hda_intel loads first
 sudo cp config/ae9-omit.conf /etc/dracut.conf.d/          # keep our module out of the initramfs
 sudo cp config/ae9-options.conf /etc/modprobe.d/          # optional: debug/tuning options (all commented out)
+sudo cp config/ae9-modules-load.conf /etc/modules-load.d/creative-ae9.conf  # load early at boot (dkms-install.sh does this one)
 sudo dracut -f
 ```
+
+The early load matters: loaded by udev alone, the DSP's first start failed
+on 11 of 26 cold boots (0 of 150 loaded early).
 
 Both find the card by its IDs, in any slot (since 0.9.9; before, the
 modprobe file had the PCI address written in). The module must load from the

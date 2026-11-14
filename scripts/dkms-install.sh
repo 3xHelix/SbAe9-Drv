@@ -48,6 +48,9 @@ if [ "${1:-}" = "--check" ]; then
 	echo "  copies:"
 	copies "$k" | sed 's/^/    /' | grep . || echo "    none (the driver isn't installed for this kernel)"
 	echo "  modprobe loads: $(modinfo -k "$k" -n "$NAME" 2>/dev/null || echo nothing)"
+	ml=$(ls /etc/modules-load.d/creative-ae9.conf /usr/lib/modules-load.d/creative-ae9.conf 2>/dev/null | tr '\n' ' ' || true)
+	[ -n "$ml" ] || ml="none (udev only: the DSP's first start can fail on cold boots)"
+	echo "  early load at boot: $ml"
 	[ "$(copies "$k" | wc -l)" -le 1 ] || echo "  WARNING: more than one copy; keep one install method and remove the others" >&2
 	exit 0
 fi
@@ -69,6 +72,28 @@ BIN=/usr/local/bin
 tools_install() { local t; for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done; }
 tools_remove() { local t; for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done; }
 
+# Early load at boot (systemd-modules-load), as every package does from
+# /usr/lib/modules-load.d: loaded by udev alone, the DSP's first start
+# failed on 11 of 26 cold boots (0.10.1). A source install missed it until
+# 0.12.10 (arkhodakov, PR #3). An existing file is left alone, also one
+# toggle-ae9-mode.sh parked (.off-vfio) or masked (-> /dev/null); --remove
+# deletes it only while it is still our copy.
+ML=/etc/modules-load.d/creative-ae9.conf
+MLSRC=$SRC/config/ae9-modules-load.conf
+early_install() {
+	if [ -e "$ML" ] || [ -L "$ML" ] || [ -e "$ML.off-vfio" ]; then
+		echo "early load: $ML already there (left as it is)"
+		return 0
+	fi
+	install -Dm644 "$MLSRC" "$ML" && echo "early load: $ML"
+}
+early_remove() {
+	if [ -f "$ML" ] && [ ! -L "$ML" ] && cmp -s "$MLSRC" "$ML"; then
+		rm -f "$ML" && echo "early load: $ML removed"
+	fi
+	return 0
+}
+
 registered() { dkms status -m "$NAME" 2>/dev/null | sed -n "s#^$NAME/\([^,: ]*\).*#\1#p" | sort -u; }
 
 # Take a version out of DKMS and /usr/src. dkms remove can return non-zero
@@ -83,6 +108,7 @@ if [ "${1:-}" = "--remove" ]; then
 	for v in $(registered); do drop "$v"; done
 	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
 	tools_remove
+	early_remove
 	echo "removed from DKMS (and its tools from $BIN); build and copy the module by hand again if you still want it"
 	left=$(copies "$(uname -r)")
 	[ -z "$left" ] || { echo "still installed for $(uname -r) (not by DKMS):"; echo "$left" | sed 's/^/  /'; }
@@ -138,6 +164,7 @@ if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
 fi
 tools_install
 echo "tools: $(printf '%s ' "${TOOLS[@]%.sh}")in $BIN"
+early_install
 echo "done: $NAME $VER is in DKMS, built for $built kernel(s);"
 echo "new kernels get it built automatically. Reboot to load it."
 for k in "${kernels[@]}"; do

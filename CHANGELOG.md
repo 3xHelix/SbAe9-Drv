@@ -3,6 +3,18 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.10 (unreleased)
+
+Thanks to arkhodakov (the report behind the source-install fix).
+
+- **Fixed: a source/DKMS install didn't load the driver early at boot.**
+  `scripts/dkms-install.sh` (and the README's file list) left out
+  `ae9-modules-load.conf`, which every package installs, so the driver
+  loaded through udev alone, where the DSP's first start failed on about
+  half of cold boots. The script now installs
+  `/etc/modules-load.d/creative-ae9.conf` (an existing one is left alone;
+  `--remove` takes it out while it's still ours), and `--check` shows it.
+
 ## 0.12.9 (2026-11-14)
 One command to bring it back. 🔁
 
