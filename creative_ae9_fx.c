@@ -1231,6 +1231,9 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	long v = uv->value.integer.value[0];
 	unsigned int e = uv->value.enumerated.item[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	switch (PV_K(kc->private_value)) {
 	case K_DIRECT:
 		if (!!v == fx->direct)
@@ -1590,6 +1593,9 @@ static int hp_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (on == chip->fx.hp_virt)
 		return 0;

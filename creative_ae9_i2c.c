@@ -372,7 +372,7 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 {
 	ktime_t deadline;
 	unsigned int idle = 0;
-	int i, n = 0;
+	int i, n = 0, total = 0;
 
 	creative_ext_readl(chip, DSP_REG_RESP);
 	creative_ext_readl(chip, DSP_REG_STS);
@@ -393,12 +393,29 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 		if ((creative_ext_readl(chip, DSP_REG_RESP) & 0xff) == 0x41) {
 			u8 b = creative_ext_readl(chip, DSP_REG_CMD) & 0xff;
 
+			idle = 0;
+			/* a reply starts at f0: anything before it is a byte an
+			 * earlier, cut-short reply left behind */
+			if (!n && b != I2C_START)
+				continue;
 			if (resp && n < resp_len)
 				resp[n] = b;
 			n++;
-			if (b == I2C_STOP && n > 1)
+			if (n == 3)
+				total = b + 4;
+			/*
+			 * A reply is f0 <cmd> <len> <len bytes> f7: it ends at
+			 * byte len + 4, not at the first f7. Status 0xf7 (nothing
+			 * plugged, SBX light on, phantom off) is data; stopping
+			 * there cut the reply short and shifted the next one by
+			 * a byte (uv42 2026-11-12: a plug-out logged 8 s late and
+			 * a false "knob press bit stuck"). All 478018 replies in
+			 * 28 Windows traces follow len + 4, 7840 of them with an
+			 * f7 data byte. A reply shorter than its length (never
+			 * seen) times out; a longer one ends at the first f7 past its length.
+			 */
+			if (b == I2C_STOP && n > 1 && (!total || n >= total))
 				return n;
-			idle = 0;
 			continue;
 		}
 		if (ktime_after(ktime_get(), deadline))

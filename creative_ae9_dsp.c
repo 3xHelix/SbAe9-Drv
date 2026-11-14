@@ -573,7 +573,7 @@ static int dspio_write_wait(struct creative_chip *chip, unsigned int ms)
 		    status == VENDOR_STATUS_DSPIO_SCP_RESPONSE_QUEUE_EMPTY ||
 		    status == VENDOR_STATUS_DSPIO_SCP_COMMAND_QUEUE_FULL)
 			return 0;
-		if (chip->card_gone)
+		if (chip->card_gone || chip->card_hung)
 			return -ENODEV;
 		if (!time_before(jiffies, timeout))
 			break;
@@ -888,7 +888,8 @@ static int scp_wait_not_busy(struct creative_chip *chip, unsigned int verb,
 		*res = dsp_read(chip, WIDGET_DSP_CTRL, verb, parm);
 		if (*res != VENDOR_STATUS_DSPIO_BUSY)
 			return *res == ~0U ? -EIO : 0;
-		if (!time_before(jiffies, until) || chip->card_gone)
+		if (!time_before(jiffies, until) || chip->card_gone ||
+		    chip->card_hung)
 			return -EBUSY;
 		usleep_range(500, 1000);
 	}
@@ -4067,6 +4068,9 @@ static int cv_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_ae9_cv *cv = &chip->cv;
 	unsigned long k = kc->private_value;
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (k == 4 || k == 5) {
 		unsigned int v = uv->value.enumerated.item[0];
 		unsigned int *p = k == 4 ? &cv->voicefx : &cv->miceq;
@@ -4169,6 +4173,9 @@ static int mic_monitor_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *u
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (on == chip->cv.monitor)
 		return 0;

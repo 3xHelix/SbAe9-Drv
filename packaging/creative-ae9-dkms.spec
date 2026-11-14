@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.7
+Version:        0.12.8
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -118,6 +118,13 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
+- Driver 0.12.8: head unit catches its start-up handshake (board D0
+  step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and
+  is set up again after a power dip or stop frame, SBX held 5 s switches
+  its display; rear RCA input and optical work after a reload (codec 2
+  woken); the driver stops when the card stops answering
+
 * Thu Nov 12 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.7-1
 - Driver 0.12.7: the card's mic monitor no longer breaks Voice Clarity
   until a power-off (monitor off restores the DSP's mic route), optional

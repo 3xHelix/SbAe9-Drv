@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.7
+Version:        0.12.8
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,13 @@ done
 %{?akmod_install}
 
 %changelog
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
+- Driver 0.12.8: head unit catches its start-up handshake (board D0
+  step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and
+  is set up again after a power dip or stop frame, SBX held 5 s switches
+  its display; rear RCA input and optical work after a reload (codec 2
+  woken); the driver stops when the card stops answering
+
 * Thu Nov 12 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.7-1
 - Driver 0.12.7: the card's mic monitor no longer breaks Voice Clarity
   until a power-off (monitor off restores the DSP's mic route), optional

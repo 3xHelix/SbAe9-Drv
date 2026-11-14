@@ -3,6 +3,70 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.8 (2026-11-14)
+The head unit says hello again. 👋
+
+Pairs with [SbAe9-SBC v0.20.0](https://github.com/3xHelix/SbAe9-SBC) (a "stopped answering" screen with the reload command when the card stops answering; a note, with a "Use 48 kHz" button, when DSP mode waits for a 48 kHz stream) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed).
+
+Thanks to arkhodakov (PR #3: the cause, the fix and the tests) and
+s3boun3t (a side-by-side with another AE-9 driver that pointed at the
+head unit's attach marker and a misleading register label).
+
+- **Fixed: the head unit could miss its start-up handshake**, leaving the
+  headphones and the mic silent until a reload. The driver powered the
+  head unit (GPIO pin 5) only just before its first start-up frame. On one
+  ASMedia card it started answering about 200 ms in and missed 9 or 10 of
+  the 246 frames; with the handshake among them, nothing worked. The
+  driver now runs Windows' board start-up step first: head unit powered
+  seconds earlier, DAC reset pin 0 pulsed with both DACs muted. Tested on
+  both board versions, after reloads and a cold boot: the head unit answers
+  its first frame at the first try, 0 of 246 lost (without the step, the
+  IDT card needed 3 tries). If it still doesn't answer, the driver retries
+  its first frame for up to ~1 s. `board_d0=0` is the old behaviour.
+- **Fixed: a 3.5 mm headphone unplug could go unnoticed.** A head-unit
+  reply ends at its length byte, but the driver stopped reading at the
+  first 0xf7 byte. The status byte is exactly 0xf7 in headphones mode with
+  nothing plugged, the SBX light on and phantom power off, so that reply was
+  cut short and shifted the next one: the unplug was never seen (3 of 3
+  tries; now 0.01 s), and a false "knob press bit stuck" could appear. All
+  478018 replies in 28 Windows traces end at their length byte.
+- **Fixed: the head unit's rear RCA input was dead after a driver
+  reload** (unload + load without a power-off): recording failed at once
+  with "Input/output error" until the next cold boot. The unload leaves
+  both codecs asleep, and start-up only ever woke the first. The driver
+  now wakes the second codec (rear RCA input, optical in and out) when it
+  finds it asleep. Tested over 3 reloads; optical in and out checked
+  working after a reload too.
+- **New: the driver stops when the card stops answering.** Toggling SBX on
+  and off very fast once left the card on the bus but no longer answering
+  commands; the driver kept sending for 4 minutes (1420 timeouts, up to 2 s
+  per effect setting) until a reload. Now 8 timeouts in a row on a running
+  card log one line, "card stopped answering", with the reload command,
+  and every later command fails at once. A reload (or sleep/wake) clears
+  it. A healthy card's rare timeouts come one at a time and the next
+  command answers, so they don't count. Control writes (alsamixer, SbAe9-SBC)
+  then fail with "No such device" instead of quietly doing nothing. The debugfs `state` file shows it;
+  `hung_inject` (with `debug=1`) tests it without a real hang.
+- **New: the head unit shows "AE-9" at start-up, as on Windows**: "AE-9"
+  for ~4.6 s, then "-SP-"/"-HP-" for ~5 s, then the volume. The driver sent
+  "AE-9" before, but replaced it with "-SP-" within a fraction of a second.
+  A knob turn shows the volume at once. Tested on a cold boot.
+- **New: the head unit is set up again when it loses its setup** while
+  running (a power dip on its cable, or the stop frame). It kept answering
+  but showed nothing new, and its headphone amp stayed off. The driver now
+  reads the head unit's "set up" marker on every poll, as Windows does, and
+  sends its setup again from the current state: output, knob light,
+  volume, mute, with "AE-9" first. Phantom power goes off, as at start-up.
+  Tested on headphones and speakers. `hu_reattach=0` switches it off.
+- **New: hold the SBX button 5 s to switch the head unit's display off or
+  on**, as on Windows (the knob light stays). The SBX button now acts when
+  released, as on Windows; a short press still switches SBX. New control
+  "Head Unit Display" does the same, for apps.
+- Docs: `docs/DECODED-SEQUENCES.md` checked step by step against ca0132,
+  Creative's own parameter tables, the datasheets and card reads. Every
+  step the driver sends (1681 with default settings) is named; the few
+  details still unproven are listed under "Open items".
+
 ## 0.12.7 (2026-11-12)
 Monitor yourself, keep your Voice Clarity. 🎙️
 

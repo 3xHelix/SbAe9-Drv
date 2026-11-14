@@ -578,6 +578,9 @@ static int spdif_out_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (on == chip->spdif_out)
 		return 0;
 	chip->spdif_out = on;
@@ -598,6 +601,9 @@ static int spdif_mirror_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (on == chip->spdif_mirror)
 		return 0;
@@ -1221,6 +1227,9 @@ static int ae9_iec958_default_put(struct snd_kcontrol *kc, struct snd_ctl_elem_v
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int i;
 	int changed = 0;
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	mutex_lock(&chip->spdif_mutex);
 	for (i = 0; i < 4; i++) {
@@ -1892,7 +1901,7 @@ static void ae9_sense_work(struct work_struct *w)
 
 	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING)
 		return;		/* stopped: the next start queues this again */
-	if (chip->card_gone ||
+	if (chip->card_gone || chip->card_hung ||
 	    ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) < 0)
 		goto again;
 	sig = sense & 0x80000000;

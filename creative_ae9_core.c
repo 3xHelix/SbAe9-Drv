@@ -46,6 +46,25 @@ MODULE_VERSION(CREATIVE_AE9_DRV_VERSION);
 #define AE9_PHANTOM_HOLD_S	30
 
 /*
+ * Windows' head-unit start-up display: "AE-9" (sent with the head unit's
+ * setup), then no text at all for 10 polls of 500 ms (AcmShowAE9TextMaxCounts,
+ * CtxHda FUN_0003fe68), then "-SP-"/"-HP-" for 10 polls, then the volume.
+ * Measured in 31 Windows boots: "AE-9" up 4.5-5.1 s, typically 4.6 s.
+ */
+#define HU_AE9_HOLD_MS	4600
+
+/* SBX button held this long (its b1 01 01 press report) switches the display
+ * off or on instead of SBX: Windows' AcmSBXLongPressMs (CtxHda FUN_0003f6xx,
+ * default 5000), the same 5000 ms our f0 32 03 01 88 13 gives the head unit */
+#define HU_SBX_LONG_MS	5000
+
+static void creative_ae9_hu_ae9_hold(struct creative_chip *chip)
+{
+	chip->hu_ae9_hold = true;
+	chip->hu_ae9_until = jiffies + msecs_to_jiffies(HU_AE9_HOLD_MS);
+}
+
+/*
  * enable_pcm: register the PCM playback device. No HDA interrupts are used
  * (Windows runs playback with global interrupts disabled), avoiding the
  * level-triggered INTx storm that previously hard-locked the system.
@@ -338,7 +357,7 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	u16 irs;
 	unsigned int timeout;
 
-	if (chip->card_gone)
+	if (chip->card_gone || chip->card_hung)
 		return -ENODEV;
 
 	/* Step 1: ACK previous response (or arm interface for first verb) */
@@ -2402,8 +2421,28 @@ MODULE_PARM_DESC(warm_reset, "Windows' codec recovery cycle before the DSP downl
 /* Cold table positions of Windows' warm-start steps (CtxHda FUN_0001c7dc) */
 #define AE9_COLD_AFG_F05	384	/* codec 1 AFG power state read */
 #define AE9_COLD_AFG_RESET	395	/* first of the two AFG resets (7ff) */
+#define AE9_COLD_C2_AFG_RESET	15	/* codec 2's first AFG reset (7ff) */
+#define AE9_COLD_C2_AFG_RESET_VERB	0x2017ff00
 #define AE9_COLD_SETTLE		774	/* after Windows' 1.5 s timer */
 #define AE9_COLD_DSP_INIT	521	/* DSPIO 0x703 (DSP_INIT) after the codec init */
+#define AE9_COLD_BOARD_D0	383	/* codec 1's first verb after codec 2's set-up */
+#define AE9_COLD_BOARD_D0_VERB	0x100f0004
+
+/*
+ * Windows' board-D0 GPIO step (CtxHda 0x364b0, 0x35de4, 0x35e58), which it
+ * runs once, between codec 2's set-up and codec 1's first verb (sb-ae9's
+ * capture ae9-20260903-210512, ops lines 1264-1288): pins 4-7 to GPIO and
+ * all pins enabled, pin 5 = 1 (head-unit power), pin 0 = 0, ~16 ms, pin 0
+ * = 1 ("AntiPop"), both DAC devices muted, pin 2 = 0, DAC 48/1d = 0x40,
+ * pin 3 = 1. The post-boot replay is Windows' post-DSP block, which has no
+ * pin 0 because Windows set it here. Without it, on a card behind an
+ * ASM1083 rev 03 bridge neither DAC device answered (every read 0xff,
+ * every DAC command lost, analog outputs silent) until pin 0 was pulsed
+ * (2026-11-10).
+ */
+static unsigned int board_d0 = 1;
+module_param(board_d0, uint, 0644);
+MODULE_PARM_DESC(board_d0, "Windows' board-D0 GPIO step before codec 1's set-up (GPIO pin 0 pulse, DACs muted): 1=on (default), 0=off");
 
 /*
  * Windows' two start-up checks, logged only (no behaviour change yet;
@@ -2528,6 +2567,54 @@ static bool ae9_recovery_pass(struct creative_chip *chip, struct ae9_bootchk *ch
 	return ae9_bootchk_ramp_failed(chk);
 }
 
+/* Windows' board-D0 GPIO step (see board_d0), then whether the DAC answers. */
+static void creative_ae9_board_d0(struct creative_chip *chip)
+{
+	static const u8 mute[][3] = { { 0x48, 0x07, 0x81 }, { 0x49, 0x0a, 0x07 } };
+	static const u8 front[][3] = { { 0x48, 0x1d, 0x40 } };
+	u32 raw[2];
+	u8 id;
+
+	creative_ext_writel(chip, 0x100, creative_ext_readl(chip, 0x100) & ~0x0fU);
+	creative_ext_writeb(chip, 0x304, 0xff);
+	creative_ext_writew(chip, 0x320, 0x0105);	/* pin 5 = 1: head-unit power */
+	creative_ext_writew(chip, 0x320, 0x0000);	/* pin 0 = 0 */
+	msleep(16);	/* Windows' 1 ms wait comes out at ~16 ms (its timer tick) */
+	creative_ext_writew(chip, 0x320, 0x0100);	/* pin 0 = 1 */
+	creative_dsp_ca0113_replay_quiet(chip, mute, ARRAY_SIZE(mute));
+	creative_ext_writew(chip, 0x320, 0x0002);	/* pin 2 = 0 */
+	creative_dsp_ca0113_replay_quiet(chip, front, ARRAY_SIZE(front));
+	creative_ext_writew(chip, 0x320, 0x0103);	/* pin 3 = 1 */
+	id = creative_dsp_ca0113_read(chip, 0x48, 0x40, raw);	/* ES9038 chip ID, bits 7:2 */
+	if (id >> 2 == 0x1c)
+		dev_info(chip->dev, "board D0: GPIO pin 0 pulsed, the DAC answers (48/40 = 0x%02x)\n", id);
+	else
+		dev_warn(chip->dev, "board D0: GPIO pin 0 pulsed, but the DAC does not answer (48/40 = 0x%02x): the analog outputs will be silent\n",
+			 id);
+}
+
+/*
+ * Codec 2's AFG asleep: our unload (and a reboot) leaves both AFGs in
+ * D3hot. The start-up wakes codec 1's (check (A) below) but nothing woke
+ * codec 2's: Windows' cold table only reads its power state (entry 309),
+ * and its function resets don't wake it. So after a driver reload codec 2
+ * stayed in D3 (F05 = 0x233), its widgets with it (actual D3 though set
+ * to D0), and the rear RCA input (ADC 0x08) never streamed: "Input/output
+ * error" until a power-off. Waking it to D0 brought it back at once
+ * (uv48, 2026-11-12). Optical in and out are on codec 2 as well.
+ */
+static void ae9_codec2_wake(struct creative_chip *chip)
+{
+	u32 resp = 0;
+
+	if (ae9_cold_verb(chip, 0x201f0500, &resp) < 0 || !(resp & 0xf))
+		return;
+	ae9_cold_verb(chip, 0x20170500, &resp);
+	msleep(2000);	/* as codec 1's wake (Windows' 2 s) */
+	ae9_cold_verb(chip, 0x201f0500, &resp);
+	dev_info(chip->dev, "warm start: codec 2 was asleep, woken to D0 (now 0x%x) + 2 s\n", resp);
+}
+
 /* Replay the cold-boot pre-download verbs; via CORB once it is running. */
 static void creative_ae9_replay_cold(struct creative_chip *chip)
 {
@@ -2539,6 +2626,19 @@ static void creative_ae9_replay_cold(struct creative_chip *chip)
 		u32 resp = 0;
 		int ret;
 
+		if (board_d0 && i == AE9_COLD_BOARD_D0) {
+			if (ae9_cold_prefw[i] != AE9_COLD_BOARD_D0_VERB)
+				dev_warn(chip->dev, "board D0: cold table entry %zu is 0x%08x, not codec 1's first verb 0x%08x\n",
+					 i, ae9_cold_prefw[i], AE9_COLD_BOARD_D0_VERB);
+			creative_ae9_board_d0(chip);
+		}
+
+		if (i == AE9_COLD_C2_AFG_RESET) {
+			if (ae9_cold_prefw[i] != AE9_COLD_C2_AFG_RESET_VERB)
+				dev_warn(chip->dev, "codec 2 wake: cold table entry %zu is 0x%08x, not 0x%08x\n",
+					 i, ae9_cold_prefw[i], AE9_COLD_C2_AFG_RESET_VERB);
+			ae9_codec2_wake(chip);
+		}
 		/* (A) codec 1's AFG asleep (a card that was running: our
 		 * shutdown left it in D3): wake it and give it 2 s before
 		 * the two resets, as Windows does every time */
@@ -2611,6 +2711,8 @@ static void creative_ae9_replay_both(struct creative_chip *chip)
 	/* fallback when the table layout changed: the warm tables */
 	creative_ae9_replay_init(chip, 2, ae9_initseq_codec2,
 				 ARRAY_SIZE(ae9_initseq_codec2));
+	if (board_d0)
+		creative_ae9_board_d0(chip);
 	creative_ae9_replay_init(chip, 1, ae9_initseq_codec1, n1);
 }
 
@@ -2828,6 +2930,27 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	chip->rt_direct_swept = false;
 }
 
+/* the head unit's first frame: up to ~1 s of tries, 100 ms apart (a card
+ * without a head unit pays this once at load) */
+#define AE9_HU_FIRST_TRIES	10
+
+/*
+ * Bytes waiting in the head-unit UART before its first frame (with the
+ * board-D0 step the head unit is powered seconds earlier, as in Windows):
+ * read them out (LSR 0xc14 bit 0 = byte received, RBR 0xc00), so that the
+ * first reply is the head unit's answer. Returns the count.
+ */
+static unsigned int creative_ae9_hu_drain(struct creative_chip *chip)
+{
+	unsigned int n = 0;
+
+	while (n < 64 && (creative_ext_readl(chip, 0xc14) & 0x01)) {
+		creative_ext_readl(chip, 0xc00);
+		n++;
+	}
+	return n;
+}
+
 static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 {
 	unsigned int frames = 0, noreply = 0, cmds = 0, writes = 0;
@@ -2850,9 +2973,55 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			return;
 		}
 		switch (o->type) {
-		case 'S':
-			if (creative_spi_frame_win(chip, o->data, o->len,
-						   resp, sizeof(resp)) < 0) {
+		case 'S': {
+			int n;
+
+			if (!frames) {
+				unsigned int stale = creative_ae9_hu_drain(chip);
+
+				if (stale)
+					dev_info(chip->dev, "post_windows: %u byte%s waiting from the head unit, read out\n",
+						 stale, stale == 1 ? "" : "s");
+			}
+			if (o->len == 13 && o->data[1] == 0x11 &&
+			    !memcmp(o->data + 3, "AE-9", 4) && !chip->hu_display) {
+				/* display switched off before a sleep/wake */
+				static const u8 blank[13] = { 0xf0, 0x11, 0x09, ' ', ' ',
+					' ', ' ', ' ', ' ', ' ', ' ', 0x00, 0xf7 };
+
+				n = creative_spi_frame_win(chip, blank, sizeof(blank),
+							   resp, sizeof(resp));
+			} else {
+				n = creative_spi_frame_win(chip, o->data, o->len,
+							   resp, sizeof(resp));
+				if (o->len == 13 && o->data[1] == 0x11 &&
+				    !memcmp(o->data + 3, "AE-9", 4))
+					creative_ae9_hu_ae9_hold(chip);
+			}
+
+			/*
+			 * The head unit's first frame (its probe): wait until
+			 * it answers, before its init frames. Without the
+			 * board-D0 step the first 10 frames, the handshake
+			 * 03 03 05 03 03 among them, went unanswered on one card
+			 * (0.12.4 on 2026-11-10, a 0.12.5 cold boot on 2026-11-12):
+			 * reg 5 stayed 00 and the XLR mic silent until the
+			 * handshake was resent. With the step the head unit
+			 * answered at the first try; this is the fallback.
+			 */
+			if (!frames && n < 0) {
+				unsigned int tries = 1;
+
+				while (n < 0 && tries < AE9_HU_FIRST_TRIES) {
+					msleep(100);
+					n = creative_spi_frame_win(chip, o->data, o->len,
+								   resp, sizeof(resp));
+					tries++;
+				}
+				dev_info(chip->dev, "post_windows: head unit %s its first frame after %u tries\n",
+					 n < 0 ? "did not answer" : "answered", tries);
+			}
+			if (n < 0) {
 				if (noreply < ARRAY_SIZE(chip->hu_noreply_idx)) {
 					chip->hu_noreply_idx[noreply] = frames + 1;
 					chip->hu_noreply_head[noreply] =
@@ -2863,6 +3032,7 @@ static void creative_ae9_bar2_post_replay(struct creative_chip *chip)
 			}
 			frames++;
 			break;
+		}
 		case 'C': {
 			u8 cmd[1][3] = { { o->off, o->val >> 8, o->val & 0xff } };
 
@@ -2952,12 +3122,12 @@ static void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 /* Result readable from the same file.				  */
 /* ------------------------------------------------------------------ */
 static struct creative_chip *g_dbg_chip;
-static char g_dbg_result[128];
+static char g_dbg_result[512];
 
 static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 				  size_t len, loff_t *ppos)
 {
-	char buf[64];
+	char buf[256];
 	char op[8];
 	unsigned int off, val;
 	int n;
@@ -3058,21 +3228,30 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 	 * characters but the display has 4 cells (left-aligned, no scroll;
 	 * dots ride on the cell before them), so only the first 4 show. */
 	/*
-	 * "huframe f0 85 01 02 f7": one raw head-unit frame (hex bytes, up to
-	 * 16). The heartbeat sends it on its next cycle, so it never collides
-	 * with the poll; the reply is logged and shown by reading cmd.
+	 * "huframe f0 85 01 02 f7": a raw head-unit frame (hex bytes), or
+	 * several back to back (up to 48 bytes), each f0 <cmd> <len> <len
+	 * bytes> f7. The heartbeat sends them on its next cycle, each right
+	 * after the previous reply (the head unit's unlock, read and relock
+	 * must come together), so they never collide with the poll; the
+	 * replies are logged and shown by reading cmd.
 	 */
 	if (!strncmp(buf, "huframe", 7)) {
-		u8 tx[16];
+		u8 tx[48];
 		unsigned long flags;
 		unsigned int b;
-		int k = 0, used, i = 7;
+		int k = 0, used, i = 7, p = 0;
 
-		while (k < 16 && sscanf(buf + i, " %x%n", &b, &used) == 1) {
+		while (k < 48 && sscanf(buf + i, " %x%n", &b, &used) == 1) {
 			tx[k++] = b & 0xff;
 			i += used;
 		}
-		if (k < 3 || tx[0] != 0xf0 || tx[k - 1] != 0xf7)
+		while (p < k) {		/* every frame: f0 .. f7, len + 4 bytes */
+			if (p + 3 >= k || tx[p] != 0xf0 || p + tx[p + 2] + 4 > k ||
+			    tx[p + tx[p + 2] + 3] != 0xf7)
+				return -EINVAL;
+			p += tx[p + 2] + 4;
+		}
+		if (!k)
 			return -EINVAL;
 		spin_lock_irqsave(&g_dbg_chip->lock, flags);
 		memcpy(g_dbg_chip->hu_dbg_tx, tx, k);
@@ -3080,6 +3259,22 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 		spin_unlock_irqrestore(&g_dbg_chip->lock, flags);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
 			  "huframe queued (%d bytes); read again for the reply\n", k);
+		return len;
+	}
+	/*
+	 * "hupause <ms>" (up to 30000): no head-unit poll, so no GPIO 0x320
+	 * write (each poll sets pin 5, the head unit's power, high), for a
+	 * test that powers the head unit off with "w2 320 005".
+	 */
+	if (!strncmp(buf, "hupause ", 8)) {
+		unsigned int ms;
+
+		if (kstrtouint(strim(buf + 8), 0, &ms) || ms > 30000)
+			return -EINVAL;
+		g_dbg_chip->hu_pause_until = jiffies + msecs_to_jiffies(ms);
+		g_dbg_chip->hu_paused = ms > 0;
+		dev_info(g_dbg_chip->dev, "head unit: poll paused for %u ms\n", ms);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result), "hupause %u ms\n", ms);
 		return len;
 	}
 	if (!strncmp(buf, "hutext", 6)) {
@@ -3315,8 +3510,13 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		   chip->corb_timeouts, chip->scp_full_words, chip->scp_busy_words,
 		   chip->fx.fails, chip->fx.dead ? " (DSP not answering)" : "",
 		   chip->hp_tries, chip->hp_leaks);
+	if (chip->card_hung)
+		seq_printf(m, "card: STOPPED ANSWERING (last verb 0x%08x); reload the driver\n",
+			   chip->hung_verb);
 	seq_printf(m, "DSP output unmute: resent %u, stayed muted %u\n",
 		   chip->unmute_resends, chip->unmute_stuck);
+	seq_printf(m, "head unit: set up again %u time(s)%s\n", chip->hu_reattaches,
+		   chip->hu_ae9_hold ? ", AE-9 shown" : "");
 	seq_printf(m, "head unit boot frames: %u, without reply %u",
 		   chip->hu_boot_frames, chip->hu_noreply_n);
 	for (i = 0; i < min_t(int, chip->hu_noreply_n, ARRAY_SIZE(chip->hu_noreply_idx)); i++)
@@ -3325,7 +3525,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			   chip->hu_noreply_head[i] & 0xff);
 	seq_printf(m, "%s\n", chip->hu_noreply_n > ARRAY_SIZE(chip->hu_noreply_idx) ? ", ..." : "");
 
-	if (chip->suspended || chip->card_gone || !chip->corb_buf) {
+	if (chip->suspended || chip->card_gone || chip->card_hung || !chip->corb_buf) {
 		seq_puts(m, "card: not readable now (suspended, gone or not up)\n");
 		return 0;
 	}
@@ -3628,10 +3828,10 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 				 r[4], chg & ~0x7b);
 		/* bit 3 = SBX button, 1 while held (b5 -> bd, found live
 		 * 2026-11-04): act on the press */
-		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08)) {
-			chip->hu_sbx_press = true;
-			ae9_dbg(chip, "head unit: SBX button\n");
-		}
+		/* SBX acts on the press report (b1 01 01, below), on release,
+		 * as Windows: a 5 s hold switches the display instead */
+		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08))
+			ae9_dbg(chip, "head unit: SBX button down\n");
 		chip->hu_status = st;
 		chip->hu_status_valid = true;
 
@@ -3691,6 +3891,15 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 	 * the knob: f0 b1 04 01 01 <ms lo> <ms hi> f7 (seen 2026-11-04, not
 	 * needed). Item 03's b1 reply is logged, to learn what it is.
 	 */
+	if (r[1] == 0xb1 && n >= 8 && r[3] == 0x01 && r[4] == 0x01) {
+		unsigned int ms = r[5] | (r[6] << 8);
+
+		if (ms >= HU_SBX_LONG_MS)
+			chip->hu_display_to = !chip->hu_display;
+		else
+			chip->hu_sbx_press = true;
+		ae9_dbg(chip, "head unit: SBX button %u ms\n", ms);
+	}
 	if ((hu_debug || ae9_debug >= 2) && r[1] == 0xb1 && n >= 8 && r[4])
 		dev_info(chip->dev, "hu_debug: b1 item %u press %u ms\n",
 			 r[3], r[5] | (r[6] << 8));
@@ -3717,6 +3926,16 @@ static void creative_ae9_hu_label(struct creative_chip *chip)
 	spin_lock_irqsave(&chip->lock, flags);	/* debugfs "hutext" writes it */
 	strscpy(text, chip->hu_text, sizeof(text));
 	spin_unlock_irqrestore(&chip->lock, flags);
+	if (!text[0] && !chip->hu_display)
+		return;			/* off: Windows sends no text either */
+	if (!text[0] && chip->hu_ae9_hold) {
+		/* Windows sends no text while "AE-9" is held (its text
+		 * setter refuses too); then the output name, 10 polls */
+		if (time_before(jiffies, chip->hu_ae9_until))
+			return;
+		chip->hu_ae9_hold = false;
+		chip->hu_name_until = chip->hu_ticks + HU_SP_TICKS;
+	}
 	if (!text[0]) {			/* no "hutext" test text held */
 		if (chip->hu_ticks < chip->hu_name_until)
 			strscpy(text, chip->hu_output ? "-HP-" : "-SP-",
@@ -3786,6 +4005,20 @@ static void creative_ae9_ops_replay(struct creative_chip *chip,
  * that output's own volume. Windows also brackets the change with
  * f0 22 02 01 01 / 00 on the head unit, which is the SBX light (item 01):
  * it flashes, then ends off. The heartbeat puts the real state back.
+ *
+ * What each step does, measured on the card (2026-11-12, uv33-uv36: a tone
+ * in Direct Mode, the headphone jack and then the card's front RCA out
+ * looped into a USB interface, one step changed at a time):
+ *  - the head-unit frame f0 03 03 02 <40 on / 00 off> 40 f7 alone switches
+ *    the headphone jack (off: -30 -> -108 dBFS);
+ *  - DAC 48/1d bit 7 (ES9038 GPIO2) mutes the card's RCA out (-41 dB);
+ *    bit 6 (GPIO1) changed nothing on either output;
+ *  - no measurable change on either output (level, 2nd/3rd harmonic) from
+ *    48/0d or 48/19 (THD compensation), codec 1 pins 0x0b/0x0f/0x10,
+ *    GPIO pin 3 (0x300: high on speakers) or the ChipIO 0x0d map a1/a4
+ *    (map not tested in DSP mode). We still send them all, as Windows.
+ * No codec pin senses the head unit's jacks; only the head unit reports
+ * the 3.5 mm one.
  */
 /*
  * "Apply Headphones Virtualization to Line Out" (Sound Blaster Command;
@@ -3911,6 +4144,25 @@ static void creative_ae9_hu_light(struct creative_chip *chip, unsigned int on)
 	dev_info(chip->dev, "head unit: knob light %s\n", on ? "on" : "off");
 }
 
+/* Display off (8 spaces, then no text) or on (the current text at once);
+ * the knob light stays as it is (Windows: SBX held 5 s, FUN_0003f6xx). */
+static void creative_ae9_hu_display(struct creative_chip *chip, bool on)
+{
+	static const u8 blank[13] = { 0xf0, 0x11, 0x09, ' ', ' ', ' ', ' ',
+				      ' ', ' ', ' ', ' ', 0x00, 0xf7 };
+	u8 resp[24];
+
+	chip->hu_display = on;
+	chip->hu_ae9_hold = false;
+	if (on)
+		creative_ae9_hu_label(chip);
+	else
+		creative_spi_frame_win(chip, blank, sizeof(blank), resp, sizeof(resp));
+	if (chip->hu_disp_ctl)
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->hu_disp_ctl->id);
+	dev_info(chip->dev, "head unit: display %s\n", on ? "on" : "off");
+}
+
 /* Act on knob input and pending control changes: display first (feels
  * immediate), then the DAC volume commands (~20 ms each). Holds: under
  * 1 s mutes, 1.5-3 s switches speakers/headphones, 3 s or more toggles
@@ -3925,6 +4177,13 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 	if (chip->hu_sbx_press) {
 		chip->hu_sbx_press = false;
 		creative_ae9_fx_sbx_toggle(chip);
+	}
+	if (chip->hu_display_to >= 0) {
+		bool on = chip->hu_display_to;
+
+		chip->hu_display_to = -1;
+		if (on != chip->hu_display)
+			creative_ae9_hu_display(chip, on);
 	}
 	/* knob light, when it isn't what the head unit last got (after a
 	 * resume): sent from here, the heartbeat, so its frames can't
@@ -3983,6 +4242,10 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				 "headphone jack");
 		}
 	}
+	/* a knob turn or button press ends "AE-9" at once (Windows keeps
+	 * it; showing the change feels better) */
+	if (steps || press_ms >= 0)
+		chip->hu_ae9_hold = false;
 	if (press_ms >= 1500 && press_ms < 3000) {
 		creative_ae9_hu_switch(chip, !chip->hu_output);
 		press_ms = -1;
@@ -4032,9 +4295,83 @@ static void creative_ae9_hb_fast(struct creative_chip *chip)
 	if (n > 0)
 		steps += creative_ae9_hu_parse(chip, resp, min_t(int, n, sizeof(resp)), &press_ms);
 	n = creative_spi_frame_win(chip, q_btn, sizeof(q_btn), resp, sizeof(resp));
-	if (n > 0)
+	if (n > 0 && !chip->hu_unattached)
 		steps += creative_ae9_hu_parse(chip, resp, min_t(int, n, sizeof(resp)), &press_ms);
 	creative_ae9_hu_update(chip, steps, press_ms);
+}
+
+/*
+ * The head unit lost its setup: it powered up again (GPIO pin 5 dropped) or
+ * got the stop frame (uv55: both reset the 0x2000 marker to 0xaaaaaaaa; it
+ * keeps answering, status 0xd5 -> 0x85). Windows then sends its setup again
+ * (FUN_0003fe68, only when the marker reads 0xaaaaaaaa) and marks it
+ * attached. Ours: the same frames, built from the current state (uv56: the
+ * boot copy's "speakers" jack frame left headphones without their amp, status
+ * 0x95), "AE-9" with its hold, then the volume. Phantom power goes off, as at
+ * every start-up.
+ */
+#define HU_REATTACH_TRIES	3
+
+static bool hu_reattach = true;
+module_param(hu_reattach, bool, 0644);
+MODULE_PARM_DESC(hu_reattach, "Set the head unit up again when it powered up on its own (its 0x2000 marker reads 0xaaaaaaaa), as Windows (default on)");
+
+static void creative_ae9_hu_reattach(struct creative_chip *chip)
+{
+	const u8 mode = chip->hu_output && !chip->lo_virt_phys ? 0x40 : 0x00;
+	const struct { u8 len; u8 d[13]; } f[] = {
+		{ 8, { 0xf0, 0x54, 0x04, 0x41, 0x63, 0x6d, 0x31, 0xf7 } },	/* unlock */
+		{ 8, { 0xf0, 0x54, 0x04, 0x31, 0x6d, 0x63, 0x41, 0xf7 } },
+		{ 11, { 0xf0, 0x55, 0x07, 0x00, 0x20, 0x04, 0xde, 0xc0, 0xad, 0xde, 0xf7 } },
+		{ 8, { 0xf0, 0x54, 0x04, 0x11, 0x11, 0x11, 0x11, 0xf7 } },	/* relock */
+		{ 7, { 0xf0, 0x03, 0x03, 0x05, 0x03, 0x03, 0xf7 } },
+		{ 7, { 0xf0, 0x32, 0x03, 0x02, 0xb8, 0x0b, 0xf7 } },
+		{ 8, { 0xf0, 0x43, 0x04, 0x64, 0x00, 0xf4, 0x01, 0xf7 } },
+		{ 7, { 0xf0, 0x32, 0x03, 0x01, 0x88, 0x13, 0xf7 } },
+		{ 7, { 0xf0, 0x05, 0x03, 0x02, 0x01, 0x00, 0xf7 } },	/* phantom off */
+		{ 6, { 0xf0, 0x22, 0x02, 0x01, 0x00, 0xf7 } },		/* SBX light */
+		{ 6, { 0xf0, 0x22, 0x02, 0x02, chip->hu_light ? 1 : 0, 0xf7 } },
+		{ 7, { 0xf0, 0x03, 0x03, 0x02, mode, 0x40, 0xf7 } },	/* jack */
+		{ 13, { 0xf0, 0x11, 0x09, 'A', 'E', '-', '9', 0, 0, 0, 0, 0, 0xf7 } },
+	};
+	u8 resp[24];
+	int i, lost = 0;
+
+	if (chip->hu_reattach_try >= HU_REATTACH_TRIES)
+		return;		/* said so once; until the next bring-up */
+	if (++chip->hu_reattach_try == HU_REATTACH_TRIES) {
+		dev_warn(chip->dev, "head unit: still not set up after %u tries; leaving it until the next reload or sleep/wake\n",
+			 HU_REATTACH_TRIES - 1);
+		return;
+	}
+	/* the last frame is "AE-9": only with the display on (Windows) */
+	for (i = 0; i < ARRAY_SIZE(f) - !chip->hu_display; i++)
+		if (creative_spi_frame_win(chip, f[i].d, f[i].len, resp, sizeof(resp)) < 0)
+			lost++;
+	if (chip->hu_display)
+		creative_ae9_hu_ae9_hold(chip);
+	creative_ae9_hu_apply_volume(chip);
+	creative_spi_frame_win(chip, (const u8[]){ 0xf0, 0x21, 0x03, 0x02, 0x00, 0x00, 0xf7 },
+			       7, resp, sizeof(resp));
+	chip->hu_sbx_led = -1;		/* the poll sends it again */
+	chip->hu_light_sent = chip->hu_light;
+	chip->hu_phantom_req = -1;
+	chip->hu_status_valid = false;	/* the next status read is the new base */
+	chip->hu_reattaches++;
+	dev_info(chip->dev, "head unit: powered up again (marker 0xaaaaaaaa): setup sent again (%s, volume att 0x%02x%s, phantom power off%s)\n",
+		 chip->hu_output ? (chip->lo_virt_phys ? "headphones on the RCA out" : "headphones") : "speakers",
+		 chip->hu_att, chip->hu_mute ? ", muted" : "",
+		 lost ? ", some frames unanswered" : "");
+}
+
+/* the marker read's reply, complete: f0 d5 07 00 20 04 <4 bytes> f7 */
+static int creative_ae9_hu_marker(const u8 *r, int n)
+{
+	static const u8 head[6] = { 0xf0, 0xd5, 0x07, 0x00, 0x20, 0x04 };
+
+	if (n != 11 || memcmp(r, head, 6) || r[10] != 0xf7)
+		return -1;			/* not a clean reply: no verdict */
+	return r[6] == 0xaa && r[7] == 0xaa && r[8] == 0xaa && r[9] == 0xaa;
 }
 
 /* Windows' full poll cycle, then the display text. */
@@ -4052,11 +4389,29 @@ static void creative_ae9_hb_windows(struct creative_chip *chip)
 			continue;
 		}
 		n = min_t(int, n, sizeof(resp));
+		if (hu_poll[i].d[1] == 0xd5) {
+			int aa = creative_ae9_hu_marker(resp, n);
+
+			if (aa == 0)
+				chip->hu_reattach_try = 0;	/* attached */
+			/* given up or switched off: read the status as usual */
+			if (aa >= 0)
+				chip->hu_unattached = aa && hu_reattach &&
+					chip->hu_reattach_try < HU_REATTACH_TRIES;
+			continue;
+		}
+		/* its status bits while unattached aren't the jacks' */
+		if (chip->hu_unattached && resp[1] == 0x83)
+			continue;
 		steps += creative_ae9_hu_parse(chip, resp, n, &press_ms);
 	}
 	if (fails)
 		dev_info_ratelimited(chip->dev, "head unit: %d/%zu poll frames unanswered\n",
 				     fails, ARRAY_SIZE(hu_poll));
+	if (chip->hu_unattached && hu_reattach) {
+		creative_ae9_hu_reattach(chip);
+		chip->hu_unattached = false;	/* the next read says */
+	}
 	creative_ae9_hu_update(chip, steps, press_ms);
 	creative_ae9_hu_label(chip);
 	chip->hu_ticks++;
@@ -4089,6 +4444,9 @@ static int hu_vol_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	long v = clamp_t(long, uv->value.integer.value[0], 0, 254);
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (254 - v == chip->hu_att)
 		return 0;
 	chip->hu_att = 254 - v;
@@ -4108,6 +4466,9 @@ static int hu_mute_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int mute = !uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (mute == chip->hu_mute)
 		return 0;
@@ -4189,6 +4550,9 @@ static int mic_boost_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, mic_boost_max());
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (v == chip->mic_boost)
 		return 0;
@@ -4272,6 +4636,9 @@ static int mic_level_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, 99);
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (v == chip->mic_level)
 		return 0;
@@ -4359,6 +4726,9 @@ static int dac_filter_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = uv->value.enumerated.item[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (v >= ARRAY_SIZE(dac_filter_values))
 		return -EINVAL;
 	if (v == chip->dac_filter)
@@ -4400,6 +4770,9 @@ static int hu_out_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	unsigned int v = uv->value.enumerated.item[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (v > 1)
 		return -EINVAL;
 	if (v == chip->hu_output && chip->hu_switch_to < 0)
@@ -4414,6 +4787,42 @@ static const struct snd_kcontrol_new hu_out_control = {
 	.info = hu_out_info,
 	.get = hu_out_get,
 	.put = hu_out_put,
+};
+
+/* "Head Unit Display": the display on/off, as the SBX button's 5 s hold */
+static int hu_disp_get_cur(struct creative_chip *chip)
+{
+	return chip->hu_display_to >= 0 ? chip->hu_display_to : chip->hu_display;
+}
+
+static int hu_disp_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = hu_disp_get_cur(chip);
+	return 0;
+}
+
+static int hu_disp_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	int on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
+	if (on == hu_disp_get_cur(chip))
+		return 0;
+	chip->hu_display_to = on;	/* the heartbeat applies it */
+	return 1;
+}
+
+static const struct snd_kcontrol_new hu_disp_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Head Unit Display",
+	.info = snd_ctl_boolean_mono_info,
+	.get = hu_disp_get,
+	.put = hu_disp_put,
 };
 
 /* pending re-route for the heartbeat (head unit traffic runs only there) */
@@ -4434,6 +4843,9 @@ static int lo_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
 
 	if (on == chip->lo_virt)
 		return 0;
@@ -4486,6 +4898,9 @@ static int hu_phantom_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 	int on = !!uv->value.integer.value[0];
 	unsigned long flags;
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (!chip->hu_status_valid)
 		return -EAGAIN;
 	if (on == !(chip->hu_status & 0x01))
@@ -4530,6 +4945,9 @@ static int hu_auto_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (on == chip->hu_auto_hp)
 		return 0;
 	chip->hu_auto_hp = on;
@@ -4554,6 +4972,8 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_output = 0;		/* the boot replay selects speakers */
 	chip->hu_name_until = HU_SP_TICKS;
 	chip->hu_switch_to = -1;
+	chip->hu_display = true;
+	chip->hu_display_to = -1;
 	chip->hu_light = 1;
 	chip->hu_light_sent = 1;	/* the head unit starts lit */
 	chip->hu_sbx_led = -1;
@@ -4561,6 +4981,9 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_out_ctl = snd_ctl_new1(&hu_out_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_out_ctl) < 0)
 		chip->hu_out_ctl = NULL;
+	chip->hu_disp_ctl = snd_ctl_new1(&hu_disp_control, chip);
+	if (snd_ctl_add(chip->card, chip->hu_disp_ctl) < 0)
+		chip->hu_disp_ctl = NULL;
 	chip->hu_vol_ctl = snd_ctl_new1(&hu_controls[0], chip);
 	chip->hu_mute_ctl = snd_ctl_new1(&hu_controls[1], chip);
 	if (hu_master && chip->hu_vol_ctl && chip->hu_mute_ctl) {
@@ -4589,25 +5012,39 @@ static void creative_ae9_hb_work(struct work_struct *work)
 	struct creative_chip *chip =
 		container_of(work, struct creative_chip, hb_work.work);
 
+	if (chip->dsp_done && chip->hu_paused &&
+	    time_before(jiffies, chip->hu_pause_until)) {
+		queue_delayed_work(chip->wq, &chip->hb_work, msecs_to_jiffies(100));
+		return;
+	}
+	if (chip->hu_paused) {
+		chip->hu_paused = false;
+		dev_info(chip->dev, "head unit: poll resumed\n");
+	}
 	if (chip->dsp_done) {
 		if (chip->hu_dbg_len) {
-			u8 tx[16], rx[16];
+			u8 tx[48], rx[16];
 			unsigned long flags;
-			int k, n, j, o = 0;
-			char hex[16 * 3 + 1] = "";
+			int k, n, j, p, f, o, r = 0;
+			char hex[16 * 3 + 1];
 
 			spin_lock_irqsave(&chip->lock, flags);
 			k = chip->hu_dbg_len;
 			memcpy(tx, chip->hu_dbg_tx, k);
 			chip->hu_dbg_len = 0;
 			spin_unlock_irqrestore(&chip->lock, flags);
-			n = creative_spi_frame_win(chip, tx, k, rx, sizeof(rx));
-			for (j = 0; j < min(n, 16); j++)
-				o += scnprintf(hex + o, sizeof(hex) - o, " %02x", rx[j]);
-			dev_info(chip->dev, "huframe: sent %*ph, reply%s (%d)\n",
-				 k, tx, n > 0 ? hex : " none", n);
-			scnprintf(g_dbg_result, sizeof(g_dbg_result),
-				  "huframe reply:%s (%d)\n", n > 0 ? hex : " none", n);
+			/* the frames back to back, each after the previous reply */
+			for (p = 0; p < k; p += f) {
+				f = tx[p + 2] + 4;	/* checked when queued */
+				n = creative_spi_frame_win(chip, tx + p, f, rx, sizeof(rx));
+				hex[0] = '\0';
+				for (j = 0, o = 0; j < min(n, 16); j++)
+					o += scnprintf(hex + o, sizeof(hex) - o, " %02x", rx[j]);
+				dev_info(chip->dev, "huframe: sent %*ph, reply%s (%d)\n",
+					 f, tx + p, n > 0 ? hex : " none", n);
+				r += scnprintf(g_dbg_result + r, sizeof(g_dbg_result) - r,
+					       "huframe reply:%s (%d)\n", n > 0 ? hex : " none", n);
+			}
 		}
 		if (chip->hu_phantom_req >= 0) {
 			u8 tx[7] = { 0xf0, 0x05, 0x03, 0x02, 0x01, 0x00, 0xf7 };
@@ -4770,6 +5207,10 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 
 	creative_ae9_log_state(chip, "before bring-up");
 	chip->card_gone = false;
+	chip->card_hung = false;
+	chip->corb_to_run = 0;
+	chip->hu_unattached = false;
+	chip->hu_reattach_try = 0;
 	creative_ae9_bridge_log(chip, "before bring-up");
 
 	if (do_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {

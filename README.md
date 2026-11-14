@@ -9,7 +9,7 @@ a Windows VFIO MMIO capture. The goal is functionality the in-tree
 card LEDs, the ACM head unit (OLED display + volume knob + buttons), and PCM
 playback.
 
-> **Status (2026-11-12, v0.12.7):** stereo playback works on the card's RCA outputs
+> **Status (2026-11-14, v0.12.8):** stereo playback works on the card's RCA outputs
 > (speaker mode), clean on both channels, through ALSA and PipeWire.
 > Recording from the head unit's XLR or 3.5 mm input works, at 48 or 96 kHz, 24- or 32-bit (arecord, Audacity).
 > Optical S/PDIF works both ways: out is its own output (stereo, up
@@ -42,7 +42,9 @@ playback.
 > its presets, Scout Mode, Direct Mode, outputs, recording and the mixer,
 > all in one window. It's a solid stand-in for the Windows software that
 > ships with the card.
-> Driver v0.12.7 (mic monitor and Voice Clarity together, +30 dB Mic Gain,
+> Driver v0.12.8 (head unit: "AE-9" at start-up, re-attach, SBX
+> display toggle; card-stopped detection) pairs with SbAe9-SBC v0.20.0
+> and SbAe9-AudioMon v0.4.6; v0.12.7 (mic monitor and Voice Clarity together, +30 dB Mic Gain,
 > clean-mic example) pairs with SbAe9-SBC v0.19.0 and SbAe9-AudioMon v0.4.6;
 > v0.12.6 (What U Hear stall fixed, router clean-up) and v0.12.5
 > (restarts fixed for real, DSP queue resend) pair with SbAe9-SBC v0.18.0
@@ -140,7 +142,7 @@ needed) plus the boot setup, PipeWire profiles, `ae9-get-firmware` and
 (kernel 6.8) in containers.
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.7-1_all.deb
+sudo apt install ./creative-ae9-dkms_0.12.8-1_all.deb
 sudo apt install innoextract     # for ae9-get-firmware with Creative's installer
 ```
 
@@ -333,7 +335,13 @@ Reboot after setup. A full power-off (PSU off) is the safest first start.
   on: options snd-hda-codec-creative-ae9 hu_auto_switch=1
 - SBX button (head unit): turns SBX on/off, same as "SBX Switch", only
   with Direct Mode off (with Direct Mode on it does nothing). Its light is
-  on while the effects are running: Direct Mode off and SBX on.
+  on while the effects are running: Direct Mode off and SBX on. It acts
+  when you let go, as on Windows. Hold it 5 s or more to switch the head
+  unit's display off or back on (the knob light stays); the "Head Unit
+  Display" control does the same.
+- Display at start-up: "AE-9" for about 5 s, then "-SP-" or "-HP-", then
+  the volume, as on Windows. If the head unit loses power or its setup
+  while running, the driver sets it up again and the same sequence shows.
 - In PipeWire / KDE use the "Stereo Output + Stereo Input" profile: the
   desktop volume slider and mute drive the card (hardware volume), and the
   knob moves the slider and OSD. "Pro Audio" also plays, but uses software
@@ -889,6 +897,9 @@ what's left is tuning and diagnostics:
   +30 dB, the mic preamp's top step (Windows stops at +20 dB). It adds a
   clean 10 dB, but normal speech into a typical mic clips there: it's for
   quiet mics.
+- Head unit (0.12.8, writable at runtime): `hu_reattach` (1) set the head
+  unit up again when it loses its setup while running (its "set up" marker
+  reads as freshly powered), as Windows; 0 = leave it.
 - DSP output unmute (0.12.6, writable at runtime): `unmute_check` (1) read
   the unmute back after effect changes and resend it (up to 10 times), as
   Windows; `pcm_unmute` (1) unmute at every DSP-mode playback start and

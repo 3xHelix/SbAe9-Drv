@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.7"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.8"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -143,6 +143,9 @@ struct creative_chip {
 	bool			unsol_parked;	/* corb_free switched unsolicited responses off */
 	bool			card_gone;	/* dropped off the bus: registers and
 						 * config space read all-ones */
+	bool			card_hung;	/* on the bus, but the codecs stopped
+						 * answering commands (corb.c) */
+	unsigned int		corb_to_run;	/* verb timeouts in a row */
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
 	bool			rings_deferred;	/* start CORB/RIRB after the firmware
 						 * stream (fw_rings_off=1) */
@@ -322,6 +325,7 @@ struct creative_chip {
 	unsigned int		spk_follow_ch;	/* channels of the prepared playback */
 	unsigned long		hp_last;	/* jiffies of the last profile upload */
 	unsigned int		corb_timeouts;	/* verb timeouts so far (corb.c) */
+	u32			hung_verb;	/* the verb that made card_hung */
 	unsigned int		hp_tries;	/* failed uploads in a row */
 	unsigned int		hp_leaks;	/* DSP DMA channels we couldn't free (this bring-up) */
 	bool			scp_fail_logged;	/* first failed DSP message logged (this bring-up) */
@@ -400,8 +404,10 @@ struct creative_chip {
 	unsigned int		hu_att_out[2];	/* remembered volume per output */
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
 	char			hu_text[9];	/* debugfs "hutext": held display text */
-	u8			hu_dbg_tx[16];	/* debugfs "huframe": frame for the heartbeat to send */
-	int			hu_dbg_len;	/* its length, 0 = none pending */
+	u8			hu_dbg_tx[48];	/* debugfs "huframe": frame(s) for the heartbeat to send, back to back */
+	int			hu_dbg_len;	/* their total length, 0 = none pending */
+	bool			hu_paused;	/* debugfs hupause: no head-unit poll */
+	unsigned long		hu_pause_until;	/* (jiffies) and no GPIO 0x320 write */
 	int			hu_phantom_req;	/* phantom power to send: 0/1, -1 = none */
 	unsigned long		hu_phantom_hold; /* "on" requests ignored until (jiffies) */
 	int			hu_switch_to;	/* pending output switch, -1 none */
@@ -412,6 +418,9 @@ struct creative_chip {
 	int			hu_light_sent;	/* knob light as last sent, -1 unknown */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
 	bool			hu_sbx_press;	/* SBX button press to act on */
+	bool			hu_display;	/* display on (SBX 5 s hold toggles) */
+	int			hu_display_to;	/* pending display on/off, -1 none */
+	struct snd_kcontrol	*hu_disp_ctl;
 	bool			hu_st07_valid;
 	u8			hu_st07;	/* 83 01 07 reply byte, logged on change */
 	struct snd_kcontrol	*hu_out_ctl;
@@ -423,6 +432,11 @@ struct creative_chip {
 	/* 83 01 02 status byte without bit 7 (knob button), for the plug
 	 * log. Logged only; output switching stays manual. */
 	bool			hu_status_valid;
+	bool			hu_ae9_hold;	/* "AE-9" on the display: no text until */
+	unsigned long		hu_ae9_until;	/* (jiffies), as Windows' AE-9 hold */
+	bool			hu_unattached;	/* 0x2000 marker read 0xaaaaaaaa */
+	unsigned int		hu_reattach_try; /* setup resends in a row */
+	unsigned int		hu_reattaches;	/* setup resends since load */
 	u8			hu_status;
 	struct snd_kcontrol	*hu_plug_ctl[3];	/* phones, mic, phantom (read-only) */
 	/* opt-in auto switch on the 3.5 mm headphone plug: a plug change waits
@@ -442,11 +456,19 @@ struct creative_chip {
  * machine froze. Checked where a timeout or an all-ones read suggests it;
  * once set, every command path returns -ENODEV straight away.
  */
+/* For control writes: the card dropped off the bus or stopped answering
+ * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing
+ * a setting that never reaches it. */
+static inline bool creative_ae9_dead(const struct creative_chip *chip)
+{
+	return chip->card_gone || chip->card_hung;
+}
+
 static inline bool creative_ae9_gone(struct creative_chip *chip, const char *where)
 {
 	u16 vid = 0;
 
-	if (chip->card_gone)
+	if (chip->card_gone || chip->card_hung)
 		return true;
 	if (readl(chip->hda_regs + 0x08) != 0xffffffff)	/* GCTL */
 		return false;

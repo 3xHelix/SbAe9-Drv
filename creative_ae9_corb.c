@@ -413,6 +413,34 @@ void creative_ae9_corb_scan_unsol(struct creative_chip *chip)
 	mutex_unlock(&chip->corb_mutex);
 }
 
+/*
+ * A card that stays on the bus but whose codecs stop answering (2026-11-13,
+ * 13:29:45, rapid SBX on/off: one timeout, then the card wrote outside its
+ * buffers and never answered again). The driver went on sending: 1420
+ * timeouts, each 100 ms plus a ring reset, and 2 s DSP waits, for 4 minutes
+ * until a reload; only the reload's bus reset brought the card back.
+ * A healthy card has single timeouts (two that evening, each answered at
+ * the next verb), so CARD_HUNG_RUN in a row on a running card (after the
+ * bring-up, which has its own retries) means it has stopped: say so once and
+ * fail every command at once until the next bring-up (reload, resume).
+ */
+#define CARD_HUNG_RUN	8
+
+static unsigned int hung_inject;
+module_param(hung_inject, uint, 0644);
+MODULE_PARM_DESC(hung_inject, "Test (needs debug=1): the next N commands after start-up count as timed out without being sent, to exercise the 'card stopped answering' stop (counts down to 0)");
+
+static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
+{
+	if (!chip->dsp_done || chip->card_hung ||
+	    ++chip->corb_to_run < CARD_HUNG_RUN)
+		return;
+	chip->card_hung = true;
+	chip->hung_verb = verb;
+	dev_err(chip->dev, "card stopped answering: %u command timeouts in a row (last verb 0x%08x, %u in all); no more commands until the driver is reloaded (sudo modprobe -r snd-hda-codec-creative-ae9 && sudo modprobe snd-hda-codec-creative-ae9) or the PC is powered off\n",
+		chip->corb_to_run, verb, chip->corb_timeouts);
+}
+
 /* ------------------------------------------------------------------ */
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp)
@@ -426,12 +454,20 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	 * Without this, concurrent callers (ACM heartbeat, PCM prepare,
 	 * select_lineout) interleave verbs and lose responses.
 	 */
-	if (chip->card_gone)
+	if (chip->card_gone || chip->card_hung)
 		return -ENODEV;
 	mutex_lock(&chip->corb_mutex);
 	if (!chip->corb_buf || !chip->rirb_buf) {	/* rings parked (suspend) */
 		mutex_unlock(&chip->corb_mutex);
 		return -ENODEV;
+	}
+	if (hung_inject && ae9_debug && chip->dsp_done) {
+		hung_inject--;
+		dev_err(chip->dev, "CORB verb response timeout (verb=0x%08x, injected)\n", verb);
+		chip->corb_timeouts++;
+		ae9_corb_hung_check(chip, verb);
+		mutex_unlock(&chip->corb_mutex);
+		return -ETIMEDOUT;
 	}
 
 	/* Drain any pre-existing RIRB entries by reading current WP. Count
@@ -500,6 +536,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
 	chip->corb_timeouts++;
+	ae9_corb_hung_check(chip, verb);
 
 	/*
 	 * Recover the command ring after a timeout, the HD-Audio spec way.
@@ -562,6 +599,8 @@ got_response:
 		if (resp)
 			*resp = r;
 	}
+
+	chip->corb_to_run = 0;
 
 	/* Update RIRB read pointer to acknowledge consumption */
 	chip->rirb_rp = wp;
