@@ -383,7 +383,7 @@ static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
  * controller can advance RIRBWP before the entry it points at is in
  * memory; read at once, the slot still holds what was written there one
  * lap (256 entries) earlier. Linux has worked around the same thing on
- * Creative controllers since 2009 (commit 14d34f16, "Add some workarounds
+ * Creative X-Fi controllers since 2010 (commit 14d34f16, "Add some workarounds
  * for Creative IBG": 80 us before every RIRB read; now under
  * AZX_DCAPS_CTX_WORKAROUND).
  * What it did here: a stale DSP notice (0x02c00001) read in place of an

@@ -21,7 +21,7 @@ PR #2 and PR #3 commits.
   until `ae9-reload`. The same early reads lost the occasional DSP reply
   (harmless, it was asked again). The driver now waits for the answer to
   land (a few microseconds), as Linux has done for Creative's sound
-  chips since 2009. On the card, 150 SBX toggles while recording all four
+  chips since 2010. On the card, 150 SBX toggles while recording all four
   inputs: 1282 answers caught landing late, 0 errors, 0 lost replies,
   where before every run had lost replies and the old code hung the card
   in 1 of 3 runs like it. Found with a full command trace of a hang.

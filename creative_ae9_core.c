@@ -963,16 +963,36 @@ static void ae9_rt_write_checked(struct creative_chip *chip, u32 a, u32 want,
 		 a, want, got);
 }
 
+/*
+ * A slot we may take: empty (0), or a DSP-mode output route that is off
+ * (src 0xc0-0xdf, dst 0x40-0x7f, active bits clear). Every switch-off
+ * here writes the entry with its active bits cleared (v & 0xffff), never
+ * 0, and only "0" counted as free: each route moved to a free slot used one
+ * up for good, and the router keeps its table until a power-off. After a
+ * few rate/Direct Mode switches with the mic running there was none left:
+ * "NOT routed (no free slot)", speakers silent in DSP mode (uv80,
+ * 2026-11-15: control C6-C8 and M4, 12 of 12 refusals). An off DSP -> DAC
+ * route is only ever ours or the 8051's own DSP-mode leftover, and DSP
+ * mode is ours.
+ */
+static bool ae9_rt_slot_free(u32 v)
+{
+	u8 src = v & 0xff, dst = (v >> 8) & 0xff;
+
+	return !v || (!((v >> 16) & 3) && (src & 0xe0) == 0xc0 &&
+		      dst >= 0x40 && dst < 0x80);
+}
+
 static int ae9_rt_free_slot(const u32 *e, int near)
 {
 	unsigned int i;
 
-	if (near > 0 && !e[near - 1])
+	if (near > 0 && ae9_rt_slot_free(e[near - 1]))
 		return near - 1;
-	if (near >= 0 && near + 1 < AE9_RT_ENTRIES && !e[near + 1])
+	if (near >= 0 && near + 1 < AE9_RT_ENTRIES && ae9_rt_slot_free(e[near + 1]))
 		return near + 1;
 	for (i = 0x0c; i < AE9_RT_ENTRIES; i++)	/* past 0x190030 */
-		if (!e[i] && 0x190000 + 4 * i != AE9_RT_FRONT_L &&
+		if (ae9_rt_slot_free(e[i]) && 0x190000 + 4 * i != AE9_RT_FRONT_L &&
 		    0x190000 + 4 * i != AE9_RT_FRONT_R)
 			return i;
 	return -1;
@@ -986,8 +1006,36 @@ static int ae9_rt_free_slot(const u32 *e, int near)
  * capture port (dst < 0x20; in every dump and capture its source is an
  * SRC or a DSP output, and Windows never writes one) is left alone: our
  * route goes to a free slot instead, unless it is already on elsewhere.
+ * So is the mic's feed one step earlier, a DSP output into a router SRC
+ * (cc/cd/ce/cf -> 90/80, then 90/80 -> HDA capture 00/01): playback never
+ * routes DSP -> SRC. After a 192 kHz stream the 8051 sometimes gives the
+ * running mic slots 0x18-0x1d and the playback link 0x24 on: DSP mode on
+ * then wrote c0/c1 -> 40/41 over the mic's cc -> 90 / cd -> 80 (the mic at
+ * ~2x pitch, its channels a sample apart: the "chipmunk" Discord mic),
+ * and the next mic start put its feeds back over ours (speakers silent in
+ * DSP mode). uv79c/d, 2026-11-15: 2 of 3 trips after 192 kHz, slot list
+ * head 0x24 in every bad one, 0x18 in every good one.
+ * And the playback's own input: a stream started at 96 kHz in DSP mode
+ * gets the host slots wired straight into the DSP (00..0b -> c0..cb) from
+ * the slot list head on; with the head at 0x18 our c0/c1 -> 40/41 went over
+ * its 00 -> c0 / 01 -> c1 and the DSP got no input: silent until Direct
+ * Mode or 48 kHz (soak, 2026-11-15 16:18 and 16:19: head 0x18, 0x190068/6c
+ * = 02 -> c2 / 03 -> c3 left of it; the same switch with head 0x24 played).
+ * So the rule is the other way round: our fixed slots may only replace a
+ * DAC feed (dst 0x40-0x7f: the Direct Mode routes, an old DSP-mode one) or
+ * an idle DSP output (dst 0xff); any other active route belongs to a live
+ * connection (capture, SRC, DSP input) and is left alone.
  * e[] must hold the n entries read; a relocation needs the full scan.
  */
+static bool ae9_rt_in_use(u32 v)
+{
+	u8 dst = (v >> 8) & 0xff;
+
+	if (!((v >> 16) & 3))
+		return false;		/* inactive */
+	return !(dst >= 0x40 && dst < 0x80) && dst != 0xff;
+}
+
 static void ae9_rt_moved_add(struct creative_chip *chip, unsigned int slot)
 {
 	unsigned int k;
@@ -1007,7 +1055,7 @@ static int ae9_rt_put(struct creative_chip *chip, u32 *e, unsigned int n,
 	unsigned int i = (a - 0x190000) / 4, j;
 	int at = -1;
 
-	if (i >= n || !((e[i] >> 16) & 3) || ((e[i] >> 8) & 0xff) >= 0x20) {
+	if (i >= n || !ae9_rt_in_use(e[i])) {
 		ae9_rt_write_checked(chip, a, want, unsteady, retried, failed);
 		if (i < n)
 			e[i] = want;
@@ -1018,7 +1066,7 @@ static int ae9_rt_put(struct creative_chip *chip, u32 *e, unsigned int n,
 			break;
 	if (j == n && n == AE9_RT_ENTRIES)
 		at = ae9_rt_free_slot(e, -1);
-	dev_info(chip->dev, "SBX: router: 0x%06x is a recording route (0x%05x), left alone; 0x%04x %s\n",
+	dev_info(chip->dev, "SBX: router: 0x%06x is in use (0x%05x), left alone; 0x%04x %s\n",
 		 a, e[i], want & 0xffff, j < n ? "already on elsewhere" :
 		 at < 0 ? "NOT routed (no free slot)" : "goes to a free slot");
 	/* either way the route now sits outside our fixed slots: remember
@@ -3581,7 +3629,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	 * gated, metallic audio until a power-off clears the router. */
 	{
 		u8 cnt[0x40] = { 0 };
-		unsigned int unsteady = 0, bad = 0, feeds = 0, nsrc = 0;
+		unsigned int unsteady = 0, bad = 0, feeds = 0, nsrc = 0, nfree = 0;
 		u16 srcs[16];
 
 		seq_puts(m, "\nDAC port feeds:");
@@ -3596,6 +3644,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			}
 			src = val & 0xff;
 			dst = (val >> 8) & 0xff;
+			if (i >= 0x0c && ae9_rt_slot_free(val))
+				nfree++;
 			if (!((val >> 16) & 3))
 				continue;
 			/* a host slot into a router SRC twice (Windows' Direct
@@ -3632,6 +3682,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		if (!feeds)
 			seq_puts(m, " none");
 		seq_puts(m, bad ? "  STALE: a port has two feeds, a route is on twice, or a DSP feed in Direct Mode (power-off clears it)" : "  ok");
+		seq_printf(m, "\nrouter free slots (for moved DSP-mode routes): %u", nfree);
 	}
 
 	/* codec 1 node 0x15 GET 0xf0f: bit N = ChipIO control flag N
