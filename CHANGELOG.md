@@ -3,10 +3,45 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
-## 0.12.10 (unreleased)
+## 0.12.10 (2026-11-15)
+No more hangs, and profiles on the fly. 🍁
 
-Thanks to arkhodakov (the report behind the source-install fix).
+Pairs with [SbAe9-SBC v0.21.1](https://github.com/3xHelix/SbAe9-SBC) (the Headphone Profile tip and the encoder notes say a new profile loads while audio plays, when the driver does) and [SbAe9-AudioMon v0.4.7](https://github.com/3xHelix/SbAe9-AudioMon) (unchanged).
 
+Thanks to arkhodakov (the report behind the source-install fix), and to
+DarkNikGr and arkhodakov, now listed as contributors with their original
+PR #2 and PR #3 commits.
+
+- **Fixed: the card could stop answering after effect changes in DSP mode**
+  (SBX on/off and the like), most often while recording. The card's
+  controller sometimes reports a new answer a few microseconds before the
+  answer is actually in memory, and the driver read it too early: it got
+  an old entry instead, waited 100 ms for an answer that had already
+  arrived, then reset its command ring, which sometimes left the card dead
+  until `ae9-reload`. The same early reads lost the occasional DSP reply
+  (harmless, it was asked again). The driver now waits for the answer to
+  land (a few microseconds), as Linux has done for Creative's sound
+  chips since 2009. On the card, 150 SBX toggles while recording all four
+  inputs: 1282 answers caught landing late, 0 errors, 0 lost replies,
+  where before every run had lost replies and the old code hung the card
+  in 1 of 3 runs like it. Found with a full command trace of a hang.
+- **Headphone profiles now load while audio plays**, as on Windows. Before,
+  a newly picked profile waited until every playback and recording had
+  stopped, because uploading during playback used to break the DSP; that
+  turned out to be the same early-read problem fixed above. On the card,
+  160 profile changes with music playing, with all four inputs recording
+  and with EQ toggled after each: every one loaded and checked out, no
+  errors. Expect a small click as the profile switches (Windows does the
+  same). `hp_live_upload=0` brings back the wait.
+- **The card stopping answering now also stops its audio streams.** A
+  crashed card's recording engines kept writing to memory addresses it
+  made up (the IOMMU blocked them, so no harm done, but the log filled
+  with `IO_PAGE_FAULT`s). Now every running stream's DMA is stopped at
+  once, and every open stream ends with "No such device", so players,
+  PipeWire and AudioMon stop cleanly instead of waiting on a frozen
+  stream; `ae9-reload` brings it all back. Every stream stop also waits
+  until the card confirms its DMA has stopped, as the HD-Audio spec asks.
+  New diagnostic option `dma_trace` logs each stream's buffer addresses.
 - **Fixed: a source/DKMS install didn't load the driver early at boot.**
   `scripts/dkms-install.sh` (and the README's file list) left out
   `ae9-modules-load.conf`, which every package installs, so the driver
@@ -14,6 +49,20 @@ Thanks to arkhodakov (the report behind the source-install fix).
   half of cold boots. The script now installs
   `/etc/modules-load.d/creative-ae9.conf` (an existing one is left alone;
   `--remove` takes it out while it's still ours), and `--check` shows it.
+- Docs: measured on the card (uv53) and corrected in the decoded tables
+  and the in-tree notes: the second DAC's volume registers 2/3 drive the
+  Rear jack and 4/5 the Center/Sub jack (the labels had them swapped; the
+  driver sets all four alike, so nothing changes in use); its registers
+  0/1/6/7 reach neither jack; the head unit's status bits read the
+  Headphone Impedance Selector switch (IEM / N / High), now in USING.md.
+  From a PSU-cold read (uv68): the 8051 code patch Windows writes at
+  start-up is already in the card's program memory at power-up (a no-op
+  on the AE-9), and GPIO pin 0 low cuts both DACs off the I2C bus.
+- Docs: the README is now a short front page (what works, install,
+  firmware, using it, help); the details moved to `docs/`: USING.md (every
+  feature), TROUBLESHOOTING.md (quick fixes, reports, known issues),
+  INSTALL-FROM-SOURCE.md, OPTIONS.md (module options) and DEVELOPING.md.
+  The packages install them with the README.
 
 ## 0.12.9 (2026-11-14)
 One command to bring it back. 🔁

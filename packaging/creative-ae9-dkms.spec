@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.9
+Version:        0.12.10
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -92,7 +92,7 @@ udevadm control --reload >/dev/null 2>&1 || :
 
 %files
 %license COPYING
-%doc README.md CHANGELOG.md
+%doc README.md CHANGELOG.md docs
 /usr/src/%{modname}-%{version}/
 /usr/lib/udev/rules.d/00-ae9-override.rules
 /usr/lib/udev/rules.d/89-ae9-pipewire.rules
@@ -120,6 +120,13 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.10-1
+- Driver 0.12.10: no more card hangs after effect changes in DSP mode
+  (answers were read before they reached memory, the Creative controller
+  quirk Linux works around too), headphone profiles load while audio
+  plays, a stopped card stops its streams cleanly, source installs load
+  the driver early at boot
+
 * Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
 - Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
   ae9-reload command (reload the driver in one go), "Card Answering"

@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.9"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.10"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -147,6 +147,7 @@ struct creative_chip {
 	bool			unsol_parked;	/* corb_free switched unsolicited responses off */
 	bool			card_gone;	/* dropped off the bus: registers and
 						 * config space read all-ones */
+	bool			dma_dumped;	/* stream DMA dumped at the first command timeout */
 	bool			card_hung;	/* on the bus, but the codecs stopped
 						 * answering commands (corb.c) */
 	unsigned int		corb_to_run;	/* verb timeouts in a row */
@@ -185,6 +186,9 @@ struct creative_chip {
 
 	/* PCM playback stream */
 	struct snd_pcm		*pcm;
+	struct snd_pcm		*pcms[6];	/* every PCM device (dead_work) */
+	unsigned int		npcms;
+	struct work_struct	dead_work;	/* PCMs to DISCONNECTED at a hang */
 	struct snd_pcm_substream *substream;
 	void			*playback_buf;	/* DMA audio buffer */
 	dma_addr_t		playback_dma;
@@ -356,6 +360,9 @@ struct creative_chip {
 	unsigned int		scp_full_words;	/* DSP words answered "command queue full" */
 	unsigned int		unmute_resends;	/* DSP output unmutes resent: read back still muted (or the read failed) */
 	unsigned int		unmute_stuck;	/* times it stayed muted after 10 unmutes */
+	unsigned int		rirb_late;	/* RIRB entries read again: RIRBWP was ahead of the entry in memory */
+	unsigned int		rirb_late_max_us;	/* the longest wait for one */
+	unsigned int		rirb_never;	/* entries that hadn't landed after RIRB_LATE_US */
 	/* post-boot head-unit replay: frame count, frames without reply and
 	 * the first ones (frame number from 1, the two bytes after the f0
 	 * start byte), for debugfs */
@@ -462,6 +469,9 @@ struct creative_chip {
  * once set, every command path returns -ENODEV straight away.
  */
 void creative_ae9_dead_notify(struct creative_chip *chip);
+void creative_ae9_dma_dump(struct creative_chip *chip, const char *why);
+void creative_ae9_dma_quiesce(struct creative_chip *chip);
+void creative_ae9_dead_work(struct work_struct *w);
 
 /* For control writes: the card dropped off the bus or stopped answering
  * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing

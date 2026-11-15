@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.9
+Version:        0.12.10
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,13 @@ done
 %{?akmod_install}
 
 %changelog
+* Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.10-1
+- Driver 0.12.10: no more card hangs after effect changes in DSP mode
+  (answers were read before they reached memory, the Creative controller
+  quirk Linux works around too), headphone profiles load while audio
+  plays, a stopped card stops its streams cleanly, source installs load
+  the driver early at boot
+
 * Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
 - Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
   ae9-reload command (reload the driver in one go), "Card Answering"

@@ -20,7 +20,7 @@
 # sets it, and reopens the output once: a short gap, like a pause.
 #
 #   scripts/ae9-headroom.sh          run in the foreground (Ctrl-C stops)
-#   config/ae9-headroom.service      the user service; see the README
+#   config/ae9-headroom.service      the user service; see docs/USING.md, "Low latency"
 set -u
 HW=/proc/asound/AE9/pcm0p/sub0/hw_params
 TABLE=${AE9_HEADROOM:-48000:64 96000:96 192000:144 384000:256}

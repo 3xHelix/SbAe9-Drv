@@ -417,9 +417,19 @@ static unsigned int fx_spk_cfg = 2;
 module_param(fx_spk_cfg, uint, 0444);
 MODULE_PARM_DESC(fx_spk_cfg, "Speaker Config at load, Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows)");
 
-static bool hp_live_upload;
+/*
+ * Live uploads, as Windows (21 uploads in 13 captures with playback, most
+ * also with captures running; nothing paused or muted). Ours broke the DSP
+ * while audio played (2026-11-08, note 54; Kaiba 0.10.1, note 55): every
+ * one of those deaths followed a lost reply or a command timeout and ring
+ * reset, i.e. the stale RIRB reads fixed in 0.12.10 (corb.c rirb_take).
+ * uv77 (2026-11-15, x2): 160 live uploads with music, with all four
+ * captures and with EQ toggled after each: all done, Y read-back 9/9,
+ * 0 lost replies, 0 timeouts, 0 DMA channel leaks.
+ */
+static bool hp_live_upload = true;
 module_param(hp_live_upload, bool, 0644);
-MODULE_PARM_DESC(hp_live_upload, "Upload headphone profiles while audio streams run (default off: the upload waits until every stream has stopped; uploads during playback lost DSP replies and broke the DSP until a power-off)");
+MODULE_PARM_DESC(hp_live_upload, "Upload headphone profiles while audio streams run, as Windows (default on; 0 = wait until every stream has stopped, as before 0.12.10)");
 
 static bool eq_headroom = true;
 module_param(eq_headroom, bool, 0644);
@@ -579,8 +589,9 @@ enum hp_sync { HP_IDLE, HP_WAIT, HP_LOADED, HP_RETRY, HP_BLOCKED };
 /*
  * Uploads that lost a reply or landed wrong broke the DSP until a
  * power-off (our crash 2026-11-08, note 54; Kaiba's 0.10.1 report, note
- * 55): most went wrong while audio played. So an upload waits until every
- * stream has stopped (hp_live_upload=1 skips the wait), and one that
+ * 55): most went wrong while audio played (stale RIRB reads, fixed in
+ * 0.12.10). hp_live_upload=0 makes an upload wait until every stream has
+ * stopped; with or without it, one that
  * failed after the DSP's DMA was armed, or after 2 channels went missing,
  * stops uploads until the next bring-up.
  */

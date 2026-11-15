@@ -1828,7 +1828,8 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	unsigned int port, rl, i, t, seen, match = 0, unread = 0;
 	bool rb_bad = false, leak = false;
 	u32 lpib = 0, matched = 0;
-	unsigned int run_ms = 0;
+	unsigned int run_ms = 0, late0 = chip->rirb_late;
+	u32 live = creative_ae9_streams_running(chip);	/* for the result line */
 	int ret;
 
 	if (!chip->dsp_done || chip->card_gone)
@@ -1987,6 +1988,15 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 		ret = -EREMOTEIO;
 		goto free_port;
 	}
+	/* our transfer stream must be idle (no PCM uses SD5 today; Windows
+	 * takes the lowest free output SD) */
+	if (readl(chip->hda_regs + HPEQ_SD + AZX_REG_SD_CTL) & SD_CTL_DMA_START) {
+		dev_warn(chip->dev, "headphone profile: stream descriptor 0x%x already running; not sending\n",
+			 HPEQ_SD);
+		leak = !hpeq_disarm(chip, chan);
+		ret = -EBUSY;
+		goto free_port;
+	}
 	xfer_stream_run(chip, HPEQ_SD, HPEQ_TAG, bdl_dma);
 	/*
 	 * Wait for our channel's start bit to come on, then to go off. 4 KB
@@ -2105,13 +2115,14 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	}
 	/* "still running" only when the last valid read had our bit on; the
 	 * extra fields pin down cut or stalled transfers (notes 60/61) */
-	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u; busy 0x%x, %u bad reads, %u verb timeout(s), stream at %u bytes after %u ms)\n",
+	dev_info(chip->dev, "headphone profile %s: %u words to Y 0x%x, chan %u, port 0x%x, %s after %u polls (first 0x%x, last 0x%x, channel on for %u; busy 0x%x, %u bad reads, %u verb timeout(s), stream at %u bytes after %u ms; streams running 0x%x, %u late RIRB entries)\n",
 		 name, HPEQ_WORDS, addr, chan, port,
 		 !ret ? "done" : rb_bad ? "FAILED (read-back differs)" :
 		 (v & BIT(chan)) ? "FAILED (still running)" :
 		 seen ? "FAILED (channel seen, end not confirmed)" :
 		 "FAILED (channel never started)",
-		 t, v0, v, seen, busy, bad, chip->corb_timeouts - to0, lpib, run_ms);
+		 t, v0, v, seen, busy, bad, chip->corb_timeouts - to0, lpib, run_ms,
+		 live, chip->rirb_late - late0);
 free_port:
 	if (!leak)
 		dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);

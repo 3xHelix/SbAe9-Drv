@@ -61,6 +61,7 @@ for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.
 done
 install -d "$R/usr/share/doc/$PKG"
 install -m 644 "$SRC/README.md" "$R/usr/share/doc/$PKG/"
+cp -r "$SRC/docs" "$R/usr/share/doc/$PKG/"
 install -m 644 "$SRC/CHANGELOG.md" "$R/usr/share/doc/$PKG/changelog"
 gzip -9n "$R/usr/share/doc/$PKG/changelog"
 # Debian's own changelog for the package (one entry per build)

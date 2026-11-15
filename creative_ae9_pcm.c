@@ -75,6 +75,173 @@ static unsigned int pcm_posbuf;
 module_param(pcm_posbuf, uint, 0644);
 MODULE_PARM_DESC(pcm_posbuf, "DMA position buffer: 0 off (default), 1 log how far the DMA reads ahead of LPIB");
 
+/*
+ * dma_trace=1: log every stream's buffer and BDL address at prepare, for
+ * matching an IOMMU IO_PAGE_FAULT address to a stream (the 2026-11-13
+ * rapid-SBX hang: 8-byte writes to an unmapped address ~70 ms after the
+ * first command timeout). The stop check and the dump below run always.
+ */
+static unsigned int dma_trace;
+module_param(dma_trace, uint, 0644);
+MODULE_PARM_DESC(dma_trace, "Log stream buffer/BDL DMA addresses at prepare (1=yes; diagnostic)");
+
+/* HD-Audio spec 3.3.35: after RUN is cleared, the DMA engine has stopped
+ * only once RUN reads back 0. Wait up to 1 ms; log a stream that doesn't */
+static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, const char *why)
+{
+	u32 c = 0;
+	int t;
+
+	for (t = 0; t < 100; t++) {
+		c = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		if (c == 0xffffffff)
+			break;
+		if (!(c & SD_CTL_DMA_START)) {
+			if (dma_trace && t)
+				dev_info(chip->dev, "dma: SD 0x%03x stopped after ~%d us (%s)\n",
+					 base, t * 10, why);
+			return true;
+		}
+		udelay(10);
+	}
+	dev_err(chip->dev, "dma: SD 0x%03x still running %s (ctl 0x%08x lpib 0x%x bdl 0x%08x)\n",
+		base, why, c, readl(chip->hda_regs + base + AZX_REG_SD_LPIB),
+		readl(chip->hda_regs + base + AZX_REG_SD_BDLPL));
+	return false;
+}
+
+static void ae9_dma_trace_prep(struct creative_chip *chip, const char *what, unsigned int base,
+			       struct snd_pcm_substream *substream, dma_addr_t bdl)
+{
+	struct snd_pcm_runtime *rt = substream->runtime;
+	size_t n = snd_pcm_lib_buffer_bytes(substream);
+
+	if (!dma_trace)
+		return;
+	dev_info(chip->dev, "dma: %s SD 0x%03x buffer 0x%llx-0x%llx (%zu bytes, %u ch, %u Hz), BDL 0x%llx\n",
+		 what, base, (unsigned long long)rt->dma_addr,
+		 (unsigned long long)rt->dma_addr + n - 1, n, rt->channels, rt->rate,
+		 (unsigned long long)bdl);
+}
+
+static void ae9_dma_dump_bdl(struct creative_chip *chip, const char *name, void *bdl, dma_addr_t dma)
+{
+	if (!bdl)
+		return;
+	dev_err(chip->dev, "dma dump: %s BDL 0x%llx: entry 0 0x%llx+%u, entry 1 0x%llx+%u\n",
+		name, (unsigned long long)ALIGN(dma, 128),
+		(unsigned long long)le64_to_cpu(*(__le64 *)bdl), le32_to_cpu(*(__le32 *)(bdl + 8)),
+		(unsigned long long)le64_to_cpu(*(__le64 *)(bdl + 16)), le32_to_cpu(*(__le32 *)(bdl + 24)));
+}
+
+/* every stream descriptor that runs or has a BDL, and the BDLs we hold:
+ * called at the first command timeout and when the card is marked hung */
+void creative_ae9_dma_dump(struct creative_chip *chip, const char *why)
+{
+	u16 g = readw(chip->hda_regs + AZX_REG_GCAP);
+	unsigned int n, i;
+	static const char * const xname[3] = { "optical in", "What U Hear", "rear RCA in" };
+
+	if (g == 0xffff) {
+		dev_err(chip->dev, "dma dump (%s): the controller reads all ones\n", why);
+		return;
+	}
+	n = ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f);
+	dev_err(chip->dev, "dma dump (%s): GCAP 0x%04x, %u streams, DPLBASE 0x%08x, INTCTL 0x%08x, CORB 0x%llx, RIRB 0x%llx\n",
+		why, g, n, readl(chip->hda_regs + AZX_REG_DPLBASE),
+		readl(chip->hda_regs + AZX_REG_INTCTL),
+		(unsigned long long)chip->corb_dma, (unsigned long long)chip->rirb_dma);
+	for (i = 0; i < n && i < 30; i++) {
+		unsigned int base = 0x80 + i * 0x20;
+		u32 ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		u32 bdl = readl(chip->hda_regs + base + AZX_REG_SD_BDLPL);
+
+		if (!(ctl & SD_CTL_DMA_START) && !bdl)
+			continue;
+		dev_err(chip->dev, "dma dump: SD 0x%03x ctl 0x%06x sts 0x%02x lpib 0x%x cbl 0x%x lvi %u bdl 0x%08x%08x%s\n",
+			base, ctl & 0xffffff, ctl >> 24,
+			readl(chip->hda_regs + base + AZX_REG_SD_LPIB),
+			readl(chip->hda_regs + base + AZX_REG_SD_CBL),
+			readw(chip->hda_regs + base + AZX_REG_SD_LVI) & 0xff,
+			readl(chip->hda_regs + base + AZX_REG_SD_BDLPU), bdl,
+			ctl & SD_CTL_DMA_START ? " RUN" : "");
+	}
+	ae9_dma_dump_bdl(chip, "playback", chip->playback_bdl, chip->playback_bdl_dma);
+	ae9_dma_dump_bdl(chip, "optical out", chip->opt_bdl, chip->opt_bdl_dma);
+	ae9_dma_dump_bdl(chip, "mic", chip->cap_bdl, chip->cap_bdl_dma);
+	for (i = 0; i < 3; i++)
+		ae9_dma_dump_bdl(chip, xname[i], chip->xcap[i].bdl, chip->xcap[i].bdl_dma);
+}
+
+/*
+ * The card stopped answering (corb.c): stop every stream's DMA engine. A
+ * crashed card's capture engines keep writing, to addresses it makes up
+ * (uv65, 2026-11-14: three running captures wrote 8-byte frames to
+ * unmapped addresses 4 s after the hang; the IOMMU blocked them). Clear
+ * RUN and the stream interrupts on every descriptor; MMIO only, so it is
+ * safe under corb_mutex. The PCMs are stopped from dead_work.
+ */
+void creative_ae9_dma_quiesce(struct creative_chip *chip)
+{
+	u16 g = readw(chip->hda_regs + AZX_REG_GCAP);
+	unsigned int n, i, stopped = 0;
+	u32 ctl;
+
+	if (g == 0xffff)
+		return;
+	n = ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f);
+	for (i = 0; i < n && i < 30; i++) {
+		unsigned int base = 0x80 + i * 0x20;
+
+		ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		if (!(ctl & SD_CTL_DMA_START))
+			continue;
+		/* RUN, IOCE, FEIE, DEIE off */
+		writel(ctl & SD_CTL_WMASK & ~(SD_CTL_DMA_START | 0x1c),
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
+		ae9_sd_wait_stopped(chip, base, "at the hang");
+		stopped |= 1u << i;
+	}
+	/* no stream interrupts either (keep CIE/GIE for the controller) */
+	writel(readl(chip->hda_regs + AZX_REG_INTCTL) & 0xc0000000,
+	       chip->hda_regs + AZX_REG_INTCTL);
+	dev_err(chip->dev, "card stopped answering: stream DMA stopped (descriptors 0x%x)\n", stopped);
+}
+
+static void ae9_pcm_track(struct creative_chip *chip, struct snd_pcm *pcm)
+{
+	if (chip->npcms < ARRAY_SIZE(chip->pcms))
+		chip->pcms[chip->npcms++] = pcm;
+}
+
+/* every open stream to DISCONNECTED: apps get -ENODEV, not a stream that
+ * never moves; prepare and start refuse while the card is dead */
+void creative_ae9_dead_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(w, struct creative_chip, dead_work);
+	struct snd_pcm_substream *ss;
+	unsigned int i, dir, n = 0;
+
+	for (i = 0; i < chip->npcms; i++) {
+		struct snd_pcm *pcm = chip->pcms[i];
+
+		mutex_lock(&pcm->open_mutex);
+		for (dir = 0; dir < 2; dir++)
+			for (ss = pcm->streams[dir].substream; ss; ss = ss->next) {
+				if (!ss->runtime)
+					continue;
+				snd_pcm_stream_lock_irq(ss);
+				if (ss->runtime->state != SNDRV_PCM_STATE_OPEN &&
+				    ss->runtime->state != SNDRV_PCM_STATE_DISCONNECTED &&
+				    !snd_pcm_stop(ss, SNDRV_PCM_STATE_DISCONNECTED))
+					n++;
+				snd_pcm_stream_unlock_irq(ss);
+			}
+		mutex_unlock(&pcm->open_mutex);
+	}
+	dev_err(chip->dev, "card stopped answering: %u open stream(s) disconnected\n", n);
+}
+
 static void ae9_posbuf_off(struct creative_chip *chip)
 {
 	if (!chip->posbuf)
@@ -267,6 +434,7 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 	ctl &= ~SD_CTL_DMA_START;
 	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
+	ae9_sd_wait_stopped(chip, base, "after stop");
 }
 
 /* ------------------------------------------------------------------ */
@@ -811,6 +979,7 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 
 	ae9_posbuf_off(chip);
 	if (chip->playback_bdl_raw) {
+		ae9_sd_wait_stopped(chip, chip->playback_stream_base, "at hw_free");
 		dma_free_coherent(chip->dev, chip->playback_bdl_size,
 				  chip->playback_bdl_raw,
 				  chip->playback_bdl_dma);
@@ -846,6 +1015,9 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	u16 format;
 	dma_addr_t addr;
 	int i;
+
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
 
 	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
@@ -900,6 +1072,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 			    lower_32_bits(chip->playback_bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->playback_bdl_dma));
+	ae9_dma_trace_prep(chip, "playback", base, substream, chip->playback_bdl_dma);
 	ae9_posbuf_on(chip);
 
 	/* Windows' playback-start block sets format 0x31 and binds node
@@ -938,6 +1111,9 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int base = chip->playback_stream_base;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1081,6 +1257,7 @@ static int creative_ae9_opt_hw_free(struct snd_pcm_substream *substream)
 	chip->opt_format = 0;
 	ae9_spdif_out_apply(chip);
 	if (chip->opt_bdl_raw) {
+		ae9_sd_wait_stopped(chip, CREATIVE_OPT_STREAM_BASE, "at hw_free");
 		dma_free_coherent(chip->dev, chip->opt_bdl_size,
 				  chip->opt_bdl_raw, chip->opt_bdl_dma);
 		chip->opt_bdl_raw = NULL;
@@ -1099,6 +1276,9 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 	u16 format;
 	dma_addr_t addr;
 	int i;
+
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
 
 	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
@@ -1133,6 +1313,7 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 			    lower_32_bits(chip->opt_bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->opt_bdl_dma));
+	ae9_dma_trace_prep(chip, "optical out", base, substream, chip->opt_bdl_dma);
 	chip->opt_format = format;
 	ae9_spdif_out_apply(chip);
 	return 0;
@@ -1142,6 +1323,9 @@ static int creative_ae9_opt_trigger(struct snd_pcm_substream *substream, int cmd
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int base = CREATIVE_OPT_STREAM_BASE;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1279,6 +1463,7 @@ static void creative_ae9_opt_new(struct creative_chip *chip)
 		return;
 	}
 	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
 	strscpy(pcm->name, "AE-9 Optical Out", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&creative_ae9_opt_pcm_ops);
@@ -1391,6 +1576,7 @@ static int creative_ae9_cap_close(struct snd_pcm_substream *substream)
 static void creative_ae9_cap_bdl_free(struct creative_chip *chip)
 {
 	if (chip->cap_bdl_raw) {
+		ae9_sd_wait_stopped(chip, CREATIVE_CAP_STREAM_BASE, "at BDL free");
 		dma_free_coherent(chip->dev, chip->cap_bdl_size,
 				  chip->cap_bdl_raw, chip->cap_bdl_dma);
 		chip->cap_bdl_raw = NULL;
@@ -1451,6 +1637,9 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	unsigned int i;
 	u32 ctl;
 
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
 	ae9_wait_hp_upload(chip);
@@ -1481,6 +1670,7 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 						    runtime->rate));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
+	ae9_dma_trace_prep(chip, "mic", base, substream, bdl_dma);
 
 	/* Windows' start block once per open (re-prepares after an xrun
 	 * must not resend it), with node 0x07 given this recording's format
@@ -1514,6 +1704,9 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 static int creative_ae9_cap_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1706,6 +1899,7 @@ static void creative_ae9_xcap_bdl_free(struct creative_chip *chip, unsigned int 
 	struct ae9_xcap_state *st = &chip->xcap[i];
 
 	if (st->bdl_raw) {
+		ae9_sd_wait_stopped(chip, ae9_xcaps[i].base, "at BDL free");
 		dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
 		st->bdl_raw = NULL;
 		st->bdl = NULL;
@@ -1767,6 +1961,9 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 	u16 format;
 	u32 ctl;
 
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
 	ae9_wait_hp_upload(chip);
@@ -1816,6 +2013,7 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
+	ae9_dma_trace_prep(chip, x->name, base, substream, bdl_dma);
 
 	/* the converter onto the stream: same format, tag, channel 0 */
 	ae9_xcap_verb(chip, x, x->nid, 0x2, format, NULL);
@@ -1832,6 +2030,9 @@ static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cm
 	struct ae9_xcap_state *st = &chip->xcap[i];
 	unsigned int base = x->base;
 	bool sil = x->signal_pin && st->no_signal;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1990,6 +2191,7 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 		return;
 	}
 	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
 	pcm->private_free = creative_ae9_xcap_pcm_free;
 	chip->xcap[i].chip = chip;
 	if (x->signal_pin) {
@@ -2030,6 +2232,7 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	}
 
 	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
 	strscpy(pcm->name, "AE-9 Analog", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&creative_ae9_pcm_ops);

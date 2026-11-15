@@ -3517,6 +3517,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			   chip->hung_verb);
 	seq_printf(m, "DSP output unmute: resent %u, stayed muted %u\n",
 		   chip->unmute_resends, chip->unmute_stuck);
+	seq_printf(m, "RIRB entries that landed late: %u (longest wait %u us), never landed %u\n",
+		   chip->rirb_late, chip->rirb_late_max_us, chip->rirb_never);
 	seq_printf(m, "head unit: set up again %u time(s)%s\n", chip->hu_reattaches,
 		   chip->hu_ae9_hold ? ", AE-9 shown" : "");
 	seq_printf(m, "head unit boot frames: %u, without reply %u",
@@ -5713,6 +5715,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
+	INIT_WORK(&chip->dead_work, creative_ae9_dead_work);
 	atomic_set(&chip->dma_running, 0);
 
 	dev_info(chip->dev,
@@ -6040,6 +6043,7 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 static void creative_ae9_stop_works(struct creative_chip *chip)
 {
 	cancel_work_sync(&chip->resume_work);
+	cancel_work_sync(&chip->dead_work);
 	atomic_set(&chip->dma_running, 0);
 	cancel_delayed_work_sync(&chip->hb_work);
 	cancel_delayed_work_sync(&chip->acm_work);
@@ -6111,6 +6115,7 @@ static int creative_ae9_suspend(struct device *dev)
 	if (!chip)
 		return 0;
 	cancel_work_sync(&chip->resume_work);
+	cancel_work_sync(&chip->dead_work);
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
 	atomic_set(&chip->dma_running, 0);
 	cancel_delayed_work_sync(&chip->hb_work);
