@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# The non-module half of the AE-9 driver: hands the card to the driver at
+# boot (instead of snd_hda_intel), PipeWire profiles, the firmware helper and
+# the dump script. Pulls in the akmod.
+%global srcname SbAe9-Drv
+
+Name:           creative-ae9
+Version:        0.12.10
+Release:        1%{?dist}
+Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
+License:        GPL-2.0-or-later
+URL:            https://github.com/3xHelix/%{srcname}
+Source0:        %{url}/archive/v%{version}/%{srcname}-%{version}.tar.gz
+BuildArch:      noarch
+
+BuildRequires:  systemd-rpm-macros
+# the akmod/kmod packages want this
+Provides:       %{name}-kmod-common = %{version}
+Requires:       %{name}-kmod >= %{version}
+# firmware extraction
+Requires:       python3
+# unpacks Creative's installer for ae9-get-firmware (firmware + headphone profiles)
+Recommends:     innoextract
+
+%description
+Everything around the AE-9 kernel module except the module itself:
+- a udev rule and a modprobe fallback that hand the AE-9 to this driver at
+  boot instead of snd_hda_intel (found by its PCI IDs, any slot)
+- keeps the module out of the initramfs (it needs the root filesystem's
+  firmware)
+- the PipeWire profile set (stereo duplex and 5.1)
+- ae9-get-firmware: extracts the DSP firmware and the headphone profiles
+  from your download of Creative's installer and installs them (also on
+  read-only Fedora Atomic systems)
+- ae9-full-dump: the state dump for bug reports
+- ae9-dsp-snapshot, ae9-read-stress: DSP and chip-read checks for reports
+
+The firmware itself is Creative's and not included.
+
+%prep
+%setup -q -n %{srcname}-%{version}
+
+%build
+
+%install
+install -D -m 644 config/00-ae9-override.rules %{buildroot}%{_udevrulesdir}/00-ae9-override.rules
+install -D -m 644 config/89-ae9-pipewire.rules %{buildroot}%{_udevrulesdir}/89-ae9-pipewire.rules
+install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-override.conf
+install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
+install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
+install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
+install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}%{_bindir}/ae9-dsp-snapshot
+install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}%{_bindir}/ae9-read-stress
+install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}%{_bindir}/ae9-optical-passthrough
+install -D -m 755 scripts/ae9-reload.sh %{buildroot}%{_bindir}/ae9-reload
+install -D -m 755 scripts/ae9-hp-profile %{buildroot}%{_bindir}/ae9-hp-profile
+install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
+install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
+install -D -m 644 extract_hpeq.py %{buildroot}%{_datadir}/%{name}/extract_hpeq.py
+# optional extras, copied by hand if wanted (see README)
+for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf ae9-clean-mic.conf; do
+	install -D -m 644 config/$f %{buildroot}%{_datadir}/%{name}/examples/$f
+done
+
+%post
+udevadm control --reload >/dev/null 2>&1 || :
+if [ "$1" -eq 1 ]; then
+	echo "creative-ae9: the DSP firmware isn't included. Install it (and the headphone"
+	echo "profiles) from Creative's AE-9 installer with"
+	echo "  sudo ae9-get-firmware AECMDMasterInstaller_3.4.92.00.exe"
+	echo "(needs innoextract; or point it at CtxHda.sys), then power the PC fully off and on."
+fi
+
+%postun
+udevadm control --reload >/dev/null 2>&1 || :
+
+%files
+%license COPYING
+%doc README.md CHANGELOG.md docs
+%{_udevrulesdir}/00-ae9-override.rules
+%{_udevrulesdir}/89-ae9-pipewire.rules
+%{_modprobedir}/ae9-override.conf
+%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
+%{_prefix}/lib/modules-load.d/creative-ae9.conf
+%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+%dir %{_datadir}/wireplumber
+%dir %{_datadir}/wireplumber/wireplumber.conf.d
+%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+%dir %{_datadir}/wireplumber/main.lua.d
+%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+%{_bindir}/ae9-get-firmware
+%{_bindir}/ae9-full-dump
+%{_bindir}/ae9-dsp-snapshot
+%{_bindir}/ae9-read-stress
+%{_bindir}/ae9-optical-passthrough
+%{_bindir}/ae9-reload
+%{_bindir}/ae9-hp-profile
+%{_datadir}/%{name}/
+
+%changelog
+* Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.10-1
+- Driver 0.12.10: no more card hangs after effect changes in DSP mode
+  (answers were read before they reached memory, the Creative controller
+  quirk Linux works around too), headphone profiles load while audio
+  plays, a stopped card stops its streams cleanly, source installs load
+  the driver early at boot
+
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.9-1
+- Driver 0.12.9: "AE-9" at start-up again (0.12.8 blanked it), new
+  ae9-reload command (reload the driver in one go), "Card Answering"
+  control so apps let go of a stopped card, unload no longer wedges a
+  card that answers again, BAR2 0x1c logged (bit 9 = second codec off)
+
+* Sat Nov 14 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.8-1
+- Driver 0.12.8: head unit catches its start-up handshake (board D0
+  step), sees 3.5 mm unplugs (reply length), shows "AE-9" at start-up and
+  is set up again after a power dip or stop frame, SBX held 5 s switches
+  its display; rear RCA input and optical work after a reload (codec 2
+  woken); the driver stops when the card stops answering
+
+* Thu Nov 12 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.7-1
+- Driver 0.12.7: the card's mic monitor no longer breaks Voice Clarity
+  until a power-off (monitor off restores the DSP's mic route), optional
+  +30 dB Mic Gain (mic_boost_30=1), optional clean-mic PipeWire example,
+  source install puts the tools in /usr/local/bin and refuses next to a
+  packaged build, DAC register read/write in debugfs
+* Wed Nov 11 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.6-1
+- Driver 0.12.6: What U Hear no longer stalls after a Direct Mode switch
+  (Direct starts follow the router chip's slot list), router stream counts
+  released at shutdown/start-up, leftover DSP-mode routes switched off
+  (gated/metallic analog out until a power-off), DSP output unmute read
+  back and resent, debugfs state readout in ae9-full-dump
+* Tue Nov 10 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.5-1
+- Driver 0.12.5: restarts fixed for real (router stream count kept as
+  Windows), bus reset on ASMedia-bridge cards too, a DSP word refused as
+  full is resent until it goes in, WirePlumber 0.4 safe start volume
+  (51-ae9-safe-volume.lua), optical without 176.4 kHz
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.4-1
+- Driver 0.12.4: warm restarts as Windows (wake + recovery cycle), Voice
+  Clarity starts in Windows' order (no DSP stall), Voice Clarity off goes
+  back to full band, mic monitor crunch fixed, Windows' DSP load retry,
+  rear RCA without 176.4 kHz
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.3-1
+- Driver 0.12.3: code-review fixes (custom headphone profiles, speaker setup
+  on headphones, mic monitor and Voice Clarity lifecycle, scripts); mic
+  monitor / Voice Clarity known issue flagged ("Mic Monitor Used Since
+  Power-up")
+* Mon Nov 09 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.2-1
+- Driver 0.12.2: Voice Clarity, Voice Morphing and Mic EQ on the DSP, mic
+  monitoring, headphone and line-out virtualization, custom headphone
+  profiles (ae9-hp-profile)
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.1-1
+- Driver 0.12.1: optical out is its own output by default (mirror is a
+  switch), What U Hear in 5.1, clearer headphone-profile log
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.0-1
+- Driver 0.12.0: separate optical output with passthrough (DarkNikGr),
+  headphone-profile uploads no longer cut short, quieter login, DKMS for
+  every installed kernel
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.3-1
+- Driver 0.11.3: no DSP control write from a bad read; snapshot marks bad reads
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.2-1
+- Driver 0.11.2: ae9-dsp-snapshot and ae9-read-stress commands for reports
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.1-1
+- Driver 0.11.1: builds on kernels before 6.13 again (Ubuntu 24.04, EPEL 10)
+* Sun Nov 08 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.11.0-1
+- Driver 0.11.0: safe headphone-profile uploads, EQ headroom, output switch
+  fix in DSP mode, 7 DAC filters, optical in without a signal, What U Hear /
+  Rear RCA In / Optical In as card-profile sources, -36 dB start volume
+* Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.1-1
+- Driver 0.10.1: early module load (modules-load.d), Rear RCA In, reliable
+  headphone profiles, firmware in creative-ae9/, Sub Boost switch
+
+* Sat Nov 07 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.10.0-1
+- ae9-get-firmware reads Creative's installer (firmware + headphone profiles);
+  extract_hpeq.py; Recommends: innoextract
+
+* Fri Nov 06 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.9.9-1
+- First package: boot setup, PipeWire profiles, firmware helper, dump script

@@ -18,6 +18,7 @@
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
 #include <sound/core.h>
 #include <sound/hda_register.h>
 
@@ -57,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.9.7"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.11-rc1"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -69,9 +70,13 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 /* ------------------------------------------------------------------ */
 /* Creative extension register offsets (relative to BAR2)		  */
 /* ------------------------------------------------------------------ */
-#define CREATIVE_REG_HW_CTRL		0x1c
-/* HW_CTRL bit fields */
-#define   CREATIVE_HW_CTRL_INIT		0x880480   /* ae9_mmio_capture.txt:65 */
+/* 0x1c (no Creative name for the register; "HW_CTRL" was ours): reset value
+ * 0x880480. Bit 9 = second codec (SDI2) off (uv62: set, the next link reset
+ * drops codec 2); bits 23:16 = Creative's MX_BSIZE byte (0x80 | 8); bit 7 =
+ * UART enable; bit 10 open. */
+#define CREATIVE_REG_1C			0x1c
+#define   CREATIVE_1C_INIT		0x880480   /* ae9_mmio_capture.txt:65 */
+#define   CREATIVE_1C_SDI2_OFF		0x200
 
 #define CREATIVE_REG_STREAM_CTRL	0x100	/* main stream parameter ctrl */
 #define CREATIVE_REG_STREAM_ENABLE	0x304	/* stream enable bitmask */
@@ -142,6 +147,14 @@ struct creative_chip {
 	bool			unsol_parked;	/* corb_free switched unsolicited responses off */
 	bool			card_gone;	/* dropped off the bus: registers and
 						 * config space read all-ones */
+	bool			dma_dumped;	/* stream DMA dumped at the first command timeout */
+	bool			card_hung;	/* on the bus, but the codecs stopped
+						 * answering commands (corb.c) */
+	unsigned int		corb_to_run;	/* verb timeouts in a row */
+	bool			unloading;	/* remove/probe failure/power-off: no
+						 * dead_work or dead notice any more
+						 * (the PCMs and card go away) */
+	atomic_t		bdl_leaks;	/* BDLs kept: their stream didn't stop */
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
 	bool			rings_deferred;	/* start CORB/RIRB after the firmware
 						 * stream (fw_rings_off=1) */
@@ -177,6 +190,9 @@ struct creative_chip {
 
 	/* PCM playback stream */
 	struct snd_pcm		*pcm;
+	struct snd_pcm		*pcms[6];	/* every PCM device (dead_work) */
+	unsigned int		npcms;
+	struct work_struct	dead_work;	/* PCMs to DISCONNECTED at a hang */
 	struct snd_pcm_substream *substream;
 	void			*playback_buf;	/* DMA audio buffer */
 	dma_addr_t		playback_dma;
@@ -205,20 +221,43 @@ struct creative_chip {
 	u16			cap_format;	/* capture stream format for the start block */
 	/* optical (codec 2's S/PDIF converters, creative_ae9_pcm.c) */
 	bool			spdif_out;	/* "Optical Out Playback Switch" */
+	bool			spdif_mirror;	/* "Optical Out Mirror Switch" */
 	u16			pb_format;	/* SD_FMT of the open playback, 0 none */
 	u32			spdif_out_sent;	/* 0x05 binding last sent (0 = none) */
+	struct mutex		spdif_mutex;	/* the 0x05 binding (main and optical prepare) */
+	u8			spdif_aes[4];	/* "IEC958 Playback Default" (AES0-3) */
+	/* separate optical playback PCM (PCM device 4) */
+	struct snd_pcm_substream *opt_substream;
+	void			*opt_bdl_raw;
+	void			*opt_bdl;
+	dma_addr_t		opt_bdl_dma;
+	size_t			opt_bdl_size;
+	unsigned int		opt_period_size;
+	u16			opt_format;	/* SD_FMT of the open optical stream, 0 none */
 	/* extra capture devices (creative_ae9_pcm.c): [0] optical in (PCM
-	 * device 1), [1] What U Hear (device 2) */
+	 * device 1), [1] What U Hear (device 2), [2] rear RCA in (device 3) */
 	struct ae9_xcap_state {
 		struct snd_pcm_substream *substream;
 		void		*bdl_raw;
 		void		*bdl;
 		dma_addr_t	bdl_dma;
 		size_t		bdl_size;
-	} xcap[2];
+		/* optical in only: with no S/PDIF signal the stream never
+		 * moves, so a timer plays the recording as silence instead
+		 * ("silence clock"), and sense_work watches the signal */
+		struct creative_chip *chip;
+		bool		no_signal;	/* prepared without a signal */
+		bool		sil_running;
+		struct hrtimer	sil_timer;
+		ktime_t		sil_t0;
+		ktime_t		sil_period;
+		struct delayed_work sense_work;
+		u32		last_lpib;
+	} xcap[3];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
-	unsigned int		dac_filter;	/* 0 boot default, 1 fast, 2 slow */
+	unsigned int		dac_filter;	/* index into dac_filters[] */
+	u8			dac_filter_bits; /* reg 7 bits 7:5 for that filter */
 	u8			dac48_07;	/* last value written to DAC 48/07 */
 	struct creative_ae9_fx {		/* SBX effects, creative_ae9_fx.c */
 		bool		direct;		/* Windows' Direct Mode (default on) */
@@ -230,15 +269,43 @@ struct creative_chip {
 		s16		eq[11];		/* 0.1 dB: pre-gain, 31 Hz .. 16 kHz */
 		u8		eq_preset;
 		u8		spk;		/* index into spk_cfgs (fx.c) */
+		/* speaker setup (Direct Mode off) */
+		bool		bass_redirect;
+		bool		hp_virt;	/* "Headphone Virtualization": DSP headphone mode (config 0) */
+		u8		xover;		/* bass redirect crossover, Hz */
+		s8		sub_gain;	/* dB */
+		s8		spk_level[6];	/* dB: FL FR C LFE RL RR */
+		u16		spk_dist[6];	/* cm of delay */
+		u8		hp_profile;	/* headphone profile (fx.c), 0 = off */
+		u8		hp_loaded;	/* profile the DSP holds, 0 = none */
+		unsigned int	hp_loaded_gen;	/* its custom slot's version then */
+		bool		hp_on;		/* "use speaker EQ" (0x1f) last sent on */
+		bool		hp_blocked;	/* an upload failed after the DSP's DMA was
+						 * armed: no more until the next bring-up */
+		bool		hp_waiting;	/* upload waits for the streams to stop */
 		bool		scout;
 		bool		dead;		/* DSP stopped answering */
 		unsigned int	fails;
 		bool		saved_sv_on, saved_eq_on;	/* before Scout Mode */
 		u8		saved_sv_level, saved_sv_mode;
 		s16		saved_eq[11];
-		struct snd_kcontrol *kc[32];
+		struct snd_kcontrol *kc[48];
 		unsigned int	nkc;
 	} fx;
+	struct creative_ae9_cv {		/* Voice Clarity / Voice Morphing, creative_ae9_dsp.c */
+		bool		on;		/* "Voice Clarity": mic through the voice processor */
+		bool		fx[3];		/* Acoustic Echo Cancellation, Noise Reduction, Smart Volume */
+		unsigned int	voicefx;	/* Voice Morphing preset, 0 = Neutral (off) */
+		unsigned int	miceq;		/* Mic EQ preset, 0 = Flat */
+		bool		route_on;	/* mic route as last set: voice processor (16 kHz) */
+		int		sent_voicefx;	/* last sent to the DSP, -1 = resend */
+		int		sent_miceq;
+		bool		monitor;	/* "Mic Monitor": the DSP mixes the mic into the output */
+		bool		mon_bound;	/* ADC 0x07 bound for the monitor, no recording */
+		/* the monitor has been on since this DSP load: its off then also
+		 * sends 0x37/0x23 = 1.0 (creative_ae9_mic_monitor_apply) */
+		bool		mon_used;
+	} cv;
 
 	/* debugfs */
 	struct dentry		*dbg_dir;
@@ -265,10 +332,54 @@ struct creative_chip {
 	 * for ~20s so the DSP and head-unit MCU are ready.
 	 */
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
+	struct delayed_work	hp_work;	/* headphone profile upload, debounced (fx.c) */
+	struct delayed_work	spk_follow_work;	/* Speaker Config follows the stream, debounced */
+	unsigned int		spk_follow_ch;	/* channels of the prepared playback */
+	unsigned long		hp_last;	/* jiffies of the last profile upload */
+	unsigned int		corb_timeouts;	/* verb timeouts so far (corb.c) */
+	u32			hung_verb;	/* the verb that made card_hung */
+	unsigned int		hp_tries;	/* failed uploads in a row */
+	unsigned int		hp_leaks;	/* DSP DMA channels we couldn't free (this bring-up) */
+	bool			scp_fail_logged;	/* first failed DSP message logged (this bring-up) */
+	/* the DSP halted itself after its boot handshake: no more DSP
+	 * messages until the next bring-up (dsp.c, dsp_kick) */
+	bool			dsp_halted;
+	/* Windows' capture level block sent since this DSP load (Windows
+	 * sends it once per stream setup, never per recording) */
+	bool			cap_level_sent;
+	/* jiffies: no DSP message before this (the voice processor was just
+	 * routed in; Windows waits >= 975 ms, creative_ae9_cv_route) */
+	unsigned long		scp_quiet_until;
 	bool			dsp_switch_pending;
 	bool			rt_ff_logged;	/* router 0xff line logged this bring-up */
+	/* router slots our DSP-mode front/surround routes were moved to
+	 * (ae9_rt_put: the usual slot held a recording route), switched off
+	 * again when Direct Mode turns on and at shutdown */
+	u8			rt_moved[6];
+	u8			rt_moved_n;
+	bool			rt_direct_swept;	/* Direct Mode: stale DSP -> DAC routes swept */
 	int			dsp_done;
 	int			standup_done; /* set after ae9_standup completes — disables keepalive CORB reads */
+	unsigned int		scp_busy_words;	/* DSP words not sent: no room after 2 s */
+	unsigned int		scp_full_words;	/* DSP words answered "command queue full" */
+	unsigned int		unmute_resends;	/* DSP output unmutes resent: read back still muted (or the read failed) */
+	unsigned int		unmute_stuck;	/* times it stayed muted after 10 unmutes */
+	unsigned int		rirb_late;	/* RIRB entries read again: RIRBWP was ahead of the entry in memory */
+	unsigned int		rirb_late_max_us;	/* the longest wait for one */
+	unsigned int		rirb_never;	/* entries that hadn't landed after RIRB_LATE_US */
+	unsigned int		rirb_stray;	/* answers from the other codec, skipped */
+	unsigned int		rirb_badwp;	/* RIRBWP read all-ones on a card still there */
+	/* post-boot head-unit replay: frame count, frames without reply and
+	 * the first ones (frame number from 1, the two bytes after the f0
+	 * start byte), for debugfs */
+	u16			hu_boot_frames;
+	u16			hu_noreply_n;
+	u16			hu_noreply_idx[8];
+	u16			hu_noreply_head[8];
+	/* the unsent rest of a cut SCP message (header + up to 16 data
+	 * words): goes out before the next message (dsp.c, scp_send_words) */
+	u32			scp_rest[17];
+	unsigned int		scp_rest_n;
 	int			pcm_started;  /* set after first PCM start — skips one-time ChipIO setup */
 	int			relay_engaged; /* set after relay fires — skip on repeated prepares */
 
@@ -285,7 +396,7 @@ struct creative_chip {
 	u32			dac_start_key;	/* rate row + output the DAC start commands
 						 * were last sent for; 0 = unknown (any DAC
 						 * command or a resume clears it) */
-	unsigned int		in05_ch;	/* DSP input stream 0x05 channels, 0 = off */
+	unsigned int		in05_ch;	/* DSP input stream 0x05 channels (DSP-mode bind), 0 = off */
 	bool			dsp_primed;
 	bool			dsp_active;	/* DSP mode routing is up */	/* a full start block ran since bring-up */
 	unsigned int		pcm_bits;	/* 24 or 32, latched at open */
@@ -304,19 +415,30 @@ struct creative_chip {
 	bool			suspended;
 	bool			resuming;	/* bring-up from resume: fail fast */
 	bool			hs_ok;		/* last boot handshake completed */
+	unsigned int		dsp_soft_left;	/* DSP_INIT re-downloads still to come in
+						 * this load: fail fast while > 0 */
 	unsigned int		hu_output;	/* 0 speakers (RCA), 1 headphones */
 	unsigned int		hu_att_out[2];	/* remembered volume per output */
 	unsigned int		hu_name_until;	/* show "-SP-"/"-HP-" until this tick */
 	char			hu_text[9];	/* debugfs "hutext": held display text */
-	u8			hu_dbg_tx[16];	/* debugfs "huframe": frame for the heartbeat to send */
-	int			hu_dbg_len;	/* its length, 0 = none pending */
+	u8			hu_dbg_tx[48];	/* debugfs "huframe": frame(s) for the heartbeat to send, back to back */
+	int			hu_dbg_len;	/* their total length, 0 = none pending */
+	bool			hu_paused;	/* debugfs hupause: no head-unit poll */
+	unsigned long		hu_pause_until;	/* (jiffies) and no GPIO 0x320 write */
 	int			hu_phantom_req;	/* phantom power to send: 0/1, -1 = none */
 	unsigned long		hu_phantom_hold; /* "on" requests ignored until (jiffies) */
 	int			hu_switch_to;	/* pending output switch, -1 none */
+	bool			lo_virt;	/* "Line Out Virtualization": headphone mode on the line out */
+	bool			lo_virt_phys;	/* the line out carries the headphone mode now */
+	bool			hu_reroute;	/* pending: redo the headphone routing */
 	unsigned int		hu_light;	/* knob light on */
 	int			hu_light_sent;	/* knob light as last sent, -1 unknown */
 	int			hu_sbx_led;	/* SBX LED as last sent, -1 unknown */
 	bool			hu_sbx_press;	/* SBX button press to act on */
+	bool			hu_display;	/* display on (SBX 5 s hold toggles) */
+	int			hu_display_to;	/* pending display on/off, -1 none */
+	struct snd_kcontrol	*hu_disp_ctl;
+	struct snd_kcontrol	*answer_ctl;	/* "Card Answering" */
 	bool			hu_st07_valid;
 	u8			hu_st07;	/* 83 01 07 reply byte, logged on change */
 	struct snd_kcontrol	*hu_out_ctl;
@@ -328,6 +450,11 @@ struct creative_chip {
 	/* 83 01 02 status byte without bit 7 (knob button), for the plug
 	 * log. Logged only; output switching stays manual. */
 	bool			hu_status_valid;
+	bool			hu_ae9_hold;	/* "AE-9" on the display: no text until */
+	unsigned long		hu_ae9_until;	/* (jiffies), as Windows' AE-9 hold */
+	bool			hu_unattached;	/* 0x2000 marker read 0xaaaaaaaa */
+	unsigned int		hu_reattach_try; /* setup resends in a row */
+	unsigned int		hu_reattaches;	/* setup resends since load */
 	u8			hu_status;
 	struct snd_kcontrol	*hu_plug_ctl[3];	/* phones, mic, phantom (read-only) */
 	/* opt-in auto switch on the 3.5 mm headphone plug: a plug change waits
@@ -347,11 +474,24 @@ struct creative_chip {
  * machine froze. Checked where a timeout or an all-ones read suggests it;
  * once set, every command path returns -ENODEV straight away.
  */
+void creative_ae9_dead_notify(struct creative_chip *chip);
+void creative_ae9_dma_dump(struct creative_chip *chip, const char *why);
+void creative_ae9_dma_quiesce(struct creative_chip *chip);
+void creative_ae9_dead_work(struct work_struct *w);
+
+/* For control writes: the card dropped off the bus or stopped answering
+ * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing
+ * a setting that never reaches it. */
+static inline bool creative_ae9_dead(const struct creative_chip *chip)
+{
+	return chip->card_gone || chip->card_hung;
+}
+
 static inline bool creative_ae9_gone(struct creative_chip *chip, const char *where)
 {
 	u16 vid = 0;
 
-	if (chip->card_gone)
+	if (chip->card_gone || chip->card_hung)
 		return true;
 	if (readl(chip->hda_regs + 0x08) != 0xffffffff)	/* GCTL */
 		return false;
@@ -359,6 +499,7 @@ static inline bool creative_ae9_gone(struct creative_chip *chip, const char *whe
 	if (vid != 0xffff)
 		return false;
 	chip->card_gone = true;
+	creative_ae9_dead_notify(chip);
 	dev_err(chip->dev, "card dropped off the bus (%s): registers and config space read all-ones; stopping\n",
 		where);
 	return true;
@@ -406,6 +547,7 @@ int creative_ae9_hw_reset(struct creative_chip *chip);
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
 			      unsigned int addx, unsigned int data);
+void creative_dsp_dbg_block_log(struct creative_chip *chip, const char *when);
 int creative_dsp_chipio_read(struct creative_chip *chip,
 			     unsigned int addx, unsigned int *data);
 int creative_dsp_prepare(struct creative_chip *chip);
@@ -416,9 +558,12 @@ void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool a
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
+void creative_ae9_cap_start(struct creative_chip *chip, bool route_vc);
 void creative_ae9_cap_irq(struct creative_chip *chip);
 void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
+void creative_ae9_opt_irq(struct creative_chip *chip);
 extern unsigned int ae9_sentinel_clear;
+int creative_dsp_out_mute_get(struct creative_chip *chip, u32 *val);
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
 void creative_dsp_chipio_addr_invalidate(void);
@@ -438,12 +583,35 @@ extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\
 	} while (0)
 void creative_ae9_mic_level_apply(struct creative_chip *chip);
+int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name);
+u32 creative_ae9_streams_running(struct creative_chip *chip);
+void creative_ae9_corb_scan_unsol(struct creative_chip *chip);
+int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
+			   unsigned int req, unsigned int count, unsigned int wait_us);
 void creative_ae9_fx_init(struct creative_chip *chip);
 int creative_ae9_fx_controls_add(struct creative_chip *chip);
+void creative_ae9_fx_remove(struct creative_chip *chip);
+void creative_ae9_cv_apply(struct creative_chip *chip);
+void creative_ae9_cv_route(struct creative_chip *chip, bool on);
+void creative_ae9_cv_down(struct creative_chip *chip);
+int creative_ae9_cv_controls_add(struct creative_chip *chip);
+void creative_ae9_mic_monitor_apply(struct creative_chip *chip);
+/* Windows routes the voice processor in only while an effect is on; the
+ * Voice Clarity master alone is UI-only (cap4: master on, nothing on ->
+ * conns 96 kHz, no route) */
+#define CREATIVE_CAP_STREAM_TAG	1	/* mic capture stream tag (ADC 0x07 bind) */
+#define AE9_CV_WANT(c)	((c)->cv.on && ((c)->cv.fx[0] || (c)->cv.fx[1] || \
+			 (c)->cv.fx[2] || (c)->cv.miceq || (c)->cv.voicefx))
 void creative_ae9_fx_restore(struct creative_chip *chip);
 void creative_ae9_fx_defer(struct creative_chip *chip);
+void creative_ae9_fx_dsp_reset(struct creative_chip *chip);
 void creative_ae9_fx_sbx_toggle(struct creative_chip *chip);
+void creative_ae9_fx_output_changed(struct creative_chip *chip);
+void creative_ae9_fx_unmute(struct creative_chip *chip);
+void creative_ae9_hu_reroute_request(struct creative_chip *chip);
+void creative_ae9_fx_hp_work(struct work_struct *w);
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels);
+void creative_ae9_fx_spk_follow_work(struct work_struct *w);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
 void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);
@@ -451,6 +619,7 @@ void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 				size_t n, const char *what);
 void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
 				      const u8 (*cmds)[3], size_t n);
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 
 /* ------------------------------------------------------------------ */
 /* MMIO accessor helpers (with mandated memory barriers)		  */

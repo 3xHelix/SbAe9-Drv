@@ -31,7 +31,7 @@ MODULE_PARM_DESC(ring_irq, "Command-ring interrupts (1=on, default; 0=off, diagn
 #define CORBCTL_RUN	(ring_irq ? 0x03 : 0x02)	/* run (+ memory-error irq) */
 
 /*
- * ring_order: 0 = our long-standing order (default on master): the run bits are set
+ * ring_order: 0 = our long-standing order: the run bits are set
  * before the ring base addresses, the ring sizes after the rings run.
  * 1 = Windows' effective order and the HD Audio spec's: both DMA engines
  * stopped (and seen stopped) while the base addresses and sizes are set,
@@ -39,14 +39,16 @@ MODULE_PARM_DESC(ring_irq, "Command-ring interrupts (1=on, default; 0=off, diagn
  * controller right after, which clears them (cold capture 2026-11-03,
  * 23:24:10.544-.608). For ASMedia-bridged cards (bugzilla 219552), where
  * a stray ring DMA before the bases are valid may be what takes the
- * bridge down.
+ * bridge down. -1 (default) = 1 behind an ASMedia bridge (the order
+ * Kaiba's card first played with, round 3d.1), 0 otherwise.
  */
-static unsigned int ring_order = 1;	/* asmedia-debug: Windows' order (round 3c) */
-module_param(ring_order, uint, 0444);
-MODULE_PARM_DESC(ring_order, "Command-ring start order: 0 = as before, 1 = addresses and sizes while stopped, as Windows and the HDA spec (default on this branch)");
+static int ring_order = -1;
+module_param(ring_order, int, 0444);
+MODULE_PARM_DESC(ring_order, "Command-ring start order: -1 = auto (Windows' order behind an ASMedia bridge, default), 0 = as before, 1 = addresses and sizes while stopped, as Windows and the HDA spec");
 
 int creative_ae9_corb_init(struct creative_chip *chip)
 {
+	bool order = ring_order < 0 ? chip->asmedia : !!ring_order;
 	u32 corb_addr_low, corb_addr_high;
 	u32 rirb_addr_low, rirb_addr_high;
 	u32 ctl;
@@ -57,7 +59,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 		chip->corb_dma = chip->corb_keep_dma;
 		chip->rirb_buf = chip->rirb_keep;
 		chip->rirb_dma = chip->rirb_keep_dma;
-		memset(chip->rirb_buf, 0, CREATIVE_RIRB_SIZE);
+		memset(chip->rirb_buf, 0xff, CREATIVE_RIRB_SIZE);	/* RIRB_MARK */
 	}
 
 	/* Allocate DMA-coherent buffer for CORB (256 * 4 = 1 KB) */
@@ -70,10 +72,8 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 		}
 	}
 
-	/* Allocate DMA-coherent buffer for RIRB (256 * 8 = 2 KB).
-	 * May already be allocated by probe (pre-alloc for ICW priming).
-	 * Reuse it so RIRBWP pre-seeded from ICW responses is preserved.
-	 */
+	/* Allocate DMA-coherent buffer for RIRB (256 * 8 = 2 KB), or reuse
+	 * the one an earlier init allocated (resume, ring restarts). */
 	if (!chip->rirb_buf) {
 		chip->rirb_buf = dmam_alloc_coherent(chip->dev,
 				ae9_dma_size(chip, CREATIVE_RIRB_SIZE), &chip->rirb_dma, GFP_KERNEL);
@@ -81,7 +81,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 			dev_err(chip->dev, "Failed to allocate RIRB DMA buffer\n");
 			return -ENOMEM;
 		}
-		memset(chip->rirb_buf, 0, CREATIVE_RIRB_SIZE);
+		memset(chip->rirb_buf, 0xff, CREATIVE_RIRB_SIZE);	/* RIRB_MARK */
 	}
 
 	memset(chip->corb_buf, 0, CREATIVE_CORB_SIZE);
@@ -133,7 +133,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0x00);
 	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0x00);
 
-	if (ring_order) {
+	if (order) {
 		unsigned int t;
 
 		/* wait (up to 1 ms) for both DMA engines to report stopped */
@@ -164,7 +164,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	creative_hda_writel(chip, AZX_REG_RIRBLBASE, rirb_addr_low);
 
 	/* ring_order=1: the sizes too while stopped (256 entries) */
-	if (ring_order) {
+	if (order) {
 		creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
 		creative_hda_writeb(chip, AZX_REG_RIRBSIZE, 0x0a);
 		wmb();
@@ -229,13 +229,21 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 * Resetting RIRBWP confuses the CA0132 RIRB engine.
 	 * Seed our software read pointer from the current hardware value.
 	 */
-	chip->rirb_rp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+	{
+		u16 raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+
+		if (raw == 0xffff) {	/* one bad read? (a dead card fails below) */
+			udelay(10);
+			raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+		}
+		chip->rirb_rp = raw == 0xffff ? 0 : raw & 0xff;
+	}
 
 	/* CORB/RIRB sizes: 256 entries (bits 3-2 = 10 = 0x0a).
 	 * CA0132 appears to ignore CORBSIZE (live dump shows 0x00 with
 	 * CORBWP=58 and no wrap), but we set it for spec compliance.
 	 */
-	if (!ring_order) {
+	if (!order) {
 		creative_hda_writeb(chip, AZX_REG_CORBSIZE, 0x0a);
 		creative_hda_writeb(chip, AZX_REG_RIRBSIZE, 0x0a);
 	}
@@ -251,7 +259,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 
 	ctl = creative_hda_readb(chip, AZX_REG_CORBCTL);
 	dev_info(chip->dev, "CORBCTL=0x%02x (expected 0x%02x)%s\n", ctl, ring_irq ? 0x01 : 0x00,
-		 ring_order ? " (ring_order=1: addresses and sizes set while stopped)" : "");
+		 order ? " (ring_order=1: addresses and sizes set while stopped)" : "");
 	ctl = creative_hda_readb(chip, AZX_REG_RINTCNT);
 	dev_info(chip->dev, "RINTCNT=0x%02x (expected 0xc0)\n", ctl);
 	dev_info(chip->dev, "RIRBCTL=0x%02x (expected 0x%02x)\n",
@@ -362,6 +370,160 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 /* ------------------------------------------------------------------ */
 /* Send a verb via CORB and wait for the response			  */
 /* Returns 0 on success, -ETIMEDOUT on timeout			  */
+/*
+ * One unsolicited RIRB entry: log it, and count it as a DSP reply
+ * announcement only if it is one: codec 1, tag 0x16 (the DSP node; resp
+ * 0x02c00001). Windows' handler filters on (resp >> 21) & 0x1f == 0x16
+ * (decompile FUN_0001da88); counting every codec-1 entry would count a
+ * jack event as a reply (2026-11-07).
+ */
+static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
+{
+	creative_ae9_vlog(res, fl, true);
+	if ((fl & 0xf) == 1 && ((res >> 21) & 0x1f) == 0x16)
+		atomic_inc(&chip->scp_unsol);
+}
+
+/*
+ * RIRB entries that land after RIRBWP moves (2026-11-15, uv71-uv75). The
+ * controller can advance RIRBWP before the entry it points at is in
+ * memory; read at once, the slot still holds what was written there one
+ * lap (256 entries) earlier. Linux has worked around the same thing on
+ * Creative X-Fi controllers since 2010 (commit 14d34f16, "Add some workarounds
+ * for Creative IBG": 80 us before every RIRB read; now under
+ * AZX_DCAPS_CTX_WORKAROUND).
+ * What it did here: a stale DSP notice (0x02c00001) read in place of an
+ * answer made the real answer, which landed a moment later in the slot we
+ * had passed, look lost: 100 ms timeout, command-ring reset, replies out
+ * of step, then capture DMA to made-up addresses and a card that stopped
+ * answering (uv71, after SBX toggles while recording). A stale 0 read as a
+ * DSP reply header lost that reply (3-12 per 150 GETs), and stale entries
+ * from the other codec came back as answers (27 in uv74).
+ * So every slot read gets RIRB_MARK (all ones; real flags have bits 31:5
+ * clear), and a slot RIRBWP says is new that still holds the mark is read
+ * again until the entry lands, for up to RIRB_LATE_US. uv75 (SBX toggled
+ * every 3 s, four captures): 1282 entries landed late, at most 6 us;
+ * 0 timeouts, 0 lost headers, 0 wrong-codec answers (uv74: 12 and 27).
+ */
+#define RIRB_MARK	0xffffffffu
+#define RIRB_LATE_US	200
+
+static bool rirb_take(struct creative_chip *chip, struct creative_rirb_entry *rirb,
+		      u16 i, u32 *res, u32 *fl)
+{
+	unsigned int t;
+
+	*fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
+	if (*fl == RIRB_MARK) {
+		for (t = 0; t < RIRB_LATE_US && *fl == RIRB_MARK; t++) {
+			udelay(1);
+			*fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
+		}
+		if (*fl == RIRB_MARK) {
+			chip->rirb_never++;
+			dev_info_ratelimited(chip->dev, "RIRB entry %u never landed (%u us)\n",
+					     i, RIRB_LATE_US);
+			return false;
+		}
+		chip->rirb_late++;
+		if (t > chip->rirb_late_max_us)
+			chip->rirb_late_max_us = t;
+	}
+	rmb();
+	*res = le32_to_cpu(READ_ONCE(rirb[i].response));
+	WRITE_ONCE(rirb[i].response, cpu_to_le32(RIRB_MARK));
+	WRITE_ONCE(rirb[i].flags, cpu_to_le32(RIRB_MARK));
+	return true;
+}
+
+/* RIRBWP's bits 15:8 read 0 on a live card: all-ones is a card off the
+ * bus or one bad read (a bridge glitch); never use it as a write pointer.
+ * Counted when the card is still there, to learn how often that happens. */
+static bool rirb_wp_bad(struct creative_chip *chip, u16 raw, const char *where)
+{
+	if (raw != 0xffff)
+		return false;
+	if (!creative_ae9_gone(chip, where)) {
+		chip->rirb_badwp++;
+		dev_warn_ratelimited(chip->dev, "RIRB: write pointer read all-ones (%s), card still there (%u so far)\n",
+				     where, chip->rirb_badwp);
+	}
+	return true;
+}
+
+/*
+ * Look for DSP reply announcements WITHOUT sending a verb: scan the RIRB
+ * the DMA has written since our last look. Windows sends nothing to the
+ * DSP between a GET (and its one trailing F01) and the announcement (606
+ * of 606 GETs, 15 captures; notes 24); we used to poll F01 every
+ * 0.2-0.4 ms there, the one place our reads differ from Windows'.
+ * A solicited entry here can only be a late reply to a timed-out verb.
+ */
+void creative_ae9_corb_scan_unsol(struct creative_chip *chip)
+{
+	struct creative_rirb_entry *rirb = chip->rirb_buf;
+	u16 raw, wp, i;
+
+	if (!rirb || chip->card_gone)
+		return;
+	mutex_lock(&chip->corb_mutex);
+	raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	/* all-ones (bits 15:8 read 0 on a live card): gone, or one bad read
+	 * through a bridge; either way don't move rirb_rp to 0xff
+	 * (ultrareview 2) */
+	if (rirb_wp_bad(chip, raw, "RIRB scan")) {
+		mutex_unlock(&chip->corb_mutex);
+		return;
+	}
+	wp = raw & 0xff;
+	rmb();
+	for (i = chip->rirb_rp; i != wp;) {
+		u32 fl, res;
+
+		i = (i + 1) & 0xff;
+		if (rirb_take(chip, rirb, i, &res, &fl) && (fl & 0x10))
+			rirb_unsol(chip, res, fl);
+	}
+	chip->rirb_rp = wp;
+	mutex_unlock(&chip->corb_mutex);
+}
+
+/*
+ * A card that stays on the bus but whose codecs stop answering (2026-11-13,
+ * 13:29:45, rapid SBX on/off: one timeout, then the card wrote outside its
+ * buffers and never answered again). The driver went on sending: 1420
+ * timeouts, each 100 ms plus a ring reset, and 2 s DSP waits, for 4 minutes
+ * until a reload; only the reload's bus reset brought the card back.
+ * A healthy card has single timeouts (two that evening, each answered at
+ * the next verb), so CARD_HUNG_RUN in a row on a running card (after the
+ * bring-up, which has its own retries) means it has stopped: say so once and
+ * fail every command at once until the next bring-up (reload, resume).
+ */
+#define CARD_HUNG_RUN	8
+
+static unsigned int hung_inject;
+module_param(hung_inject, uint, 0644);
+MODULE_PARM_DESC(hung_inject, "Test (needs debug=1): the next N commands after start-up count as timed out without being sent, to exercise the 'card stopped answering' stop (counts down to 0)");
+
+static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
+{
+	if (!chip->dsp_done || chip->card_hung ||
+	    ++chip->corb_to_run < CARD_HUNG_RUN)
+		return;
+	chip->card_hung = true;
+	chip->hung_verb = verb;
+	creative_ae9_dma_dump(chip, "card stopped answering");
+	creative_ae9_dma_quiesce(chip);
+	/* not while unloading: stop_works has cancelled dead_work and the
+	 * PCMs are freed or about to be (ultrareview 2, #1: the shutdown's
+	 * own timeouts re-queued it, use-after-free) */
+	if (!chip->unloading)
+		schedule_work(&chip->dead_work);
+	creative_ae9_dead_notify(chip);
+	dev_err(chip->dev, "card stopped answering: %u command timeouts in a row (last verb 0x%08x, %u in all); no more commands until the driver is reloaded (sudo modprobe -r snd-hda-codec-creative-ae9 && sudo modprobe snd-hda-codec-creative-ae9) or the PC is powered off\n",
+		chip->corb_to_run, verb, chip->corb_timeouts);
+}
+
 /* ------------------------------------------------------------------ */
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp)
@@ -369,40 +531,64 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	u16 wp_start;
 	u16 wp;
 	unsigned int timeout;
+	u32 got_res = 0, got_fl = 0;
 	int ret;
 
 	/* Serialise: only one CORB verb in flight at a time.
 	 * Without this, concurrent callers (ACM heartbeat, PCM prepare,
 	 * select_lineout) interleave verbs and lose responses.
 	 */
-	if (chip->card_gone)
+	if (chip->card_gone || chip->card_hung)
 		return -ENODEV;
 	mutex_lock(&chip->corb_mutex);
 	if (!chip->corb_buf || !chip->rirb_buf) {	/* rings parked (suspend) */
 		mutex_unlock(&chip->corb_mutex);
 		return -ENODEV;
 	}
+	if (hung_inject && ae9_debug && chip->dsp_done) {
+		hung_inject--;
+		dev_err(chip->dev, "CORB verb response timeout (verb=0x%08x, injected)\n", verb);
+		chip->corb_timeouts++;
+		ae9_corb_hung_check(chip, verb);
+		mutex_unlock(&chip->corb_mutex);
+		return -ETIMEDOUT;
+	}
 
 	/* Drain any pre-existing RIRB entries by reading current WP. Count
 	 * the unsolicited ones on the way: the DSP announces each SCP reply
 	 * with one, and they often land between our commands. */
 	wp_start = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	/* all-ones: a card off the bus (each marked slot would cost the full
+	 * 200 us wait: ~51 ms under corb_mutex, and 255 false "never landed")
+	 * or one bad read; read once more, then give up on this verb
+	 * (ultrareview 2, #5) */
+	if (wp_start == 0xffff) {
+		udelay(10);
+		wp_start = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	}
+	if (rirb_wp_bad(chip, wp_start, "RIRB drain")) {
+		ret = chip->card_gone || chip->card_hung ? -ENODEV : -EIO;
+		if (ret == -EIO) {
+			dev_warn_ratelimited(chip->dev, "RIRB: verb 0x%08x not sent (write pointer unreadable)\n", verb);
+			/* counts like a timeout: a card whose registers stay
+			 * unreadable still ends up "stopped answering" */
+			chip->corb_timeouts++;
+			ae9_corb_hung_check(chip, verb);
+		}
+		mutex_unlock(&chip->corb_mutex);
+		return ret;
+	}
 	wp_start &= 0xff;
 	{
 		struct creative_rirb_entry *rirb = chip->rirb_buf;
 		u16 i = chip->rirb_rp;
 
 		while (i != wp_start) {
-			u32 fl;
+			u32 fl, res;
 
 			i = (i + 1) & 0xff;
-			fl = le32_to_cpu(READ_ONCE(rirb[i].flags));
-			if (fl & 0x10) {
-				creative_ae9_vlog(le32_to_cpu(READ_ONCE(rirb[i].response)),
-						  fl, true);
-				if ((fl & 0xf) == 1)
-					atomic_inc(&chip->scp_unsol);
-			}
+			if (rirb_take(chip, rirb, i, &res, &fl) && (fl & 0x10))
+				rirb_unsol(chip, res, fl);
 		}
 	}
 	chip->rirb_rp = wp_start;
@@ -430,20 +616,41 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 
 			/* all-ones: the card may have dropped off the bus;
 			 * each read of a dead card can stall for a long time */
-			if (raw_wp == 0xffff && creative_ae9_gone(chip, "RIRB poll"))
-				break;
+			if (rirb_wp_bad(chip, raw_wp, "RIRB poll")) {
+				if (chip->card_gone || chip->card_hung)
+					break;
+				/* one bad read: don't take 0xff as the write pointer */
+				udelay(10);
+				continue;
+			}
 			while (cur_wp != wp) {
 				u16 next = (wp + 1) & 0xff;
-				u32 fl = le32_to_cpu(READ_ONCE(rirb[next].flags));
+				u32 fl, res;
+
 				wp = next;
-				if (!(fl & 0x10))
+				if (!rirb_take(chip, rirb, next, &res, &fl))
+					continue;
+				/* an answer from the other codec isn't ours (ultrareview
+				 * 2). It narrows the stale-answer case, it doesn't close
+				 * it: a late answer from the same codec still looks like
+				 * ours; the marks keep those out by timing */
+				if (!(fl & 0x10) && (fl & 0xf) != (verb >> 28)) {
+					chip->rirb_stray++;
+					dev_warn_ratelimited(chip->dev, "RIRB: answer 0x%08x from codec %u while waiting for codec %u (verb 0x%08x): skipped\n",
+							     res, fl & 0xf, verb >> 28, verb);
+					continue;
+				}
+				if (!(fl & 0x10)) {
+					got_res = res;
+					got_fl = fl;
 					goto got_response;
+				}
 				/* unsolicited — log/count it, keep scanning */
-				creative_ae9_vlog(le32_to_cpu(READ_ONCE(rirb[next].response)),
-						  fl, true);
-				if ((fl & 0xf) == 1)
-					atomic_inc(&chip->scp_unsol);
-				cur_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+				rirb_unsol(chip, res, fl);
+				raw_wp = readw(chip->hda_regs + AZX_REG_RIRBWP);
+				if (raw_wp == 0xffff)
+					break;	/* the outer pass re-reads it, guarded */
+				cur_wp = raw_wp & 0xff;
 			}
 			udelay(10);
 		} while (--timeout);
@@ -455,6 +662,12 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	}
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
+	chip->corb_timeouts++;
+	if (chip->dsp_done && !chip->dma_dumped) {	/* the first timeout of this load */
+		chip->dma_dumped = true;
+		creative_ae9_dma_dump(chip, "first command timeout");
+	}
+	ae9_corb_hung_check(chip, verb);
 
 	/*
 	 * Recover the command ring after a timeout, the HD-Audio spec way.
@@ -468,8 +681,13 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	 * so the controller would re-send stale entries.
 	 */
 	{
-		u16 cur_rirb_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+		u16 cur_rirb_wp = readw(chip->hda_regs + AZX_REG_RIRBWP);
 		int t;
+
+		/* all-ones: don't skip ahead to 0xff; stay at wp */
+		if (rirb_wp_bad(chip, cur_rirb_wp, "RIRB reset"))
+			cur_rirb_wp = wp;
+		cur_rirb_wp &= 0xff;
 
 		writeb(0x00, chip->hda_regs + AZX_REG_CORBCTL);	/* stop */
 		for (t = 0; t < 100 && (readb(chip->hda_regs + AZX_REG_CORBCTL) & 0x02); t++)
@@ -484,7 +702,21 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		chip->corb_wp = 0;
 		writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
 
-		/* skip responses that may still arrive for the dropped verb */
+		/* skip responses that may still arrive for the dropped verb,
+		 * but count the DSP reply announcements among them: skipping
+		 * one left every later GET one reply behind */
+		{
+			struct creative_rirb_entry *rirb = chip->rirb_buf;
+			u16 i = wp;
+
+			while (i != cur_rirb_wp) {
+				u32 fl, res;
+
+				i = (i + 1) & 0xff;
+				if (rirb_take(chip, rirb, i, &res, &fl) && (fl & 0x10))
+					rirb_unsol(chip, res, fl);
+			}
+		}
 		chip->rirb_rp = cur_rirb_wp;
 		dev_warn(chip->dev, "CORB ring reset after timeout (RP=WP=0)\n");
 	}
@@ -493,15 +725,12 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	return -ETIMEDOUT;
 
 got_response:
-	/* Read solicited response from RIRB buffer */
-	{
-		struct creative_rirb_entry *rirb = chip->rirb_buf;
-		u32 r = le32_to_cpu(READ_ONCE(rirb[wp].response));
+	/* the solicited response, taken from the RIRB in the poll loop */
+	creative_ae9_vlog(got_res, got_fl, true);
+	if (resp)
+		*resp = got_res;
 
-		creative_ae9_vlog(r, le32_to_cpu(READ_ONCE(rirb[wp].flags)), true);
-		if (resp)
-			*resp = r;
-	}
+	chip->corb_to_run = 0;
 
 	/* Update RIRB read pointer to acknowledge consumption */
 	chip->rirb_rp = wp;

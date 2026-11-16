@@ -16,7 +16,10 @@
 //     0x07/0x08 Crystalizer on, level  0x18/0x19 Bass (X-Bass) on, level
 //     0x17 Bass crossover (Hz)         0x09      EQ on
 //     0x0a EQ pre-gain (dB)            0x0b-0x14 EQ bands 31 Hz-16 kHz (dB)
-//     0x15 bass redirect, 0x1f use speaker EQ, 0x3a output mute
+//     0x15 bass redirect, 0x16 its crossover (Hz), 0x1e subwoofer boost (on/off)
+//     0x1f use speaker EQ, 0x3a output mute
+//     0x21-0x26 speaker level (dB), 0x31-0x36 speaker delay (seconds),
+//               Front L, Front R, Center, Sub, Rear L, Rear R
 //   module 0x80 (MASTERCONTROL) request 0x04: speaker config, 8.0 in
 //     Direct Mode, the "Speaker Config" control's value with Direct Mode off
 //   module 0x8f (speaker EQ) request 0x01: bypass attenuation
@@ -33,7 +36,10 @@
 // With SBX off every effect and the EQ are off in the DSP; the controls
 // keep their values for the next time SBX is turned on.
 
+#include <linux/ctype.h>
 #include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/math64.h>
 #include <linux/moduleparam.h>
 #include <sound/core.h>
@@ -136,9 +142,298 @@ static unsigned int spk_idx(const struct creative_ae9_fx *fx)
 	return fx->spk < spk_count() ? fx->spk : 1;
 }
 
+/*
+ * Speaker setup (Sound Blaster Command > Speakers; capture 2026-11-07,
+ * notes 12). Windows sends these with Direct Mode off:
+ * - Bass redirection on/off (0x96/0x15); its crossover 0x96/0x16 comes
+ *   from the speaker type (Tower 80 Hz, Desktop 120 Hz); sub gain 0x96/0x1e.
+ *   Our startup leaves 0x16/0x1e out (the DSP rejects them at boot);
+ *   Windows sends them at run time, after the speaker config.
+ * - Calibration: a level and a delay per speaker. Distance steps of 10 cm
+ *   sent 0.000293867 s each (sound at 340.29 m/s), so the control is in cm.
+ *   The levels look like dB offsets (0 = as is; a raise sent 1.0).
+ * Sent with every speaker block (fx_apply_all_locked) and live.
+ */
+static const char * const spk_ch_names[6] = {
+	"Front L", "Front R", "Center", "Sub", "Rear L", "Rear R",
+};
+#define SPK_LVL_MIN	(-12)	/* dB */
+#define SPK_LVL_MAX	12
+#define SPK_DIST_MAX	500	/* cm (14.7 ms) */
+#define XOVER_MIN	50	/* Hz */
+#define XOVER_MAX	200
+#define XOVER_STEP	10
+#define XOVER_DEF	80	/* Tower; Desktop is 120 */
+#define SOUND_CM_S	34029	/* Windows' 10 cm = 0.000293867 s */
+
+/*
+ * Headphone profiles (Sound Blaster Command's headphone list; notes 13):
+ * a speaker EQ image per model, uploaded into the DSP and switched on with
+ * 0x96/0x1f ("use speaker EQ") while the output is headphones and Direct
+ * Mode is off. The images are Creative's and not shipped: ae9-get-firmware
+ * extracts them from Creative's installer (AE9HPEQ/<key>.reg) into
+ * /lib/firmware/creative-ae9/hp/<key>.bin. Keys as in Creative's registry
+ * files, names as Sound Blaster Command shows them.
+ *
+ * Four custom slots (not in Windows) at the end of the list, so saved
+ * picks of Creative's profiles keep their numbers: the same format, two
+ * 512-tap linear-phase FIRs at 48 kHz (left, right), made from a published
+ * measurement by ae9-hp-profile. hp_custom names them ("DT990=Beyerdynamic
+ * DT 990 PRO;DT880=..."): slot N loads hp/<KEY>.bin and shows the name; an
+ * empty slot shows "Custom N" and loads hp/custom<N>.bin.
+ */
+static const struct { const char *key, *name; } hp_profiles[] = {
+	{ NULL,		"Off" },
+	{ "AKGM220",	"AKG M220" },
+	{ "IP3EP",	"Apple Earphone" },
+	{ "IP5EP",	"Apple Earpod" },
+	{ "ATHM50",	"audio-technica ATH-M50" },
+	{ "HS50",	"CORSAIR HS50" },
+	{ "CTAVNA",	"Creative Aurvana Air" },
+	{ "CTAVNG",	"Creative Aurvana Gold" },
+	{ "CTAVNL",	"Creative Aurvana Live!" },
+	{ "CTAVNL2",	"Creative Aurvana Live!2" },
+	{ "CTEP3NC",	"Creative EP-3NC" },
+	{ "CTFATGHS",	"Creative Fatal1ty Gaming Headset" },
+	{ "CTFlex",	"Creative Flex" },
+	{ "OUTLIER",	"Creative Outlier" },
+	{ "OUTLIERB",	"Creative Outlier Black" },
+	{ "CTSBINF",	"Creative SB Inferno Headset" },
+	{ "SXFIAIR",	"Creative SXFI AIR" },
+	{ "SXFIAIRC",	"Creative SXFI AIR C" },
+	{ "EMUTEAK",	"E-MU Teak" },
+	{ "WALNUT",	"E-MU Walnut" },
+	{ "HXHSCF",	"HYPERX HX-HSCF" },
+	{ "ETHERC",	"Mr Speakers ETHER C" },
+	{ "PFX2HR",	"Philips Fidelio X2HR" },
+	{ "GS3EP",	"Samsung Galaxy Headset" },
+	{ "HD201",	"SENNHEISER HD 201" },
+	{ "HD280Pro",	"SENNHEISER HD 280 Pro" },
+	{ "HD457",	"SENNHEISER HD 457" },
+	{ "MDR1R",	"SONY MDR-1R" },
+	{ "SBBLAZE",	"Sound Blaster Blaze" },
+	{ "H3",		"Sound BlasterX H3" },
+	{ "H5",		"Sound BlasterX H5 TE" },
+	{ "H7",		"Sound BlasterX H7 TE" },
+	{ "P5",		"Sound BlasterX P5" },
+	{ "custom1",	"Custom 1" },
+	{ "custom2",	"Custom 2" },
+	{ "custom3",	"Custom 3" },
+	{ "custom4",	"Custom 4" },
+};
+
+/*
+ * Headphone profile picks are debounced. Each upload is a few hundred
+ * commands to the card; seven in 3 s (a fast scroll through the list)
+ * choked the command ring, the DSP's DMA arm reply was lost and the DSP
+ * stopped answering until a power-off (2026-11-07, 12:42:34). So: upload
+ * only the pick still standing after HP_SETTLE_MS, at most one upload per
+ * HP_GAP_MS, and retry once an upload that failed before arming anything.
+ */
+#define HP_SETTLE_MS	700
+#define HP_GAP_MS	2000
+
+#define HP_CUSTOM	4
+#define HP_CUSTOM0	(ARRAY_SIZE(hp_profiles) - HP_CUSTOM)
+#define HP_KEY_MAX	24
+#define HP_NAME_MAX	40
+
+static struct {
+	char key[HP_KEY_MAX + 1], name[HP_NAME_MAX + 1];
+} hp_custom_slot[HP_CUSTOM];
+static char hp_custom_val[HP_CUSTOM * (HP_KEY_MAX + HP_NAME_MAX + 2) + 1];
+/* bumped each time a slot is (re)written: a loaded custom profile whose
+ * slot changed since (new key, or a new file under the same key) is
+ * loaded again */
+static unsigned int hp_custom_gen[HP_CUSTOM];
+static DEFINE_MUTEX(hp_custom_lock);
+static struct creative_chip *hp_custom_chip;	/* for the names' change event */
+static struct snd_kcontrol *hp_custom_kc;
+
+static bool hp_key_ok(const char *k)
+{
+	if (!*k || *k == '.')
+		return false;
+	for (; *k; k++)
+		if (!isalnum(*k) && *k != '_' && *k != '-' && *k != '.')
+			return false;
+	return true;
+}
+
+/*
+ * "KEY=Name;KEY=Name;;KEY=Name": slot by position, empty = unused. A bad
+ * entry is skipped (its slot stays empty) with a warning, never an error:
+ * an error here at load time would stop the whole driver loading (no sound
+ * card) because of one name in /etc/modprobe.d. ae9-hp-profile reads the
+ * value back to see what was taken.
+ */
+static int hp_custom_set(const char *val, const struct kernel_param *kp)
+{
+	typeof(hp_custom_slot) s = {};
+	struct creative_chip *chip;
+	char *buf, *p, *ent;
+	unsigned int n = 0;
+
+	buf = kstrdup(val, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	p = strim(buf);
+	while (p) {
+		char *eq;
+
+		ent = strsep(&p, ";");
+		ent = strim(ent);
+		if (n >= HP_CUSTOM) {
+			if (*ent)
+				pr_warn("creative-ae9: hp_custom: only %d slots; \"%s\" ignored\n",
+					HP_CUSTOM, ent);
+			continue;
+		}
+		if (*ent) {
+			eq = strchr(ent, '=');
+			if (eq)
+				*eq++ = '\0';
+			ent = strim(ent);
+			eq = eq ? strim(eq) : ent;
+			if (strlen(ent) > HP_KEY_MAX || !hp_key_ok(ent) ||
+			    strlen(eq) > HP_NAME_MAX || !*eq) {
+				pr_warn("creative-ae9: hp_custom: slot %u (\"%.*s\"): key 1-%d of A-Z a-z 0-9 _ - ., name 1-%d bytes; slot left empty\n",
+					n + 1, HP_KEY_MAX, ent, HP_KEY_MAX, HP_NAME_MAX);
+				n++;
+				continue;
+			}
+			strscpy(s[n].key, ent, sizeof(s[n].key));
+			strscpy(s[n].name, eq, sizeof(s[n].name));
+		}
+		n++;
+	}
+	kfree(buf);
+	mutex_lock(&hp_custom_lock);
+	for (n = 0; n < HP_CUSTOM; n++)
+		if (s[n].key[0] || hp_custom_slot[n].key[0])
+			hp_custom_gen[n]++;
+	memcpy(hp_custom_slot, s, sizeof(s));
+	hp_custom_val[0] = '\0';	/* the same, tidied: "KEY=Name;;KEY=Name" */
+	for (n = 0; n < HP_CUSTOM; n++) {
+		size_t l = strlen(hp_custom_val);
+
+		if (n)
+			l += scnprintf(hp_custom_val + l, sizeof(hp_custom_val) - l, ";");
+		if (s[n].key[0])
+			scnprintf(hp_custom_val + l, sizeof(hp_custom_val) - l, "%s=%s",
+				  s[n].key, s[n].name);
+	}
+	chip = hp_custom_chip;
+	if (chip && hp_custom_kc)	/* SbAe9-SBC & co. re-read the names */
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_INFO,
+			       &hp_custom_kc->id);
+	/* a picked custom profile whose slot changed loads again (or goes
+	 * off if its file is gone); hp_work checks, uploads only when idle.
+	 * Queued under the lock: creative_ae9_fx_remove clears the chip
+	 * before the remove path cancels the work. */
+	if (chip)
+		mod_delayed_work(chip->wq, &chip->hp_work,
+				 msecs_to_jiffies(HP_SETTLE_MS));
+	mutex_unlock(&hp_custom_lock);
+	return 0;
+}
+
+static int hp_custom_get(char *buf, const struct kernel_param *kp)
+{
+	int n;
+
+	mutex_lock(&hp_custom_lock);
+	n = scnprintf(buf, PAGE_SIZE, "%s\n", hp_custom_val);
+	mutex_unlock(&hp_custom_lock);
+	return n;
+}
+
+static const struct kernel_param_ops hp_custom_ops = {
+	.set = hp_custom_set,
+	.get = hp_custom_get,
+};
+module_param_cb(hp_custom, &hp_custom_ops, NULL, 0644);
+MODULE_PARM_DESC(hp_custom, "Custom headphone profiles, by slot: \"KEY=Name;KEY=Name;...\" (up to 4; slot N loads creative-ae9/hp/<KEY>.bin and shows Name); written by ae9-hp-profile");
+
+/* firmware key (hp/<key>.bin), shown name and slot version (custom
+ * slots; 0 for Creative's) of profile e */
+static void hp_profile_id_gen(unsigned int e, char *key, size_t klen,
+			      char *name, size_t nlen, unsigned int *gen)
+{
+	unsigned int c = e - HP_CUSTOM0;
+
+	if (gen)
+		*gen = 0;
+	if (e < HP_CUSTOM0) {
+		if (key)
+			strscpy(key, hp_profiles[e].key ?: "", klen);
+		if (name)
+			strscpy(name, hp_profiles[e].name, nlen);
+		return;
+	}
+	mutex_lock(&hp_custom_lock);
+	if (gen)
+		*gen = hp_custom_gen[c];
+	if (key)
+		strscpy(key, hp_custom_slot[c].key[0] ? hp_custom_slot[c].key :
+			hp_profiles[e].key, klen);
+	if (name)
+		strscpy(name, hp_custom_slot[c].name[0] ? hp_custom_slot[c].name :
+			hp_profiles[e].name, nlen);
+	mutex_unlock(&hp_custom_lock);
+}
+
+static void hp_profile_id(unsigned int e, char *key, size_t klen,
+			  char *name, size_t nlen)
+{
+	hp_profile_id_gen(e, key, klen, name, nlen, NULL);
+}
+
+/* the DSP holds the picked profile, as it is now (a custom slot may have
+ * been rewritten since it was loaded) */
+static bool fx_hp_current(const struct creative_ae9_fx *fx)
+{
+	unsigned int gen;
+
+	if (fx->hp_loaded != fx->hp_profile)
+		return false;
+	if (fx->hp_loaded < HP_CUSTOM0)
+		return true;
+	hp_profile_id_gen(fx->hp_loaded, NULL, 0, NULL, 0, &gen);
+	return gen == fx->hp_loaded_gen;
+}
+
+void creative_ae9_fx_remove(struct creative_chip *chip)
+{
+	mutex_lock(&hp_custom_lock);
+	if (hp_custom_chip == chip) {
+		hp_custom_chip = NULL;
+		hp_custom_kc = NULL;
+	}
+	mutex_unlock(&hp_custom_lock);
+}
+
 static unsigned int fx_spk_cfg = 2;
 module_param(fx_spk_cfg, uint, 0444);
 MODULE_PARM_DESC(fx_spk_cfg, "Speaker Config at load, Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows)");
+
+/*
+ * Live uploads, as Windows (21 uploads in 13 captures with playback, most
+ * also with captures running; nothing paused or muted). Ours broke the DSP
+ * while audio played (2026-11-08, note 54; Kaiba 0.10.1, note 55): every
+ * one of those deaths followed a lost reply or a command timeout and ring
+ * reset, i.e. the stale RIRB reads fixed in 0.12.10 (corb.c rirb_take).
+ * uv77 (2026-11-15, x2): 160 live uploads with music, with all four
+ * captures and with EQ toggled after each: all done, Y read-back 9/9,
+ * 0 lost replies, 0 timeouts, 0 DMA channel leaks.
+ */
+static bool hp_live_upload = true;
+module_param(hp_live_upload, bool, 0644);
+MODULE_PARM_DESC(hp_live_upload, "Upload headphone profiles while audio streams run, as Windows (default on; 0 = wait until every stream has stopped, as before 0.12.10)");
+
+static bool eq_headroom = true;
+module_param(eq_headroom, bool, 0644);
+MODULE_PARM_DESC(eq_headroom, "With a headphone profile and the EQ both on, send the DSP the EQ pre-gain 12 dB lower, not below -12 dB (default on; stops the DSP's overload, the \"metallic\" sound)");
 
 /* num/den as IEEE-754 single bits, without the FPU. |num/den| >= 2^-16. */
 static u32 fx_f32(s32 num, u32 den)
@@ -170,8 +465,8 @@ static u32 fx_f32(s32 num, u32 den)
  * stopped answering (seen once, 2026-11-03: 747 timeouts until a resume);
  * then nothing more is sent until the next bring-up (creative_ae9_fx_restore).
  */
-static int fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
-		   bool log)
+static int __fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
+		     bool log, bool soft)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
 	int ret;
@@ -182,17 +477,196 @@ static int fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
 	ret = creative_dsp_scp_send(chip, ((u32)req << 17) | (0x20 << 8) | mid,
 				    &val, 1);
 	if (ret < 0)
-		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x FAILED\n", mid, req, val);
+		dev_info(chip->dev, "fx: 0x%02x/0x%02x = 0x%08x FAILED (%d)\n", mid, req, val, ret);
 	else if (log)
 		ae9_dbg(chip, "fx: 0x%02x/0x%02x = 0x%08x\n", mid, req, val);
 	if (ret >= 0) {
 		fx->fails = 0;
+	} else if (soft || ret == -EBUSY) {
+		/* a setting the DSP may refuse in some states, or a word the
+		 * DSP had no room for (nothing was written, dsp.c
+		 * dspio_write_wait): not a sign of a stuck DSP; a halted
+		 * DSP is caught by dsp_kick */
 	} else if (++fx->fails >= 3) {
 		fx->dead = true;
 		dev_warn(chip->dev, "fx: the DSP stopped answering; no more effect changes until the next bring-up (sleep/wake or reboot)\n");
 	}
 	return ret;
 }
+
+static int fx_send(struct creative_chip *chip, u8 mid, u8 req, u32 val,
+		   bool log)
+{
+	return __fx_send(chip, mid, req, val, log, false);
+}
+
+/* Bass redirection's crossover and sub gain: the DSP rejects them at boot,
+ * so a refusal doesn't count towards "stopped answering". */
+static void fx_send_redirect(struct creative_chip *chip, bool log)
+{
+	struct creative_ae9_fx *fx = &chip->fx;
+
+	__fx_send(chip, FX_MID_OUT, 0x16, fx_f32(fx->xover, 1), log, true);
+	__fx_send(chip, FX_MID_OUT, 0x1e, fx_f32(fx->sub_gain, 1), log, true);
+}
+
+/* One speaker's calibration: level 0x21+i (dB), delay 0x31+i (seconds). */
+static u32 spk_level_val(const struct creative_ae9_fx *fx, unsigned int i)
+{
+	return fx->direct ? 0 : fx_f32(fx->spk_level[i], 1);
+}
+
+static u32 spk_delay_val(const struct creative_ae9_fx *fx, unsigned int i)
+{
+	return fx->direct ? 0 : fx_f32(fx->spk_dist[i], SOUND_CM_S);
+}
+
+/* EQ is in the DSP's path: Direct Mode off, SBX on, EQ on. */
+static bool fx_eq_live(const struct creative_ae9_fx *fx)
+{
+	return !fx->direct && fx->sbx && fx->eq_on;
+}
+
+/*
+ * The EQ pre-gain the DSP gets. With the headphone profile's EQ ("use
+ * speaker EQ", 0x1f) and the graphic EQ both on, a hot signal overloads
+ * the DSP: it drops every other 64-frame block, the "metallic" sound
+ * (Windows captures, notes 52/53: pre-gain 0 dB, 91% of snapshots bad;
+ * -12 dB, 0 of 253). Windows sends the setting as is. Here it goes 12 dB
+ * lower while both are on, but not below -12 dB (the slider's floor; the
+ * DSP's range below it is untested). The control keeps the user's value.
+ * Every pre-gain send goes through here.
+ */
+static s32 fx_pregain_tenths(const struct creative_ae9_fx *fx)
+{
+	s32 v = fx->eq[0];
+
+	if (eq_headroom && fx->hp_on)
+		v = max(v - 120, -120);
+	return v;
+}
+
+static u32 fx_pregain(const struct creative_ae9_fx *fx)
+{
+	return fx_f32(fx_pregain_tenths(fx), 10);
+}
+
+/*
+ * "Use speaker EQ" on or off, with the pre-gain moved first on the way in
+ * and after on the way out, so the two EQs are never both on at the full
+ * pre-gain. Always sends 0x1f: an output switch's replay turns it off in
+ * the DSP behind our back.
+ */
+static void fx_hp_set_locked(struct creative_chip *chip, bool on, bool log)
+{
+	struct creative_ae9_fx *fx = &chip->fx;
+	bool was = fx->hp_on;
+	bool eq = fx_eq_live(fx);	/* not eq_headroom: switching it off must restore */
+
+	if (on) {
+		fx->hp_on = true;
+		if (eq)
+			fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), log);
+		fx_send(chip, FX_MID_OUT, 0x1f, fx_f32(1, 1), log);
+	} else {
+		fx_send(chip, FX_MID_OUT, 0x1f, 0, log);
+		fx->hp_on = false;
+		if (eq && was)
+			fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), log);
+	}
+	if (eq && eq_headroom && was != on) {
+		s32 a = fx_pregain_tenths(fx), b = fx->eq[0];
+
+		dev_info(chip->dev, "EQ headroom: pre-gain %s%d.%d dB to the DSP (setting %s%d.%d dB)%s\n",
+			 a < 0 ? "-" : "", abs(a) / 10, abs(a) % 10,
+			 b < 0 ? "-" : "", abs(b) / 10, abs(b) % 10,
+			 on ? " while the headphone profile and the EQ are both on" : "");
+	}
+}
+
+enum hp_sync { HP_IDLE, HP_WAIT, HP_LOADED, HP_RETRY, HP_BLOCKED };
+
+/*
+ * Uploads that lost a reply or landed wrong broke the DSP until a
+ * power-off (our crash 2026-11-08, note 54; Kaiba's 0.10.1 report, note
+ * 55): most went wrong while audio played (stale RIRB reads, fixed in
+ * 0.12.10). hp_live_upload=0 makes an upload wait until every stream has
+ * stopped; with or without it, one that
+ * failed after the DSP's DMA was armed, or after 2 channels went missing,
+ * stops uploads until the next bring-up.
+ */
+static bool fx_hp_must_wait(struct creative_chip *chip)
+{
+	return !hp_live_upload && creative_ae9_streams_running(chip);
+}
+
+static void fx_hp_block(struct creative_chip *chip, const char *why)
+{
+	chip->fx.hp_blocked = true;
+	chip->fx.hp_waiting = false;
+	dev_warn(chip->dev, "headphone profile: %s; no more profile uploads until the next start (sleep/wake or reboot; power the PC off if the sound is broken)\n",
+		 why);
+}
+
+/*
+ * The headphone profile's part of a speaker block: upload the image if the
+ * DSP doesn't hold it yet (after a bring-up it holds nothing), then "use
+ * speaker EQ" on or off. On with Direct Mode off, headphones out and a
+ * profile picked. A failed or postponed upload leaves it off. Caller holds
+ * replay_mutex.
+ */
+static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
+{
+	struct creative_ae9_fx *fx = &chip->fx;
+	bool want = !fx->direct && chip->hu_output && fx->hp_profile;
+	enum hp_sync st = HP_IDLE;
+	char name[64];
+	int ret;
+
+	bool cur = fx_hp_current(fx);
+
+	if (!want || cur)
+		fx->hp_waiting = false;
+	if (want && !cur) {
+		if (fx->hp_blocked || fx->dead) {
+			st = HP_BLOCKED;
+		} else if (fx_hp_must_wait(chip)) {
+			if (!fx->hp_waiting)
+				dev_info(chip->dev, "headphone profile: loads when playback and recording stop (uploads during playback can break the DSP)\n");
+			fx->hp_waiting = true;
+			queue_delayed_work(chip->wq, &chip->hp_work,
+					   msecs_to_jiffies(HP_GAP_MS));
+			st = HP_WAIT;
+		} else {
+			fx->hp_waiting = false;
+			char key[HP_KEY_MAX + 1];
+			unsigned int gen;
+
+			/* the slot's version as of this key: a rewrite during
+			 * the upload makes it load again */
+			hp_profile_id_gen(fx->hp_profile, key, sizeof(key), NULL, 0, &gen);
+			snprintf(name, sizeof(name), "creative-ae9/hp/%s.bin", key);
+			ret = creative_dsp_hpeq_upload(chip, name);
+			fx->hp_loaded = ret ? 0 : fx->hp_profile;
+			fx->hp_loaded_gen = gen;
+			st = ret ? HP_RETRY : HP_LOADED;
+			if (ret == -EREMOTEIO) {
+				fx_hp_block(chip, "the upload failed after the DSP's DMA was set up");
+				st = HP_BLOCKED;
+			} else if (ret && chip->hp_leaks >= 2) {
+				fx_hp_block(chip, "2 DSP DMA channels went missing");
+				st = HP_BLOCKED;
+			}
+		}
+	}
+	/* while a new pick waits for a pause, the profile already loaded stays
+	 * on (Kaiba: it went off at once, audibly); the upload turns "use
+	 * speaker EQ" off itself before it writes, and a failure leaves it off */
+	fx_hp_set_locked(chip, want && fx->hp_loaded &&
+			 (fx->hp_loaded == fx->hp_profile || st == HP_WAIT), log);
+	return st;
+}
+
 
 /* Effects run only with Direct Mode off and SBX on. */
 static bool fx_eff(const struct creative_ae9_fx *fx)
@@ -206,6 +680,93 @@ static bool fx_ready(struct creative_chip *chip)
 }
 
 /* Windows' SBX profile sequence; with SBX off, everything off. */
+/*
+ * Headphone virtualization ("Virtual 7.1" in Creative's guide): with the
+ * output on headphones and Direct Mode off, Windows tells the DSP it is
+ * driving headphones, speaker config 0 (MASTERCONTROL 0x80/0x04 = 0), and
+ * SBX Surround becomes the headphone virtualizer; there is no other switch
+ * (Sound Blaster Command: one headphone config on the AE-9). Its headphone
+ * block (capture 4 s11, 00:58:27.54 #16040-16500; CtxHda FUN_00019534):
+ * levels and delays of all 8 channels 0, interleaved; config 0; X-Bass at
+ * 0x17 80 Hz; bass redirect off; no full-range pairs 0x1a-0x1d. We sent
+ * the speaker config (2.0..5.1) on headphones until 2026-11-09.
+ */
+static bool fx_hp_virt(struct creative_chip *chip)
+{
+	return !chip->fx.direct && chip->hu_output && chip->fx.hp_virt;
+}
+
+/*
+ * The closing unmute of a mute ... unmute bracket, as Windows does it
+ * (CtxHda FUN_000196d0, note 64c): unmute, read the mute back, and while
+ * it still reads muted (or the read fails) unmute again after 10 ms, at
+ * most 10 times. Sent even when the DSP was marked as not answering: the
+ * opening mute may already be in, and a lost unmute leaves DSP-mode
+ * playback silent until the next effect change.
+ * unmute_check=0: one unmute, no read-back (before 0.12.6).
+ */
+static unsigned int unmute_check = 1;
+module_param(unmute_check, uint, 0644);
+MODULE_PARM_DESC(unmute_check, "DSP output unmute after effect changes: read it back and resend until it took, as Windows (1 = yes, default; 0 = one unmute, no check)");
+
+static void fx_unmute_verify(struct creative_chip *chip)
+{
+	u32 hdr = (0x3a << 17) | (0x20 << 8) | FX_MID_OUT, zero = 0, val = ~0U, val0 = 0;
+	int i, ret = 0, got = 0, got0 = 0, fails = 0;
+
+	for (i = 0; i < 10; i++) {
+		if (i) {
+			chip->unmute_resends++;
+			usleep_range(10000, 11000);
+		}
+		usleep_range(5000, 6000);	/* fx_send's pacing */
+		ret = creative_dsp_scp_send(chip, hdr, &zero, 1);
+		if (ret < 0)
+			dev_info(chip->dev, "fx: unmute (0x96/0x3a = 0) FAILED (%d)\n", ret);
+		/* a DSP that stopped answering gets the one unmute, no
+		 * read-backs (each failed read waits up to 1 s) */
+		if (!unmute_check || chip->dsp_halted || chip->fx.dead)
+			return;
+		usleep_range(3000, 4000);	/* Windows reads 2-3 ms after the unmute */
+		got = creative_dsp_out_mute_get(chip, &val);
+		if (!i) {
+			got0 = got;
+			val0 = val;
+		}
+		if (got < 0 && ++fails >= 3) {
+			dev_info(chip->dev, "fx: DSP output mute can't be read back (%d); unmute sent %d times\n",
+				 got, i + 1);
+			return;
+		}
+		if (got >= 0 && val == 0) {
+			if (i)
+				dev_info(chip->dev, "fx: DSP output unmuted after %d resend%s (first read %d: 0x%08x)\n",
+					 i, i == 1 ? "" : "s", got0, val0);
+			return;
+		}
+	}
+	chip->unmute_stuck++;
+	dev_warn(chip->dev, "fx: DSP output still muted after 10 unmutes (last send %d, read %d: 0x%08x); DSP mode may play silence until the next effect change\n",
+		 ret, got, val);
+}
+
+/*
+ * Windows unmutes the DSP output at every stream start and stop (CtxHda
+ * FUN_0001964c from the stream SetState, no read-back). In DSP mode only:
+ * Direct Mode doesn't pass the DSP output. pcm_unmute=0: not sent.
+ */
+static unsigned int pcm_unmute = 1;
+module_param(pcm_unmute, uint, 0644);
+MODULE_PARM_DESC(pcm_unmute, "DSP mode: unmute the DSP output at every playback start and stop, as Windows (1 = yes, default; 0 = no)");
+
+void creative_ae9_fx_unmute(struct creative_chip *chip)
+{
+	if (!pcm_unmute || chip->fx.direct || !fx_ready(chip) ||
+	    chip->fx.dead || chip->dsp_halted)
+		return;
+	__fx_send(chip, FX_MID_OUT, 0x3a, 0, false, true);
+}
+
 static void fx_apply_all_locked(struct creative_chip *chip)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
@@ -213,23 +774,54 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 
 	bool on;
 
+	if (fx_hp_virt(chip)) {
+		fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
+		/* Windows sends 8+8; the DSP rejects channels 7/8 (0x27/0x28/
+		 * 0x37/0x38, error replies in all 36 Windows sets), so 6+6 */
+		for (i = 0; i < 6; i++) {
+			fx_send(chip, FX_MID_OUT, 0x21 + i, 0, false);
+			fx_send(chip, FX_MID_OUT, 0x31 + i, 0, false);
+			usleep_range(10000, 11000);	/* CtxHda FUN_00019534: 10 ms */
+		}
+		fx_send(chip, FX_MID_MASTER, 0x04, 0, true);
+		/* X-Bass crossover gain: always 0.1 in Windows' headphone block
+		 * (every headphone + DSP block in all captures) */
+		fx_send(chip, FX_MID_OUT, 0x19, fx_f32(1, 10), false);
+		fx_send(chip, FX_MID_OUT, 0x17, fx_f32(80, 1), false);
+		fx_send(chip, FX_MID_OUT, 0x18, 0, false);
+		fx_send(chip, FX_MID_SPKEQ, 0x01, 0, false);
+		fx_hp_sync_locked(chip, false);
+		fx_send(chip, FX_MID_OUT, 0x15, 0, false);
+		goto effects;
+	}
+
 	/* Windows' order (capture 3, 19:56:08): mute, speaker config, speaker
 	 * block, on/offs, then values only for what is on, EQ on last. */
 	fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
+	/* speaker calibration first, as Windows' speaker block (capture
+	 * 2026-11-07, section 12): levels, then delays */
+	for (i = 0; i < ARRAY_SIZE(fx->spk_level); i++)
+		fx_send(chip, FX_MID_OUT, 0x21 + i, spk_level_val(fx, i), false);
+	for (i = 0; i < ARRAY_SIZE(fx->spk_dist); i++)
+		fx_send(chip, FX_MID_OUT, 0x31 + i, spk_delay_val(fx, i), false);
 	fx_send(chip, FX_MID_MASTER, 0x04,
 		fx_f32(fx->direct ? 8 : spk_cfgs[spk_idx(fx)], 1), true);
 	fx_send(chip, FX_MID_OUT, 0x19, fx_f32(fx->level[FX_BASS], 100), false);
 	fx_send(chip, FX_MID_OUT, 0x17, fx_f32(80, 1), false);
 	fx_send(chip, FX_MID_OUT, 0x18, 0, false);
 	fx_send(chip, FX_MID_SPKEQ, 0x01, 0, false);
-	fx_send(chip, FX_MID_OUT, 0x1f, 0, false);
-	fx_send(chip, FX_MID_OUT, 0x15, 0, false);
+	fx_hp_sync_locked(chip, false);
+	fx_send(chip, FX_MID_OUT, 0x15,
+		fx_f32(!fx->direct && fx->bass_redirect, 1), false);
+	if (!fx->direct && fx->bass_redirect)
+		fx_send_redirect(chip, false);
 	/* full range on every pair (front, center/LFE, rear, surround), sent
 	 * by Windows after each speaker config change in DSP mode (captures 5
 	 * and 6); otherwise the DSP redirects the bass to the LFE channel,
 	 * which the AE-9's stereo outputs don't have */
 	for (i = 0; i < 4; i++)
 		fx_send(chip, FX_MID_OUT, 0x1a + i, fx_f32(1, 1), false);
+effects:
 	for (i = 0; i < FX_COUNT; i++)
 		fx_send(chip, FX_MID_OUT, fx_req_on[i],
 			fx_f32(fx_eff(fx) && fx->on[i], 1), false);
@@ -245,9 +837,9 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 	for (i = 1; on && i < FX_EQ_VALUES; i++)
 		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 10), false);
 	if (on)
-		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 10), false);
+		fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), false);
 	fx_send(chip, FX_MID_OUT, 0x09, fx_f32(on, 1), false);
-	fx_send(chip, FX_MID_OUT, 0x3a, 0, false);
+	fx_unmute_verify(chip);
 }
 
 static void fx_apply_all(struct creative_chip *chip)
@@ -258,8 +850,9 @@ static void fx_apply_all(struct creative_chip *chip)
 	fx_apply_all_locked(chip);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
-	dev_info(chip->dev, "Direct Mode %s, SBX %s (Surround %d, Dialog+ %d, Smart Volume %d, Crystalizer %d, Bass %d, EQ %d%s)\n",
+	dev_info(chip->dev, "Direct Mode %s, SBX %s%s (Surround %d, Dialog+ %d, Smart Volume %d, Crystalizer %d, Bass %d, EQ %d%s)\n",
 		 chip->fx.direct ? "on" : "off", chip->fx.sbx ? "on" : "off",
+		 fx_hp_virt(chip) ? ", headphone virtualization" : "",
 		 chip->fx.on[FX_SURROUND],
 		 chip->fx.on[FX_DIALOG], chip->fx.on[FX_SMARTVOL],
 		 chip->fx.on[FX_CRYSTAL], chip->fx.on[FX_BASS], chip->fx.eq_on,
@@ -315,7 +908,7 @@ static void fx_live_eq(struct creative_chip *chip, bool values, bool onoff)
 	for (i = 1; values && fx->eq_on && i < FX_EQ_VALUES; i++)
 		fx_send(chip, FX_MID_OUT, 0x0a + i, fx_f32(fx->eq[i], 10), true);
 	if (values && fx->eq_on)
-		fx_send(chip, FX_MID_OUT, 0x0a, fx_f32(fx->eq[0], 10), true);
+		fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), true);
 	if (onoff)
 		fx_send(chip, FX_MID_OUT, 0x09, fx_f32(fx->eq_on, 1), true);
 	fx_live_end(chip);
@@ -328,12 +921,80 @@ static void fx_live_one(struct creative_chip *chip, u8 req, u32 val)
 	fx_live_end(chip);
 }
 
+/*
+ * Speaker setup in headphone mode (Virtual 7.1): Windows' headphone block
+ * sets levels, delays, config and bass redirect itself, so the speaker
+ * setup (Speaker Config, levels, distances, bass redirect, crossover, sub
+ * gain) is only stored there, and goes to the DSP with the full apply at
+ * the switch back to speakers (or Headphone Virtualization off). Checked
+ * under replay_mutex: the follow work and the heartbeat's output switch
+ * can run at the same time.
+ */
+static void fx_live_spk_one(struct creative_chip *chip, u8 req, u32 val)
+{
+	fx_live_begin(chip);
+	if (!fx_hp_virt(chip))
+		fx_send(chip, FX_MID_OUT, req, val, true);
+	fx_live_end(chip);
+}
+
+/* Speaker Config changed: the whole profile again (config + full range,
+ * as Windows), except in headphone mode (above) */
+static void fx_apply_spk(struct creative_chip *chip)
+{
+	bool sent = false;
+
+	if (!fx_ready(chip))
+		return;
+	mutex_lock(&chip->replay_mutex);
+	if (!fx_hp_virt(chip)) {
+		fx_apply_all_locked(chip);
+		creative_dsp_chipio_addr_invalidate();
+		sent = true;
+	}
+	mutex_unlock(&chip->replay_mutex);
+	if (!sent)
+		dev_info(chip->dev, "Speaker Config stored; sent when the output is speakers\n");
+}
+
+/* The DSP routing was set up again (switch to DSP mode, bring-up): its
+ * "use speaker EQ" is off until the profile block sends it. */
+static void creative_ae9_fx_hp_reset(struct creative_chip *chip)
+{
+	chip->fx.hp_on = false;
+	chip->fx.hp_waiting = false;
+	chip->hp_tries = 0;
+}
+
+/*
+ * The DSP firmware is about to be (re)loaded (hw_bringup): a fresh DSP,
+ * so a blocked upload may be tried again and lost channels are back. Only
+ * here: a Direct Mode round trip is router verbs only, the DSP keeps
+ * whatever a failed upload left (review B1, note 56a).
+ */
+void creative_ae9_fx_dsp_reset(struct creative_chip *chip)
+{
+	chip->fx.hp_on = false;
+	chip->fx.hp_loaded = 0;
+	chip->fx.hp_blocked = false;
+	chip->fx.hp_waiting = false;
+	chip->hp_leaks = 0;
+	chip->hp_tries = 0;
+	chip->scp_fail_logged = false;
+	chip->dsp_halted = false;	/* a new firmware start */
+	chip->scp_rest_n = 0;		/* nothing half-sent to the new DSP */
+	chip->cap_level_sent = false;	/* Windows' level block again */
+	chip->scp_quiet_until = jiffies;
+}
+
 /* After a bring-up (probe or resume) the DSP is back at its startup state:
  * effects off, speaker config 8. Only SBX on needs sending again. */
 void creative_ae9_fx_restore(struct creative_chip *chip)
 {
-	chip->fx.dead = false;
+	chip->fx.dead = chip->dsp_halted;	/* halted itself in the startup tail */
 	chip->fx.fails = 0;
+	chip->fx.hp_loaded = 0;		/* the DSP was reset */
+	creative_ae9_fx_hp_reset(chip);
 	if (chip->fx.direct)
 		return;
 	creative_ae9_dsp_mode(chip, true);
@@ -347,8 +1008,10 @@ void creative_ae9_fx_restore(struct creative_chip *chip)
  */
 void creative_ae9_fx_defer(struct creative_chip *chip)
 {
-	chip->fx.dead = false;
+	chip->fx.dead = chip->dsp_halted;	/* halted itself in the startup tail */
 	chip->fx.fails = 0;
+	chip->fx.hp_loaded = 0;		/* the DSP was reset */
+	creative_ae9_fx_hp_reset(chip);
 	if (!chip->fx.direct)
 		chip->dsp_switch_pending = true;
 }
@@ -362,6 +1025,8 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 	fx->eq_preset = EQ_PRESET_FLAT;	/* the EQ values above are flat (0) */
 	fx->direct = true;
 	fx->spk = fx_spk_cfg == 1 ? 0 : 1;
+	fx->xover = XOVER_DEF;
+	fx->hp_virt = true;	/* Windows: always on with headphones, DSP mode */
 	for (i = 0; i < FX_COUNT; i++) {
 		fx->on[i] = fx_def_on[i];
 		fx->level[i] = fx_def_lvl[i];
@@ -372,18 +1037,82 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 /* Controls: private_value = kind << 8 | index                         */
 /* ------------------------------------------------------------------ */
 
-enum { K_SBX, K_ON, K_LVL, K_SVMODE, K_EQON, K_EQ, K_PRESET, K_SCOUT, K_DIRECT, K_SPK };
+enum { K_SBX, K_ON, K_LVL, K_SVMODE, K_EQON, K_EQ, K_PRESET, K_SCOUT, K_DIRECT, K_SPK,
+       K_REDIR, K_XOVER, K_SUBGAIN, K_SPKLVL, K_SPKDIST, K_HPPROF };
 #define PV(k, i)	((k) << 8 | (i))
 #define PV_K(pv)	((pv) >> 8)
 #define PV_I(pv)	((pv) & 0xff)
 
 static const DECLARE_TLV_DB_SCALE(eq_tlv, -1200, 100, 0);
+static const DECLARE_TLV_DB_SCALE(spk_tlv, SPK_LVL_MIN * 100, 100, 0);
+
+/* Speaker setup: changes go to the DSP with Direct Mode off, effects or not */
+static bool fx_live_spk(struct creative_chip *chip)
+{
+	return !chip->fx.direct && fx_ready(chip) && !chip->fx.dead &&
+	       !chip->dsp_switch_pending;
+}
+
+void creative_ae9_fx_hp_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w),
+						  struct creative_chip, hp_work);
+	struct creative_ae9_fx *fx = &chip->fx;
+	unsigned long next = chip->hp_last + msecs_to_jiffies(HP_GAP_MS);
+	bool upload;
+	enum hp_sync st;
+
+	if (READ_ONCE(chip->unloading))	/* the card and its controls are going */
+		return;
+
+	if (!fx_live_spk(chip))
+		return;
+	if (chip->hp_last && time_before(jiffies, next)) {
+		queue_delayed_work(chip->wq, &chip->hp_work, next - jiffies);
+		return;
+	}
+	upload = fx->hp_profile && !fx_hp_current(fx) &&
+		 chip->hu_output && !fx->hp_blocked;
+	/* waiting for the streams to stop: look again later, no DSP traffic */
+	if (upload && fx->hp_waiting && fx_hp_must_wait(chip)) {
+		queue_delayed_work(chip->wq, &chip->hp_work,
+				   msecs_to_jiffies(HP_GAP_MS));
+		return;
+	}
+	fx_live_begin(chip);
+	if (fx_live_spk(chip)) {
+		st = fx_hp_sync_locked(chip, true);
+		if (st == HP_LOADED || st == HP_RETRY || st == HP_BLOCKED)
+			chip->hp_last = jiffies ?: 1;
+		if (st == HP_RETRY && !fx->dead && chip->hp_tries++ < 1)
+			queue_delayed_work(chip->wq, &chip->hp_work,
+					   msecs_to_jiffies(HP_GAP_MS));
+	}
+	fx_live_end(chip);
+}
 
 static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
 	switch (PV_K(kc->private_value)) {
 	case K_SBX: case K_ON: case K_EQON: case K_SCOUT: case K_DIRECT:
+	case K_REDIR: case K_SUBGAIN:
 		return snd_ctl_boolean_mono_info(kc, ui);
+	case K_XOVER: case K_SPKLVL: case K_SPKDIST: {
+		static const struct { s16 min, max, step; } r[] = {
+			[K_XOVER - K_XOVER]	= { XOVER_MIN, XOVER_MAX, XOVER_STEP },
+			[K_SUBGAIN - K_XOVER]	= { SPK_LVL_MIN, SPK_LVL_MAX, 1 },
+			[K_SPKLVL - K_XOVER]	= { SPK_LVL_MIN, SPK_LVL_MAX, 1 },
+			[K_SPKDIST - K_XOVER]	= { 0, SPK_DIST_MAX, 1 },
+		};
+		unsigned int k = PV_K(kc->private_value) - K_XOVER;
+
+		ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+		ui->count = 1;
+		ui->value.integer.min = r[k].min;
+		ui->value.integer.max = r[k].max;
+		ui->value.integer.step = r[k].step;
+		return 0;
+	}
 	case K_SVMODE:
 		return snd_ctl_enum_info(ui, 1, ARRAY_SIZE(sv_mode_names),
 					 sv_mode_names);
@@ -392,6 +1121,24 @@ static int fx_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 					 eq_preset_names);
 	case K_SPK:
 		return snd_ctl_enum_info(ui, 1, spk_count(), spk_names);
+	case K_HPPROF: {
+		static const char *names[ARRAY_SIZE(hp_profiles)];
+		static char cname[HP_CUSTOM][HP_NAME_MAX + 1];
+		static DEFINE_MUTEX(info_lock);	/* names[] is shared */
+		unsigned int i;
+		int ret;
+
+		mutex_lock(&info_lock);
+		for (i = 0; i < ARRAY_SIZE(hp_profiles); i++)
+			names[i] = hp_profiles[i].name;
+		for (i = 0; i < HP_CUSTOM; i++) {
+			hp_profile_id(HP_CUSTOM0 + i, NULL, 0, cname[i], sizeof(cname[i]));
+			names[HP_CUSTOM0 + i] = cname[i];
+		}
+		ret = snd_ctl_enum_info(ui, 1, ARRAY_SIZE(hp_profiles), names);
+		mutex_unlock(&info_lock);
+		return ret;
+	}
 	}
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	ui->count = 1;
@@ -418,6 +1165,12 @@ static int fx_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_SVMODE:	uv->value.enumerated.item[0] = fx->sv_mode; break;
 	case K_PRESET:	uv->value.enumerated.item[0] = fx->eq_preset; break;
 	case K_SPK:	uv->value.enumerated.item[0] = spk_idx(fx); break;
+	case K_REDIR:	*v = fx->bass_redirect; break;
+	case K_XOVER:	*v = fx->xover; break;
+	case K_SUBGAIN:	*v = fx->sub_gain; break;
+	case K_SPKLVL:	*v = fx->spk_level[i]; break;
+	case K_SPKDIST:	*v = fx->spk_dist[i]; break;
+	case K_HPPROF:	uv->value.enumerated.item[0] = fx->hp_profile; break;
 	}
 	return 0;
 }
@@ -462,7 +1215,7 @@ static void fx_update_active(struct creative_chip *chip)
 		struct snd_kcontrol *kc = fx->kc[i];
 		unsigned int k = PV_K(kc->private_value), old = kc->vd[0].access;
 		bool active = k == K_DIRECT ? true :
-			      k == K_SBX || k == K_SPK ? !fx->direct : fx_eff(fx);
+			      k == K_SBX || k >= K_SPK ? !fx->direct : fx_eff(fx);
 
 		if (active)
 			kc->vd[0].access &= ~SNDRV_CTL_ELEM_ACCESS_INACTIVE;
@@ -492,6 +1245,9 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	long v = uv->value.integer.value[0];
 	unsigned int e = uv->value.enumerated.item[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	switch (PV_K(kc->private_value)) {
 	case K_DIRECT:
 		if (!!v == fx->direct)
@@ -514,6 +1270,18 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			chip->dsp_switch_pending = false;
 			creative_ae9_dsp_mode(chip, true);
 			fx_apply_all(chip);
+		} else if (!chip->dsp_active) {
+			/*
+			 * DSP mode never started (the switch was still pending:
+			 * the stream plays direct, e.g. at 44.1 kHz). Nothing to
+			 * undo. Replaying the "DSP off" block anyway disturbed
+			 * the running direct stream and nothing restarted it:
+			 * silent until the player reopened (2026-11-07).
+			 */
+			chip->dsp_switch_pending = false;
+			/* the next Direct start checks the router again */
+			chip->rt_direct_swept = false;
+			dev_info(chip->dev, "Direct Mode on (DSP mode hadn't started; the stream stays as it is)\n");
 		} else {
 			bool was_dsp = chip->dsp_active;
 			struct snd_pcm_substream *ss = READ_ONCE(chip->playback_substream);
@@ -541,6 +1309,10 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 				snd_pcm_stop_xrun(ss);
 			}
 		}
+		/* Line Out Virtualization is DSP mode only: re-route after
+		 * the mode switch, from the heartbeat */
+		if (chip->lo_virt && chip->hu_output)
+			creative_ae9_hu_reroute_request(chip);
 		fx_update_active(chip);
 		return 1;
 	case K_SBX:
@@ -591,8 +1363,14 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		if (v == DIV_ROUND_CLOSEST(fx->eq[i], 10))
 			return 0;	/* also keeps a preset's 0.1 dB value */
 		fx->eq[i] = v * 10;
-		if (fx_live(chip) && fx->eq_on)
-			fx_live_one(chip, 0x0a + i, fx_f32(v, 1));
+		if (fx_live(chip) && fx->eq_on) {
+			/* the pre-gain under the lock: an upload or output
+			 * switch may be turning the profile on (review B4) */
+			fx_live_begin(chip);
+			fx_send(chip, FX_MID_OUT, 0x0a + i,
+				i ? fx_f32(v, 1) : fx_pregain(fx), true);
+			fx_live_end(chip);
+		}
 		return 1;
 	case K_PRESET:
 		if (e >= ARRAY_SIZE(eq_preset_names))
@@ -608,7 +1386,77 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 			return 0;
 		fx->spk = e;
 		if (!fx->direct && !chip->dsp_switch_pending)
-			fx_apply_all(chip);	/* speaker config + full range, as Windows */
+			fx_apply_spk(chip);	/* speaker config + full range, as Windows */
+		return 1;
+	case K_REDIR:
+		if (!!v == fx->bass_redirect)
+			return 0;
+		fx->bass_redirect = !!v;
+		if (fx_live_spk(chip)) {
+			fx_live_begin(chip);
+			if (!fx_hp_virt(chip)) {
+				fx_send(chip, FX_MID_OUT, 0x15, fx_f32(fx->bass_redirect, 1), true);
+				if (fx->bass_redirect)
+					fx_send_redirect(chip, true);
+			}
+			fx_live_end(chip);
+		}
+		return 1;
+	case K_XOVER:
+		v = clamp_t(long, rounddown(v, XOVER_STEP), XOVER_MIN, XOVER_MAX);
+		if (v == fx->xover)
+			return 0;
+		fx->xover = v;
+		if (fx_live_spk(chip) && fx->bass_redirect) {
+			fx_live_begin(chip);
+			if (!fx_hp_virt(chip))
+				__fx_send(chip, FX_MID_OUT, 0x16, fx_f32(v, 1), true, true);
+			fx_live_end(chip);
+		}
+		return 1;
+	case K_SUBGAIN:	/* Creative: SubwooferBoost, on/off (0x96/0x1e = 0 / 1.0) */
+		v = !!v;
+		if (v == fx->sub_gain)
+			return 0;
+		fx->sub_gain = v;
+		if (fx_live_spk(chip) && fx->bass_redirect) {
+			fx_live_begin(chip);
+			if (!fx_hp_virt(chip))
+				__fx_send(chip, FX_MID_OUT, 0x1e, fx_f32(v, 1), true, true);
+			fx_live_end(chip);
+		}
+		return 1;
+	case K_SPKLVL:
+		v = clamp_t(long, v, SPK_LVL_MIN, SPK_LVL_MAX);
+		if (v == fx->spk_level[i])
+			return 0;
+		fx->spk_level[i] = v;
+		if (fx_live_spk(chip))
+			fx_live_spk_one(chip, 0x21 + i, spk_level_val(fx, i));
+		return 1;
+	case K_SPKDIST:
+		v = clamp_t(long, v, 0, SPK_DIST_MAX);
+		if (v == fx->spk_dist[i])
+			return 0;
+		fx->spk_dist[i] = v;
+		if (fx_live_spk(chip))
+			fx_live_spk_one(chip, 0x31 + i, spk_delay_val(fx, i));
+		return 1;
+	case K_HPPROF:
+		if (e >= ARRAY_SIZE(hp_profiles) || e == fx->hp_profile)
+			return 0;
+		fx->hp_profile = e;
+		{
+			char n[HP_NAME_MAX + 1];
+
+			hp_profile_id(e, NULL, 0, n, sizeof(n));
+			dev_info(chip->dev, "Headphone Profile: %s\n", n);
+		}
+		/* upload once the picker has been still for a moment */
+		chip->hp_tries = 0;
+		if (fx_live_spk(chip))
+			mod_delayed_work(chip->wq, &chip->hp_work,
+					 msecs_to_jiffies(HP_SETTLE_MS));
 		return 1;
 	case K_SCOUT:
 		if (!!v == fx->scout)
@@ -628,11 +1476,29 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
  * 2.1) becomes 5.1; back on a 2-channel stream, 5.1 becomes 2.1. 4.0 and
  * 4.1 are the user's choice and stay. Mixers and SbAe9-SBC get notified.
  */
+void creative_ae9_fx_spk_follow_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w),
+						  struct creative_chip, spk_follow_work);
+	struct snd_pcm_substream *ss = chip->playback_substream;
+
+	if (READ_ONCE(chip->unloading))
+		return;
+
+	/* only a stream that's still there and running */
+	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING ||
+	    ss->runtime->channels != chip->spk_follow_ch)
+		return;
+	creative_ae9_fx_spk_follow(chip, chip->spk_follow_ch);
+}
+
 void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channels)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
 	unsigned int want = fx->spk, i;
 
+	/* in headphone mode too: the value is stored (the DSP downmixes 5.1
+	 * itself there) and sent at the switch back to speakers */
 	if (!ae9_surround)
 		return;
 	if (channels == 6 && spk_idx(fx) <= 1)
@@ -645,11 +1511,28 @@ void creative_ae9_fx_spk_follow(struct creative_chip *chip, unsigned int channel
 	dev_info(chip->dev, "Speaker Config %s (follows the %u-channel stream)\n",
 		 spk_names[want], channels);
 	if (!fx->direct && !chip->dsp_switch_pending)
-		fx_apply_all(chip);
+		fx_apply_spk(chip);
 	for (i = 0; i < fx->nkc; i++)
 		if (PV_K(fx->kc[i]->private_value) == K_SPK)
 			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
 				       &fx->kc[i]->id);
+}
+
+/*
+ * After a speakers/headphones switch with Direct Mode off. Windows' switch
+ * sequence (replayed from its op lists) also sets the DSP: speaker config
+ * 8, X-Bass off, bass redirect off, "use speaker EQ" off. Windows' app
+ * sends its own profile again within seconds; we sent only the headphone
+ * profile back, and the DSP stayed in the switch state: it then output
+ * every other 64-frame block, music at half speed with a 375 Hz buzz
+ * (2026-11-08 09:44 and 10:12, notes 56b/56c; cleared by the next SBX
+ * toggle). So: the whole profile again, inside its mute (fx_apply_all).
+ */
+void creative_ae9_fx_output_changed(struct creative_chip *chip)
+{
+	if (!fx_live_spk(chip))
+		return;
+	fx_apply_all(chip);
 }
 
 /*
@@ -694,14 +1577,20 @@ static int fx_add(struct creative_chip *chip, const char *name,
 	struct snd_kcontrol *kc;
 	int err;
 
-	if (kind == K_EQ) {
+	if (kind == K_EQ || kind == K_SPKLVL) {
 		kn.access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
-		kn.tlv.p = eq_tlv;
+		kn.tlv.p = kind == K_EQ ? eq_tlv : spk_tlv;
 	}
 	kc = snd_ctl_new1(&kn, chip);
 	err = snd_ctl_add(chip->card, kc);	/* frees kc on error */
 	if (!err && chip->fx.nkc < ARRAY_SIZE(chip->fx.kc))
 		chip->fx.kc[chip->fx.nkc++] = kc;
+	if (!err && kind == K_HPPROF) {	/* for the custom names' change event */
+		mutex_lock(&hp_custom_lock);
+		hp_custom_chip = chip;
+		hp_custom_kc = kc;
+		mutex_unlock(&hp_custom_lock);
+	}
 	return err;
 }
 
@@ -709,8 +1598,43 @@ static int fx_add(struct creative_chip *chip, const char *name,
  * Names avoid PipeWire's mixer-path element names ("Surround", "Bass",
  * "Treble" ...), so the desktop leaves them alone.
  */
+static int hp_virt_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->fx.hp_virt;
+	return 0;
+}
+
+static int hp_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
+	if (on == chip->fx.hp_virt)
+		return 0;
+	chip->fx.hp_virt = on;
+	dev_info(chip->dev, "Headphone Virtualization %s\n", on ? "on" : "off");
+	if (!chip->fx.direct && chip->hu_output && !chip->dsp_switch_pending)
+		fx_apply_all(chip);
+	return 1;
+}
+
+static const struct snd_kcontrol_new hp_virt_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Headphone Virtualization Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = hp_virt_get,
+	.put = hp_virt_put,
+};
+
 int creative_ae9_fx_controls_add(struct creative_chip *chip)
 {
+	snd_ctl_add(chip->card, snd_ctl_new1(&hp_virt_control, chip));
 	char name[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 	unsigned int i;
 	int err;
@@ -740,6 +1664,23 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	}
 	if (!err)
 		err = fx_add(chip, "Scout Mode Switch", K_SCOUT, 0);
+	/* speaker setup; names stay clear of PipeWire's path elements */
+	if (!err)
+		err = fx_add(chip, "Bass Redirect Switch", K_REDIR, 0);
+	if (!err)
+		err = fx_add(chip, "Bass Redirect Crossover", K_XOVER, 0);
+	if (!err)
+		err = fx_add(chip, "Bass Redirect Sub Boost Switch", K_SUBGAIN, 0);
+	for (i = 0; !err && i < ARRAY_SIZE(spk_ch_names); i++) {
+		snprintf(name, sizeof(name), "Speaker Level %s Volume", spk_ch_names[i]);
+		err = fx_add(chip, name, K_SPKLVL, i);
+		if (err)
+			break;
+		snprintf(name, sizeof(name), "Speaker Distance %s", spk_ch_names[i]);
+		err = fx_add(chip, name, K_SPKDIST, i);
+	}
+	if (!err)
+		err = fx_add(chip, "Headphone Profile", K_HPPROF, 0);
 	fx_update_active(chip);
 	return err;
 }

@@ -1,7 +1,748 @@
 # Changelog
 
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
-tested on one card (IDT bridge, `10e3:8111`).
+tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
+
+## 0.12.11 (unreleased, DRAFT)
+Full volume in DSP mode, and switch freely. 🎚️
+
+Pairs with SbAe9-SBC vX.Y.Z (TBD: its "Applying changes" pause drops to 2 s) and SbAe9-AudioMon v0.4.7 (unchanged).
+
+- **Fixed: DSP mode (Direct Mode off) played 6 dB quieter than Direct
+  Mode, and only half of the audio.** The DSP runs at 96 kHz and sends
+  each channel to the DACs on two lanes, every other sample on each; the
+  driver connected only the first lane, so the DACs got half the samples
+  (6 dB down, plus an inaudible ultrasonic mirror image). The card's
+  router chip normally sets these lanes up itself, but on our card its
+  own setup fails and leaves them unconnected. The driver now connects
+  every lane in the router chip's own slots for them, the way Creative's
+  Windows driver routes its Direct Mode. On the card: DSP mode now plays
+  at Direct Mode's level (0.0 dB, was −6.1 dB), Bass Redirect reaches the
+  sub every time, and 5.1 gets each channel's full signal. **⚠️ DSP mode
+  is now 6 dB louder at the same volume, on the headphones too: turn it
+  down before you switch.** `rt_dsp_walk=0` brings back the old routing,
+  `1` connects the front lanes only.
+- **Fixed: the mic could sound like a chipmunk after a rate change.**
+  With a recording running (Discord, OBS), playing something at 96 or
+  192 kHz and then switching Direct Mode off could leave the mic at about
+  twice the pitch, slightly metallic, until the app reopened it. The
+  card's router chip sometimes hands the running mic the same router
+  slots DSP mode always used for the speakers, and DSP mode wrote over the
+  mic's feed. The driver now leaves any slot that's in use alone and puts
+  its own route elsewhere. On the card: the trigger (192 kHz, then DSP
+  mode) broke the mic in 2 of 3 tries before; 0 of 40 checks after.
+- **Fixed: DSP mode could go silent.** Two more ways into the same router
+  slots (the new lane routing above avoids them entirely; this remains
+  the fallback): at 96 kHz in DSP mode the router chip wires the audio straight
+  into the DSP from those slots, and the driver wrote over the DSP's input
+  (silent until Direct Mode or 48 kHz); and after a few switches the
+  driver could run out of free slots, because a route it moved never gave
+  its slot back (silent in DSP mode until a power-off). Both fixed; on the
+  card, 60 checks across mic trips and 48 ↔ 96 kHz switches in DSP mode,
+  0 silent, the free-slot count steady. The free count is in the debug
+  state (`router free slots`).
+- **Fixed: unloading the driver could crash the kernel** if the card
+  stopped answering during the unload (the usual moment for
+  `sudo modprobe -r`): the "card stopped answering" clean-up was started
+  after the sound devices it touches were already freed. Proven on the
+  card with a forced hang during unload: no crash, card back without a
+  power-off. Found by an outside code review, as were the next two.
+- **Safer DMA when a stream won't stop:** its buffer list is now kept
+  instead of freed (so a stuck engine can't write into reused memory),
+  and a card that dropped off the bus no longer logs false "still
+  running" errors.
+- **Command ring hardening:** an unreadable answer pointer (a card off
+  the bus, or a glitch behind a PCIe bridge) is never used as a position
+  any more, and an answer from the wrong codec is never taken as ours.
+  New counters in the debug state: `never landed`, `other codec`,
+  `unreadable write pointer`, `BDLs kept`, all 0 on a healthy card.
+- Rapid switching no longer wears the card down: 640 random setting
+  changes, some with no gap at all, came back clean every time (the old
+  "card wear" was the early-read bug 0.12.10 fixed). SbAe9-SBC's pause
+  between changes drops to 2 s.
+- Docs: Linux's workaround for this Creative controller quirk dates from
+  2010, not 2009 (0.12.10's entry said 2009).
+
+## 0.12.10 (2026-11-15)
+No more hangs, and profiles on the fly. 🍁
+
+Pairs with [SbAe9-SBC v0.21.1](https://github.com/3xHelix/SbAe9-SBC) (the Headphone Profile tip and the encoder notes say a new profile loads while audio plays, when the driver does) and [SbAe9-AudioMon v0.4.7](https://github.com/3xHelix/SbAe9-AudioMon) (unchanged).
+
+Thanks to arkhodakov (the report behind the source-install fix), and to
+DarkNikGr and arkhodakov, now listed as contributors with their original
+PR #2 and PR #3 commits.
+
+- **Fixed: the card could stop answering after effect changes in DSP mode**
+  (SBX on/off and the like), most often while recording. The card's
+  controller sometimes reports a new answer a few microseconds before the
+  answer is actually in memory, and the driver read it too early: it got
+  an old entry instead, waited 100 ms for an answer that had already
+  arrived, then reset its command ring, which sometimes left the card dead
+  until `ae9-reload`. The same early reads lost the occasional DSP reply
+  (harmless, it was asked again). The driver now waits for the answer to
+  land (a few microseconds), as Linux has done for Creative's sound
+  chips since 2010. On the card, 150 SBX toggles while recording all four
+  inputs: 1282 answers caught landing late, 0 errors, 0 lost replies,
+  where before every run had lost replies and the old code hung the card
+  in 1 of 3 runs like it. Found with a full command trace of a hang.
+- **Headphone profiles now load while audio plays**, as on Windows. Before,
+  a newly picked profile waited until every playback and recording had
+  stopped, because uploading during playback used to break the DSP; that
+  turned out to be the same early-read problem fixed above. On the card,
+  160 profile changes with music playing, with all four inputs recording
+  and with EQ toggled after each: every one loaded and checked out, no
+  errors. Expect a small click as the profile switches (Windows does the
+  same). `hp_live_upload=0` brings back the wait.
+- **The card stopping answering now also stops its audio streams.** A
+  crashed card's recording engines kept writing to memory addresses it
+  made up (the IOMMU blocked them, so no harm done, but the log filled
+  with `IO_PAGE_FAULT`s). Now every running stream's DMA is stopped at
+  once, and every open stream ends with "No such device", so players,
+  PipeWire and AudioMon stop cleanly instead of waiting on a frozen
+  stream; `ae9-reload` brings it all back. Every stream stop also waits
+  until the card confirms its DMA has stopped, as the HD-Audio spec asks.
+  New diagnostic option `dma_trace` logs each stream's buffer addresses.
+- **Fixed: a source/DKMS install didn't load the driver early at boot.**
+  `scripts/dkms-install.sh` (and the README's file list) left out
+  `ae9-modules-load.conf`, which every package installs, so the driver
+  loaded through udev alone, where the DSP's first start failed on about
+  half of cold boots. The script now installs
+  `/etc/modules-load.d/creative-ae9.conf` (an existing one is left alone;
+  `--remove` takes it out while it's still ours), and `--check` shows it.
+- Docs: measured on the card (uv53) and corrected in the decoded tables
+  and the in-tree notes: the second DAC's volume registers 2/3 drive the
+  Rear jack and 4/5 the Center/Sub jack (the labels had them swapped; the
+  driver sets all four alike, so nothing changes in use); its registers
+  0/1/6/7 reach neither jack; the head unit's status bits read the
+  Headphone Impedance Selector switch (IEM / N / High), now in USING.md.
+  From a PSU-cold read (uv68): the 8051 code patch Windows writes at
+  start-up is already in the card's program memory at power-up (a no-op
+  on the AE-9), and GPIO pin 0 low cuts both DACs off the I2C bus.
+- Docs: the README is now a short front page (what works, install,
+  firmware, using it, help); the details moved to `docs/`: USING.md (every
+  feature), TROUBLESHOOTING.md (quick fixes, reports, known issues),
+  INSTALL-FROM-SOURCE.md, OPTIONS.md (module options) and DEVELOPING.md.
+  The packages install them with the README.
+
+## 0.12.9 (2026-11-14)
+One command to bring it back. 🔁
+
+Pairs with [SbAe9-SBC v0.21.0](https://github.com/3xHelix/SbAe9-SBC) (follows "Card Answering": shows its "stopped answering" screen by itself, lets go of the card, names `ae9-reload` with a Copy button) and [SbAe9-AudioMon v0.4.7](https://github.com/3xHelix/SbAe9-AudioMon) (lets go of the card when it stops answering, names `ae9-reload`, comes back by itself after the reload).
+
+- **Fixed: the head unit showed no "AE-9" at start-up in 0.12.8** (blank,
+  then "-SP-"/"-HP-", then the volume). The new display on/off setting was
+  switched on only after the start-up had already sent its text, so the
+  start-up blanked the display instead. Now "AE-9" shows again for about
+  4.6 s at every boot and driver reload, as on Windows.
+- **New: "Card Answering"**, a read-only control: it turns off, with a
+  change event, the moment the card stops answering or drops off the bus.
+  Apps that only listen can then let go of the card, so the driver can be
+  reloaded while they're open (SbAe9-SBC and SbAe9-AudioMon use it). A
+  reload brings it back on.
+- **Fixed: unloading the driver right after it marked the card as stopped
+  could leave the card wedged** until a power-off. The unload skipped its
+  power-down for a card that had stopped answering, even when the card had
+  come back (or, in testing, was never really stuck), and the next load
+  found the DSP busy. The unload now asks the card once and runs the full
+  power-down when it answers.
+- **New: `ae9-reload`**: reloads the driver in one command. It stops what
+  holds the card (PipeWire, WirePlumber, the AE-9 helper services,
+  alsa-state), unloads and loads the driver, waits for the card and starts
+  everything again. It lists anything else still holding the card, and says
+  when only a power-off will help. `ae9-reload --check` only shows who
+  holds the card.
+- The bring-up log shows the card register `0x1c` (before, after the bus
+  reset, after Windows' start-up writes), and `ae9-full-dump` reads it: bit 9
+  of it switches the second codec off (tested on the card; the AE-9 must
+  keep it clear). `bit9_test=1` repeats that test at load.
+
+## 0.12.8 (2026-11-14)
+The head unit says hello again. 👋
+
+Pairs with [SbAe9-SBC v0.20.0](https://github.com/3xHelix/SbAe9-SBC) (a "stopped answering" screen with the reload command when the card stops answering; a note, with a "Use 48 kHz" button, when DSP mode waits for a 48 kHz stream) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed).
+
+Thanks to arkhodakov (PR #3: the cause, the fix and the tests) and
+s3boun3t (a side-by-side with another AE-9 driver that pointed at the
+head unit's attach marker and a misleading register label).
+
+- **Fixed: the head unit could miss its start-up handshake**, leaving the
+  headphones and the mic silent until a reload. The driver powered the
+  head unit (GPIO pin 5) only just before its first start-up frame. On one
+  ASMedia card it started answering about 200 ms in and missed 9 or 10 of
+  the 246 frames; with the handshake among them, nothing worked. The
+  driver now runs Windows' board start-up step first: head unit powered
+  seconds earlier, DAC reset pin 0 pulsed with both DACs muted. Tested on
+  both board versions, after reloads and a cold boot: the head unit answers
+  its first frame at the first try, 0 of 246 lost (without the step, the
+  IDT card needed 3 tries). If it still doesn't answer, the driver retries
+  its first frame for up to ~1 s. `board_d0=0` is the old behaviour.
+- **Fixed: a 3.5 mm headphone unplug could go unnoticed.** A head-unit
+  reply ends at its length byte, but the driver stopped reading at the
+  first 0xf7 byte. The status byte is exactly 0xf7 in headphones mode with
+  nothing plugged, the SBX light on and phantom power off, so that reply was
+  cut short and shifted the next one: the unplug was never seen (3 of 3
+  tries; now 0.01 s), and a false "knob press bit stuck" could appear. All
+  478018 replies in 28 Windows traces end at their length byte.
+- **Fixed: the head unit's rear RCA input was dead after a driver
+  reload** (unload + load without a power-off): recording failed at once
+  with "Input/output error" until the next cold boot. The unload leaves
+  both codecs asleep, and start-up only ever woke the first. The driver
+  now wakes the second codec (rear RCA input, optical in and out) when it
+  finds it asleep. Tested over 3 reloads; optical in and out checked
+  working after a reload too.
+- **New: the driver stops when the card stops answering.** Toggling SBX on
+  and off very fast once left the card on the bus but no longer answering
+  commands; the driver kept sending for 4 minutes (1420 timeouts, up to 2 s
+  per effect setting) until a reload. Now 8 timeouts in a row on a running
+  card log one line, "card stopped answering", with the reload command,
+  and every later command fails at once. A reload (or sleep/wake) clears
+  it. A healthy card's rare timeouts come one at a time and the next
+  command answers, so they don't count. Control writes (alsamixer, SbAe9-SBC)
+  then fail with "No such device" instead of quietly doing nothing. The debugfs `state` file shows it;
+  `hung_inject` (with `debug=1`) tests it without a real hang.
+- **New: the head unit shows "AE-9" at start-up, as on Windows**: "AE-9"
+  for ~4.6 s, then "-SP-"/"-HP-" for ~5 s, then the volume. The driver sent
+  "AE-9" before, but replaced it with "-SP-" within a fraction of a second.
+  A knob turn shows the volume at once. Tested on a cold boot.
+- **New: the head unit is set up again when it loses its setup** while
+  running (a power dip on its cable, or the stop frame). It kept answering
+  but showed nothing new, and its headphone amp stayed off. The driver now
+  reads the head unit's "set up" marker on every poll, as Windows does, and
+  sends its setup again from the current state: output, knob light,
+  volume, mute, with "AE-9" first. Phantom power goes off, as at start-up.
+  Tested on headphones and speakers. `hu_reattach=0` switches it off.
+- **New: hold the SBX button 5 s to switch the head unit's display off or
+  on**, as on Windows (the knob light stays). The SBX button now acts when
+  released, as on Windows; a short press still switches SBX. New control
+  "Head Unit Display" does the same, for apps.
+- Docs: `docs/DECODED-SEQUENCES.md` checked step by step against ca0132,
+  Creative's own parameter tables, the datasheets and card reads. Every
+  step the driver sends (1681 with default settings) is named; the few
+  details still unproven are listed under "Open items".
+
+## 0.12.7 (2026-11-12)
+Monitor yourself, keep your Voice Clarity. 🎙️
+
+Pairs with [SbAe9-SBC v0.19.0](https://github.com/3xHelix/SbAe9-SBC) (the card's own mic monitor, with no delay, together with Voice Clarity; a monitor warm-up that works after a Direct Mode switch or driver reload; a +30 dB Mic Gain button when `mic_boost_30` is on) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed).
+
+Thanks to HandsomeHans (the report behind the source-install tools fix) and
+s3boun3t (the questions behind the +30 dB option, and a round of output
+routing measurements).
+
+- **Fixed: the card's mic monitor broke Voice Clarity until a power-off.**
+  Once "Mic Monitor" had been on, Voice Clarity recordings made with it off
+  came out wrong (left quiet, right empty). Turning the monitor off left
+  the DSP's mic tap with nothing reading it. The driver now puts that route
+  back when the monitor goes off, so the monitor and Voice Clarity can be
+  used together. "Mic Monitor Used Since Power-up" stays for older
+  SbAe9-SBC versions but always reads off.
+- New, optional: **Mic Gain up to +30 dB** with `mic_boost_30=1`. The mic
+  preamp has a +30 dB step that Windows doesn't use. It's clean, but
+  normal speech into a typical mic clips there: it's for quiet mics.
+- New, optional: **a "clean mic" example**, `config/ae9-clean-mic.conf`
+  (packages: `/usr/share/creative-ae9/examples/`). It adds an input "AE-9
+  Mic (clean)": the mic through PipeWire's built-in WebRTC noise
+  suppression, like the software clean-up Windows applies. On the card:
+  room hiss and hum 20-30 dB lower, speech level unchanged, about 35 ms
+  extra delay. See "Clean mic" in the README.
+- Source install (`scripts/dkms-install.sh`): it now also installs the
+  command-line tools (`ae9-hp-profile`, `ae9-get-firmware`,
+  `ae9-full-dump`, ...) in `/usr/local/bin`, so SbAe9-SBC's custom
+  headphone profiles work without a package. And it really refuses to run
+  next to a packaged build (COPR, .deb/PPA, AUR): the check looked for the
+  wrong package names, so a source install could leave two copies.
+- Debugging: debugfs `dacr` / `dacw` read or write one DAC register (root).
+
+## 0.12.6 (2026-11-11)
+Clean routes, clean sound. 🔀
+
+Pairs with [SbAe9-SBC v0.18.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (no changes needed on their side).
+
+- **Fixed: What U Hear could stall after a Direct Mode switch while the
+  optical out played** (the known issue in 0.12.5). Direct Mode playback
+  wrote into fixed router slots that the card's router chip may have given
+  to What U Hear. It now uses the slots the chip hands out, as Windows does.
+  `rt_chain_walk=0` is the old behaviour.
+- **Fixed: a router stream count went one too high** after switching Direct
+  Mode on while playing (until the next reload). The driver no longer
+  switches the DSP's host stream on itself (the router chip does it, as on
+  Windows), and it hands every leftover count back at shutdown and
+  start-up. `stream_drain`, `in05_host`.
+- **Found and fixed in testing (never in a release): leftover router routes
+  could make the analog out sound gated and metallic** (48/192 kHz), or 96
+  kHz very quiet, until a power-off. A DSP-mode route the What U Hear fix
+  moved, plus an input route the driver adds in DSP mode, were never
+  switched off. The driver now switches such routes off when Direct Mode
+  starts and at shutdown, and keeps one feed per output in DSP mode.
+  `rt_dac_clean`.
+- DSP mode: the output unmute is read back and resent until it takes, and
+  sent at every playback start and stop, as Windows does (`unmute_check`,
+  `pcm_unmute`).
+- `ae9-full-dump` has a read-only "Driver state" section (debugfs
+  `state`): mode, counters, router stream counts, GPIO pin levels, the
+  head unit's unanswered start-up frames, the routes feeding the DACs.
+  It lists one line per control.
+- Every step the driver replays from Windows now has a known meaning (1633
+  of 1633): the last one, 0x100e34, is a fixed setting in the DSP's debug
+  block (read on the card). The decoder also names the card's clock
+  registers.
+
+## 0.12.5 (2026-11-10)
+Restarts, for real this time. 🔁
+
+Pairs with [SbAe9-SBC v0.18.0](https://github.com/3xHelix/SbAe9-SBC) (a hint when headphones are plugged in but the card plays on speakers; fixes for PipeWire 1.0 / WirePlumber 0.4 on Ubuntu 24.04 and Mint 22) and [SbAe9-AudioMon v0.4.6](https://github.com/3xHelix/SbAe9-AudioMon) (meters work on PipeWire 1.0.x).
+
+Thanks to Kaiba (round after round of ASMedia restart tests: the logs that
+found both restart bugs below), DarkNikGr (Dolby Digital and DTS confirmed on
+a real receiver through the optical out, plus his reports) and s3boun3t (for
+hanging out and cheering us on, plus the PipeWire 1.0 reports from
+Linux Mint).
+
+- **Fixed: 0.12.4's restart fix was incomplete. After a warm reboot or a
+  driver reload, DSP mode and What U Hear could stay silent**, and after a
+  reload even Direct Mode. The card's router chip counts how often each
+  stream was switched on and keeps that count until the power goes off; the
+  driver switched the DSP stream on at every DSP-mode switch but off only
+  once, so the leftovers kept the next start from connecting it. The driver
+  now keeps the count the way Windows does: it switches the stream on only
+  when it's off, and hands every leftover back at shutdown, at start-up and
+  when you leave DSP mode.
+- **Fixed: ASMedia-bridge cards were silent after a driver reload.** The
+  driver skipped the card reset at start-up behind that bridge (since 0.9.8,
+  when the reset seemed to take the bridge down; the real cause was fixed
+  later), so a reload started on the card's leftover state. The reset now
+  runs on every card. Tested by Kaiba: hot reloads, a cold and a warm boot,
+  and Voice Clarity now works after a warm reboot too. `bus_reset=0` turns
+  it off.
+- **Fixed: a DSP message could lose a word when the DSP's command queue was
+  busy** (seen a few times per boot on some cards with Voice Clarity on).
+  The card's router chip refuses a word while the DSP's queue is full and
+  keeps saying "full" until the next word. The driver used to wait 2 s and
+  then send the next word, losing the refused one. Now it waits out "busy",
+  sends a refused word again after a short pause (up to 2 s) until it goes
+  in, and logs how many tries it took. `scp_full_resend=0` is the old
+  behaviour, for diagnosis only. Tested by Kaiba on an ASMedia card: the
+  word that used to jam goes in after one resend (4 ms).
+- **Fixed: on Ubuntu 24.04 / Mint 22, Debian 12 and openSUSE Leap the AE-9
+  started 12 dB louder than intended** (-24 dB instead of -36 dB). Their
+  WirePlumber 0.4 ignores the packages' safe-volume rule, which is written
+  for WirePlumber 0.5. The packages now also install a WirePlumber 0.4
+  version (`51-ae9-safe-volume.lua`). 0.4 can only set the start volume for
+  every output at once, so there any output without a saved volume starts
+  at -36 dB. Volumes you set are still kept.
+- Optical out and optical in no longer offer 176.4 kHz (their converters
+  don't support it), and a 176.4 kHz main stream isn't mirrored to optical.
+- The DSP's start-up reset is repeated while the DSP answers busy, as
+  Windows does.
+- `dsp_fail_inject` (a test option) only acts with `debug=1`.
+- Confirmed by DarkNikGr: Dolby Digital and DTS through the optical out to a
+  receiver, both with `ae9-optical-passthrough` and SbAe9-SBC's encoder.
+- Known issue, not new: switching Direct Mode while the optical out plays
+  can leave What U Hear recordings stalling until the driver reloads (see
+  README, Known issues).
+
+## 0.12.4 (2026-11-09)
+Restarts and Voice Clarity, the Windows way. 🔁
+Pairs with [SbAe9-SBC v0.17.2](https://github.com/3xHelix/SbAe9-SBC) (adds the rtcwake tip) and [SbAe9-AudioMon v0.4.5](https://github.com/3xHelix/SbAe9-AudioMon) (warns when a Voice Clarity recording is hit by the mic monitor quirk). Thanks to Kaiba for the Voice Clarity report that found two of these.
+
+- **Fixed: restarting the driver without a power cut could break the
+  card.** Reloading the driver (or a warm reboot) got riskier each time:
+  the 5th or 6th restart since the last power-off could leave the DSP
+  stalled or the card dark until a PSU power-off. Our unload left the
+  card's DSP codec in a deep sleep and the next start reset it without
+  waking it. Now the driver restarts the card the way Windows does:
+  light sleep at unload, wake + 2 s before the reset, Windows' recovery
+  cycle when the analog outputs report a failed ramp, a 1.5 s settle, and
+  the DSP firmware always downloaded. 6 restarts in a row on one power-up
+  came up clean.
+- **Fixed: Voice Morphing and Noise Reduction recordings stalled the DSP
+  at their start** (every Voice Morphing start, about a third with Noise
+  Reduction), and a DSP message could get lost there: once a loud
+  distorted take (Kaiba). Recordings now start in Windows' order, and the
+  mic level settings go to the DSP once per start-up instead of at every
+  recording.
+- **Fixed: switching Voice Clarity off during a recording** left it
+  limited to 8 kHz until the recording was reopened (Kaiba). It now goes
+  back to the full-band path at once, as Windows does.
+- **Fixed: a short crunch when the card's mic monitor switches on.** The
+  mic is now bound before the DSP mixes it in.
+- **New: a failed DSP start retries the way Windows does** (reset the DSP,
+  0.5 s, download again, up to 3 times) before the heavier full restart;
+  tested with a forced download failure and a forced handshake failure,
+  both recovered on the second download.
+- **New: a DSP that halts itself is never set running again.** The driver
+  stops talking to it and logs what to do (a short sleep or a power-off),
+  instead of nudging a wiped DSP back into a state that left the card
+  dark at the next start.
+- **New: a short sleep resets a stuck card.** `sudo rtcwake -m mem -s 25`
+  (suspend to RAM for 25 s) cuts the card's power like a PSU power-off
+  does; try it before reaching for the PSU switch.
+- Fixed: the head unit's rear RCA input offered 176.4 kHz, which its
+  converter doesn't support; it now offers 44.1, 48, 88.2, 96 and 192 kHz.
+- The log now says when a DSP message had to be written into a busy
+  queue (it used to happen silently).
+
+## 0.12.3 (2026-11-09)
+Fixes from a full code review of 0.12.1 and 0.12.2, all tested on a card. 🔧
+Pairs with [SbAe9-SBC v0.17.1](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity never uses the card's mic monitor) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fixed: a bad custom headphone profile name could stop the driver
+  loading.** `ae9-hp-profile` now checks names the way the driver does (up
+  to 40 bytes, so fewer letters with accents), sets the running driver
+  first and saves the setting only if the driver took it. The driver skips
+  a bad entry with a warning instead of refusing to load.
+- **Fixed: a re-installed or removed custom profile kept playing the old
+  filter.** The new file now loads by itself once nothing plays (a removed
+  one switches off); "pick Off, then it again" is no longer needed.
+- **Fixed: on headphones, speaker settings reached the headphones.** Speaker
+  levels, distances, bass redirection, crossover and sub gain changed while
+  on headphones (Virtual 7.1) are now stored and sent when you switch back
+  to speakers. Speaker Config follows the stream on headphones again, so a
+  5.1 stream plays discrete 5.1 when you switch to speakers mid-stream.
+- **Fixed: the mic monitor played at Windows' default gain** (+9 dB) after
+  turning it on or after a recording, instead of your Capture Volume.
+- **Fixed: starting a recording while the mic monitor is on** moved the mic
+  route under a bound input (scrambled or wrong-rate recordings possible).
+- **Fixed: sleep, reboot and unload** now release the monitor's hold on the
+  mic and take Voice Clarity out of the mic path; after a wake, Voice
+  Clarity and the monitor come back by themselves (they stayed off).
+- **Fixed: the hardware mic monitor sounded crunchy after Voice Clarity had
+  been used** (the DSP's mic mode stayed on the voice processor's).
+- **Fixed: `ae9-hp-profile` on Fedora Atomic** (installs under
+  `/etc/firmware`, no Python crash), and the per-rate headroom script and
+  `60-ae9-headroom.conf` now only touch the analog output (they could pick
+  the optical output and cut a passthrough stream).
+- **New: "Mic Monitor Used Since Power-up"** (read-only). Known issue,
+  found in this review: once the card's hardware mic monitor has been on
+  since the PC started, Voice Clarity recordings made with it off come out
+  wrong (left channel quiet, right channel empty) until the PC is powered
+  off. It's in the card's DSP firmware; Windows never turns this monitor on,
+  so Creative never met it. SbAe9-SBC v0.17.1 uses its software Listen
+  while Voice Clarity is on and warns before mixing the two; the driver
+  logs a warning when it happens. Plain recordings are not affected.
+- README: the What U Hear 5.1 profile wording is clearer.
+
+## 0.12.2 (2026-11-09)
+Everything on Sound Blaster Command's list. 🎙️🎧
+Pairs with [SbAe9-SBC v0.17.0](https://github.com/3xHelix/SbAe9-SBC) (Voice Clarity, Voice Morphing, mic monitor and virtualization pages, the optical out selector) and [SbAe9-AudioMon v0.4.4](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **New: Voice Clarity on the card's DSP**, as Windows does it:
+  "Acoustic Echo Cancellation" (takes the speakers' sound out of the mic,
+  about 43 dB on our card), "Noise Reduction", "Mic Smart Volume" and
+  "Mic EQ" with Creative's 11 presets (Preset 1-10, Preset DM-1). It sounds
+  like Windows: a clean wideband voice with an 8 kHz top (the voice
+  processor runs at 16 kHz). Controls: "Voice Clarity Capture Switch" and
+  one switch per effect; recordings run at 48 kHz while an effect is on.
+  The DSP route had been parked since 0.9 because it sounded metallic; the
+  cause was found (our recording stop left the voice processor half
+  routed) and Voice Clarity now matches Windows step for step.
+- **New: Voice Morphing**, all 18 of Creative's voices ("Voice Morphing
+  Capture Enum": Male, Female, Kid, Elderly, Deep Voice, From Up North,
+  Unstable, Emo, Elf, Dwarf, Demon, Infiltrator, Brute, Orc, Marine,
+  Chipmunk, Robot; Neutral = off).
+- **New: mic monitoring with no delay** ("Mic Monitor Playback Switch"):
+  the card's DSP mixes the mic into what you hear, as Windows' mic monitor
+  does. Direct Mode off; it plays once anything has played in DSP mode
+  since boot. Use headphones.
+- **New: headphone virtualization** ("Virtual 7.1" in Creative's guide):
+  on headphones with Direct Mode off the DSP now runs in its headphone
+  mode, as Windows does, and SBX Surround places 5.1 sources around you.
+  We used to send the speaker layout on headphones. "Headphone
+  Virtualization Switch", on by default.
+- **New: "Apply Headphones Virtualization to Line Out"** ("Line Out
+  Virtualization Switch", off by default): with Headphones selected, the
+  virtualized headphone mix plays on the card's RCA out and the headphone
+  jack is silent. Turn the knob down first: it uses the headphone volume.
+- **New: your own headphone profiles** (DarkNikGr's idea). The new
+  `ae9-hp-profile` command makes one from a published measurement: it
+  takes AutoEQ's correction for your model (thousands of headphones,
+  measured by oratory1990, crinacle, Rtings and others) and turns it into
+  the same kind of filter as Creative's profiles (two 512-tap
+  linear-phase FIRs at 48 kHz). `sudo ae9-hp-profile add "Beyerdynamic DT
+  990 Pro" DT990` saves it as `DT990.bin` and lists it in "Headphone
+  Profile" (and SbAe9-SBC) as "Beyerdynamic DT 990 Pro"; up to four,
+  `list` and `remove` manage them. Like Creative's, they work on
+  headphones with Direct Mode off; they never boost, so they play a few
+  dB quieter.
+- **Checked: the speaker setup** with a measurement on the card's C/Sub
+  jack: the crossover lands on its setting (50-200 Hz), bass redirection
+  off leaves the sub silent, Sub Boost adds about 15 dB.
+- **Fix: live mic monitoring ("Listen") sounded chopped up** with the
+  optional fixed 256-frame PipeWire headroom: PipeWire resynced the output
+  dozens of times a second while the mic drove the clock. The README now
+  points to the per-rate headroom service (64 at 48 kHz) instead.
+- Driver v0.12.1 now pairs with SbAe9-SBC v0.16.1 (its encoder fix).
+
+**Thanks** 🙏 to **DarkNikGr** (custom headphone profiles, the reason the
+optical out has two lives) and to everyone sending dumps. The Voice
+Clarity, Virtual 7.1 and Line Out work came from Windows captures read
+alongside Creative's own app and driver code.
+
+## 0.12.1 (2026-11-08)
+Two outputs, two streams. 🔀
+Pairs with [SbAe9-SBC v0.16.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out mirror toggle on Playback > Digital, Encoder page: AC-3, or experimental DTS, to optical) and [SbAe9-AudioMon v0.4.3](https://github.com/3xHelix/SbAe9-AudioMon) (Optical Out meter, bits/kHz per stream; thanks DarkNikGr).
+
+- **Changed: optical out no longer mirrors the main output by default**
+  (thanks DarkNikGr). The analog outputs and optical out are now two
+  separate outputs: optical plays only what's sent to it ("Optical Out" in
+  PipeWire, `hw:AE9,4`). **Upgrading:** if you used the optical jack as a
+  copy of the main output, switch "Optical Out Mirror Switch" on
+  (SbAe9-SBC: Playback > Digital, or
+  `amixer -c AE9 cset name='Optical Out Mirror Switch' on`; module
+  option `optical_mirror=1`). A stream sent to optical out always takes
+  priority over the mirror.
+- **New: What U Hear in 5.1.** With the 5.1 output profile ("Analog
+  Surround 5.1 Output + Analog Stereo Input") the What U Hear source
+  records all six channels (FL FR FC LFE RL RR, each level-exact), e.g. for
+  a software AC-3 encoder; `arecord -D hw:AE9,2 -c 6` works in any
+  profile. The stereo profiles keep the stereo source.
+- **Clearer headphone-profile log**: the upload result line says what
+  happened (done, read-back differs, still running, end not confirmed,
+  never started), with the stream position, run time and any verb
+  timeouts. Profiles load once playback and recording have been stopped
+  for a moment (about 10 s of real silence); a profile picked during
+  playback waits for that.
+
+**Thanks** 🙏 to **Kaiba** (the dump generator) and **DarkNikGr** (Mr. Needs
+Optical), whose reports, dumps, tests and code shaped this release and the
+ones before it, and a hat tip 🎩 to **HandsomeHans** for helping decode our
+boot tables a bit further.
+
+## 0.12.0 (2026-11-08)
+A second output: optical gets its own stream. 💿
+Pairs with [SbAe9-SBC v0.15.0](https://github.com/3xHelix/SbAe9-SBC) (Optical Out on Playback > Digital, passthrough status) and [SbAe9-AudioMon v0.4.2](https://github.com/3xHelix/SbAe9-AudioMon) (kit 0.3.8).
+
+- **New: separate optical output** (thanks DarkNikGr!). PCM device 4,
+  `hw:AE9,4`, "Optical Out" in PipeWire: its own stream at 44.1-192 kHz,
+  16-bit or 24-bit. While nothing plays to it, the optical jack mirrors the
+  main output as before, so nothing changes for you unless you use it.
+  Dolby Digital / DTS passthrough to a receiver with
+  `ae9-optical-passthrough movie.mkv` (sets the S/PDIF "non-audio" bit
+  while it plays; `iecset` controls it by hand).
+- **Fix: headphone-profile uploads could be cut short**. A glitched status
+  read ended the transfer after ~4 ms of the ~11 it needs, leaving part of
+  the old profile in place. 0.11 caught it (the profile stayed off and
+  further uploads were blocked; thanks Kaiba for the report), and now it
+  doesn't happen: the transfer has to really finish. The read-back now
+  checks 9 words.
+- **A profile picked during playback no longer switches the current one
+  off** while it waits for a pause.
+- **Quieter login**: Speaker Config doesn't flip between 5.1 and 2.1 while
+  PipeWire probes the card any more.
+- **`scripts/dkms-install.sh` builds for every installed kernel with
+  headers**, not only the running one (a kernel update without a reboot
+  could leave no driver for the next boot).
+
+## 0.11.3 (2026-11-08)
+One less way for the DSP to stop. 🛡️
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **Fix: a bad chip read could be written into the DSP's control
+  register**. When the DSP's command queue is full (and once at every
+  start), the driver reads the DSP's control register and, if the DSP
+  looks halted, writes it back to restart it. Reads of the card's chip
+  come back wrong now and then while audio plays (0.3-2.7% on two cards,
+  thanks DarkNik for the data), and one bad read was enough to write
+  garbage into the DSP's control: a likely cause of a DSP that stops until
+  a power-off. Now three reads must agree before anything is written; if
+  they don't, the register is left alone and the log says so.
+- `ae9-dsp-snapshot` marks registers that change only because of a bad
+  read as "one-off (likely a bad read)" instead of "moving".
+
+## 0.11.2 (2026-11-08)
+More tools for your reports. 🧰
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **New commands: `ae9-dsp-snapshot` and `ae9-read-stress`**, installed by
+  every package next to `ae9-full-dump`. The snapshot shows which of the
+  DSP's registers move (a working DSP's do, a stuck one's may not); the
+  stress test reads one chip register 300 times and counts wrong answers.
+  Both only read, and both refuse to run while audio plays unless you add
+  `--playing`: reading the chip during playback can freeze the audio until
+  a full power-off. With `--playing` the snapshot also skips the router
+  table. See "Reporting a problem" in the README.
+- `ae9-full-dump` is the command to use for dumps (the README said
+  `scripts/ae9-full-dump.sh`); stop audio first for the full picture.
+- No driver changes since 0.11.1.
+
+## 0.11.1 (2026-11-08)
+Builds everywhere again. 🔧
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon), as 0.11.0.
+
+- **Fix: 0.11.0 didn't build on kernels before 6.13** (Ubuntu 24.04's 6.8;
+  DKMS installs failed): optical in's timer used a kernel call that's new
+  in 6.13. The build now checks the kernel's own headers and uses the call
+  it has (RHEL 10's 6.12 has the new one backported). Tested against 6.8,
+  6.12 and 7.2. No other changes; Fedora and Arch users on 0.11.0 don't
+  need it.
+
+## 0.11.0 (2026-11-08)
+Safer headphone profiles, a DSP that stays in step, seven DAC filters and
+inputs that just show up. 🎛️
+Pairs with [SbAe9-SBC v0.14.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.1](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fix: picking a headphone profile could still break DSP mode** until a
+  power-off (chopped "8-bit" sound or silence; Kaiba's report and ours).
+  Most bad uploads happened while audio played, so a profile now loads only
+  when nothing is playing or recording: picked during a song, it loads a
+  few seconds after you pause. Every upload is also checked from end to
+  end: the DSP's DMA port must be a proper pair, 8 words are read back from
+  DSP memory and must match the profile (a mismatch keeps the profile off),
+  a half-armed transfer is stopped before its channel is freed, and a
+  failure after the DSP was set up stops further uploads until the next
+  start, instead of retrying blindly. `hp_live_upload=1` brings back
+  uploads during playback.
+- **Fix: the "metallic" sound with a headphone profile and the EQ both
+  on**. On a hot signal the two boosts overload the DSP (Windows does the
+  same); while both are on, the DSP now gets the EQ pre-gain 12 dB lower,
+  but not below -12 dB. The slider keeps your value. `eq_headroom=0` turns
+  this off.
+- **Fix: half-speed, buzzing audio after a speakers/headphones switch in
+  DSP mode**. Windows' switch sequence left the DSP in its own state; the
+  driver now sends the whole effects setup again after every switch.
+- **New: seven DAC filters** (thanks DarkNikGr!), with the Creative app's
+  names: Apodizing Fast Roll Off (Windows' startup filter, the default),
+  Fast Roll Off, Slow Roll Off, Fast Roll Off - Minimum Phase, Slow Roll
+  Off - Minimum Phase, Hybrid Fast Roll Off, Brick Wall. Set the way the
+  Creative app sets them, second DAC included. A saved old
+  Default/Fast/Slow comes back as the default once.
+- **Fix: the DAC got stray writes of 0 at every boot, every shutdown and
+  every 44.1/88.2 kHz start**: Windows' register *reads* had been taken
+  for writes of 0 when its startup was decoded. They're gone (25 Windows
+  captures agree), and the filter you picked now survives every DAC setup
+  the driver sends (an output switch used to put it on Fast Roll Off).
+- **New: optical in records without a signal**. With nothing plugged in it
+  records silence instead of failing; plugging the cable in or pulling it
+  while recording restarts the recording once, on the signal or on
+  silence.
+- **New: Rear RCA In, What U Hear and Optical In are sources out of the
+  box**: the card profile opens them, nothing to copy. Upgrading: delete
+  `ae9-what-u-hear.conf`, `ae9-rear-rca-in.conf` and `ae9-optical-in.conf`
+  from `~/.config/pipewire/pipewire.conf.d/` if you copied them, or each
+  source shows up twice. `config/61-ae9-names.conf` (optional) names them.
+- **New: a safe start volume**. PipeWire's output volume is the head
+  unit's volume (100% = 0.0 dB); the packages now make WirePlumber start
+  the AE-9 at -36 dB, the driver's boot volume, whenever it has no saved
+  volume for the output.
+- More in the log for bug reports: the first failed DSP message after each
+  start in full, DSP queue-full recoveries, and Windows' two startup checks
+  (codec power state, router recovery bytes).
+
+## 0.10.1 (2026-11-07)
+Boots right every time, headphone profiles that hold up, and the head unit's rear RCA input. 🔌
+Pairs with [SbAe9-SBC v0.13.0](https://github.com/3xHelix/SbAe9-SBC) and [SbAe9-AudioMon v0.4.0](https://github.com/3xHelix/SbAe9-AudioMon).
+
+- **Fix: the DSP failed its first start on about half of cold boots**
+  (packaged installs). Loaded only by udev, the driver's firmware download
+  overlapped the rest of startup (network, VMs) and the DSP never answered;
+  the retry usually recovered, sometimes with no audio. Every package now
+  also installs `/usr/lib/modules-load.d/creative-ae9.conf`, so the driver
+  loads early again: 0 failures in 150 boots that way, against 11 in 26
+  without it. The DSP also gets 250 ms after it starts before the first
+  message, as Windows.
+- **New: "AE-9 Rear RCA In"** (`hw:AE9,3`): the head unit's rear RCA L/R
+  input as its own recording device, 24-bit, 44.1-192 kHz, recording
+  alongside the XLR mic. `config/ae9-rear-rca-in.conf` adds it as a
+  PipeWire source. No level control yet.
+- **Fix: headphone profiles could kill DSP mode** (silence, one dead
+  channel or static until a PSU power-off; Kaiba's report). The DSP's
+  replies are now read exactly as Windows reads them, and every upload is
+  checked before its EQ goes on: the address is asked twice, the DMA
+  channel must be free and armed, the transfer must really finish, and a
+  stalled command anywhere in it keeps the EQ off. A failed upload costs
+  that pick, never the audio. Picks are debounced: scrolling the list
+  uploads only the one you stop on.
+- **Fix: right-channel static after a bit-depth change in DSP mode**: the
+  router chip sometimes kept the old stream format; it's now checked and
+  repaired at every stream start.
+- **"Bass Redirect Sub Boost Switch"** replaces "Bass Redirect Sub Gain
+  Volume": the DSP setting is an on/off subwoofer boost (Creative's
+  SubwooferBoost), not a gain.
+- **DAC Filter "Default"** now also puts the Center/Sub and Rear DAC back
+  to fast rolloff (it stayed on slow after picking Slow).
+- **Firmware moves to `/lib/firmware/creative-ae9/`** (`/etc/firmware/...`
+  on Fedora Atomic): `ctefx-desktop.bin` in the firmware root is also the
+  AE-5/AE-7 file from linux-firmware (clashed on Arch). Run `sudo
+  ae9-get-firmware ...` again to install there; until then the old location
+  still works, and a root file that isn't the AE-9 image is refused with a
+  clear message instead of loaded.
+
+## 0.10.0 (2026-11-07)
+Sound Blaster Command's speaker setup and headphone profiles. 🎧
+Pairs with [SbAe9-SBC v0.12.0](https://github.com/3xHelix/SbAe9-SBC) (Speaker Setup tab, Headphone Profile picker).
+
+- **Speaker setup** (Direct Mode off, SBX on or off), decoded from a new
+  Windows capture: "Bass Redirect Switch", "Bass Redirect Crossover"
+  (50-200 Hz; Windows sets it from the speaker type: Tower 80, Desktop 120),
+  "Bass Redirect Sub Gain Volume" (dB), and per speaker (Front L/R, Center,
+  Sub, Rear L/R) "Speaker Level ... Volume" (dB) and "Speaker Distance ..."
+  (cm, sent as a delay like Windows' calibration). Levels and distance
+  checked by ear; crossover and sub gain want a subwoofer to hear.
+- **Headphone profiles**: "Headphone Profile" picks one of Sound Blaster
+  Command's 32 headphone curves (Audio-Technica ATH-M50, Sennheiser HD 280
+  Pro, Sony MDR-1R, Creative's own ...). The curve is uploaded into the DSP
+  as Windows does and is active with Direct Mode off, on headphones, for
+  48 kHz streams; off on speakers, back on when you switch to headphones.
+  Tested with real ATH-M50s.
+- **`ae9-get-firmware` reads Creative's installer**: `sudo ae9-get-firmware
+  AECMDMasterInstaller_3.4.92.00.exe` installs the DSP firmware and the 32
+  headphone curves in one go (needs `innoextract`, in Fedora's, Arch's and
+  Debian's repos; the installer is only unpacked, never run). No Windows
+  install needed. `CtxHda.sys` still works for the firmware alone;
+  `--check` also counts the headphone curves.
+- **Fix:** turning Direct Mode back on while a stream was still waiting to
+  move into the DSP (e.g. 44.1 kHz, which stays direct) silenced it until
+  the player reopened. It keeps playing now.
+- Decoder (`docs/DECODED-SEQUENCES.md`): speaker levels, delays,
+  crossover, sub gain and the headphone EQ named with their units.
+
+## 0.9.9 (2026-11-06)
+Fedora packages: install with dnf, updates with your kernel. 📦
+Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC), as 0.9.8.
+
+- **Packages for Fedora and Fedora Atomic** in the COPR repository
+  `3xhelix/SbAe9-Drv`: `sudo dnf copr enable 3xhelix/SbAe9-Drv && sudo dnf
+  install creative-ae9`. akmods rebuilds the module for every new kernel, so
+  nothing to redo after a kernel update. On Silverblue, Kinoite and the other
+  rpm-ostree desktops: `rpm-ostree install creative-ae9` (README). The
+  package also sets up the boot binding and the PipeWire profiles.
+- **`ae9-get-firmware`**: one command extracts the DSP firmware from your
+  copy of Creative's driver, checks it and installs it
+  (`sudo ae9-get-firmware /path/to/CtxHda.sys`; `--check` shows what's
+  there). On Fedora Atomic it uses `/etc/firmware` and sets the kernel
+  option that points there.
+- **The boot binding finds the card by its IDs**: `config/ae9-override.conf`
+  no longer has the PCI address written in, so it works in any slot with
+  nothing to edit. Hand installs: copy the new file over the old one.
+- No driver code changes: the module is the same as 0.9.8.
+
+-- 3xHelix
+
+## 0.9.8 (2026-11-06)
+AE-9s behind an ASMedia bridge work. 🎉
+Pairs with [SbAe9-SBC v0.11.2](https://github.com/3xHelix/SbAe9-SBC).
+
+- **ASMedia-bridge cards play.** AE-9s come with one of two PCIe-to-PCI
+  bridges: IDT Tsi381 (`10e3:8111`) or ASMedia ASM1083/1085 (`1b21:1080`).
+  The ASMedia version used to drop off the bus during start-up. The bridge
+  locks up after a burst of register writes with no read in between, and
+  the driver wrote in such bursts. Behind an ASMedia bridge it now reads
+  every register back right after writing it, as Windows' driver does
+  (`posted_flush`, -1 = auto, the default). Also automatic behind ASMedia:
+  the command rings start in Windows' order (`ring_order`), every DMA
+  buffer gets 64 KB of spare room for the bridge's read-ahead (`dma_pad`),
+  and the bus reset at start-up is skipped (`bus_reset`). Tested on an
+  ASM1083 rev 03 card from a cold boot: start-up, playback, recording,
+  5.1 and optical. Thanks to Kaiba for testing round after round, and to
+  DarkNikGr for finding the write-burst lock-up.
+- If the card drops off the bus anyway, the driver now stops cleanly and
+  logs where, instead of hanging the machine.
+- IDT-bridge cards are unchanged: everything above stays off there.
+- Debug options for bridge trouble reports: `bridge_log=1` (bridge status
+  at each start-up step), `corb_rings`, `fw_rings_off`, `stream_rings_off`,
+  `ring_irq`, `fw_posbuf`. Not needed on any card tested so far.
+
+-- 3xHelix
 
 ## 0.9.7 (2026-11-06)
 

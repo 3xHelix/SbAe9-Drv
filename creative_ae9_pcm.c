@@ -10,9 +10,12 @@
 //
 
 #include <linux/dma-mapping.h>
+#include <linux/hrtimer.h>
+#include <linux/math64.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
+#include <sound/asoundef.h>
 #include <sound/hda_register.h>
 
 #include "creative_ae9.h"
@@ -22,6 +25,12 @@
  */
 #define CREATIVE_PCM_STREAM_TAG	1
 #define CREATIVE_PCM_STREAM_BASE	0x100	/* stream descriptor index 4 */
+/* separate optical out: stream descriptor 6, tag 3, what Windows' rule
+ * (lowest free output descriptor, tag = descriptor - 3) gives with SD4
+ * (main playback, firmware/overlay load) and SD5 (headphone-profile
+ * upload) taken; INTCTL/INTSTS bit 6 */
+#define CREATIVE_OPT_STREAM_TAG	3
+#define CREATIVE_OPT_STREAM_BASE	0x140
 #define CREATIVE_PCM_CODEC_ADDR	1	/* main codec */
 #define CREATIVE_PCM_DAC_NID	0x02	/* front DSP DAC */
 #define CREATIVE_PCM_BDL_MAX		32	/* one entry per period */
@@ -65,6 +74,229 @@ MODULE_PARM_DESC(pcm_nowakeup, "Let apps disable playback period interrupts (0 =
 static unsigned int pcm_posbuf;
 module_param(pcm_posbuf, uint, 0644);
 MODULE_PARM_DESC(pcm_posbuf, "DMA position buffer: 0 off (default), 1 log how far the DMA reads ahead of LPIB");
+
+/*
+ * dma_trace=1: log every stream's buffer and BDL address at prepare, for
+ * matching an IOMMU IO_PAGE_FAULT address to a stream (the 2026-11-13
+ * rapid-SBX hang: 8-byte writes to an unmapped address ~70 ms after the
+ * first command timeout). The stop check and the dump below run always.
+ */
+static unsigned int dma_trace;
+module_param(dma_trace, uint, 0644);
+MODULE_PARM_DESC(dma_trace, "Log stream buffer/BDL DMA addresses at prepare (1=yes; diagnostic)");
+
+/* HD-Audio spec 3.3.35: after RUN is cleared, the DMA engine has stopped
+ * only once RUN reads back 0. Wait up to 1 ms; log a stream that doesn't */
+static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, const char *why)
+{
+	u32 c = 0;
+	int t;
+
+	for (t = 0; t < 100; t++) {
+		c = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		/* all-ones: a card off the bus can't fetch anything (stopped);
+		 * otherwise one bad read: once more, then "not stopped" without
+		 * more reads of a maybe-dead card (this runs in trigger STOP
+		 * too, with IRQs off) (ultrareview 2, #2) */
+		if (c == 0xffffffff) {
+			if (chip->card_gone)
+				return true;
+			c = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+			if (c == 0xffffffff)
+				return false;
+		}
+		if (!(c & SD_CTL_DMA_START)) {
+			if (dma_trace && t)
+				dev_info(chip->dev, "dma: SD 0x%03x stopped after ~%d us (%s)\n",
+					 base, t * 10, why);
+			return true;
+		}
+		udelay(10);
+	}
+	dev_err(chip->dev, "dma: SD 0x%03x still running %s (ctl 0x%08x lpib 0x%x bdl 0x%08x)\n",
+		base, why, c, readl(chip->hda_regs + base + AZX_REG_SD_LPIB),
+		readl(chip->hda_regs + base + AZX_REG_SD_BDLPL));
+	return false;
+}
+
+/*
+ * Before a BDL is freed: a stream whose engine didn't stop could still
+ * fetch it (and then write wherever the recycled page points: IOMMU faults,
+ * or memory corruption without an IOMMU). Keep it then, as hpeq_upload and
+ * xfer_stream_stop do (a stuck stream is left alone, no reset): a small
+ * leak until the next reboot (ultrareview 2, #7). True = free it.
+ * Only if the descriptor still points at THIS BDL: SD4 is also the DSP
+ * firmware and overlay transfer stream (resume_work), and a playback closed
+ * during a resume must not wait on or touch that transfer.
+ * Process context only.
+ */
+static bool ae9_bdl_may_free(struct creative_chip *chip, unsigned int base,
+			     dma_addr_t bdl, const char *what)
+{
+	void __iomem *sd = chip->hda_regs + base;
+	u32 lo = readl(sd + AZX_REG_SD_BDLPL), hi = readl(sd + AZX_REG_SD_BDLPU);
+	u32 want = lower_32_bits(bdl) & ~0x7fU, want_al = lower_32_bits(ALIGN(bdl, 128)) & ~0x7fU;
+
+	if (lo == 0xffffffff || hi == 0xffffffff) {
+		/* off the bus: nothing can fetch it any more; else a bad read
+		 * (a bridge glitch): don't guess, keep it */
+		if (creative_ae9_gone(chip, what))
+			return true;
+		dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x registers unreadable (%s): its BDL is kept, not freed (%d kept)\n",
+				     base, what, atomic_inc_return(&chip->bdl_leaks));
+		return false;
+	} else if (hi != upper_32_bits(bdl) ||
+		   ((lo & ~0x7fU) != want && (lo & ~0x7fU) != want_al)) {
+		return true;	/* the descriptor doesn't use this BDL */
+	} else if (ae9_sd_wait_stopped(chip, base, what)) {
+		return true;
+	}
+	dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x didn't stop (%s): its BDL is kept, not freed (%d kept)\n",
+			     base, what, atomic_inc_return(&chip->bdl_leaks));
+	return false;
+}
+
+static void ae9_dma_trace_prep(struct creative_chip *chip, const char *what, unsigned int base,
+			       struct snd_pcm_substream *substream, dma_addr_t bdl)
+{
+	struct snd_pcm_runtime *rt = substream->runtime;
+	size_t n = snd_pcm_lib_buffer_bytes(substream);
+
+	if (!dma_trace)
+		return;
+	dev_info(chip->dev, "dma: %s SD 0x%03x buffer 0x%llx-0x%llx (%zu bytes, %u ch, %u Hz), BDL 0x%llx\n",
+		 what, base, (unsigned long long)rt->dma_addr,
+		 (unsigned long long)rt->dma_addr + n - 1, n, rt->channels, rt->rate,
+		 (unsigned long long)bdl);
+}
+
+static void ae9_dma_dump_bdl(struct creative_chip *chip, const char *name, void *bdl, dma_addr_t dma)
+{
+	if (!bdl)
+		return;
+	dev_err(chip->dev, "dma dump: %s BDL 0x%llx: entry 0 0x%llx+%u, entry 1 0x%llx+%u\n",
+		name, (unsigned long long)ALIGN(dma, 128),
+		(unsigned long long)le64_to_cpu(*(__le64 *)bdl), le32_to_cpu(*(__le32 *)(bdl + 8)),
+		(unsigned long long)le64_to_cpu(*(__le64 *)(bdl + 16)), le32_to_cpu(*(__le32 *)(bdl + 24)));
+}
+
+/* stream descriptors from GCAP (input + output + bidirectional), capped at
+ * the 30 the register map has room for; 0 if the controller reads all-ones
+ * (ultrareview 2, #8: dma_dump and dma_quiesce shared this) */
+static unsigned int ae9_sd_count(u16 g)
+{
+	if (g == 0xffff)
+		return 0;
+	return min_t(unsigned int, ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f), 30);
+}
+
+/* every stream descriptor that runs or has a BDL, and the BDLs we hold:
+ * called at the first command timeout and when the card is marked hung */
+void creative_ae9_dma_dump(struct creative_chip *chip, const char *why)
+{
+	u16 g = readw(chip->hda_regs + AZX_REG_GCAP);
+	unsigned int n, i;
+	static const char * const xname[3] = { "optical in", "What U Hear", "rear RCA in" };
+
+	if (g == 0xffff) {
+		dev_err(chip->dev, "dma dump (%s): the controller reads all ones\n", why);
+		return;
+	}
+	n = ae9_sd_count(g);
+	dev_err(chip->dev, "dma dump (%s): GCAP 0x%04x, %u streams, DPLBASE 0x%08x, INTCTL 0x%08x, CORB 0x%llx, RIRB 0x%llx\n",
+		why, g, n, readl(chip->hda_regs + AZX_REG_DPLBASE),
+		readl(chip->hda_regs + AZX_REG_INTCTL),
+		(unsigned long long)chip->corb_dma, (unsigned long long)chip->rirb_dma);
+	for (i = 0; i < n; i++) {
+		unsigned int base = 0x80 + i * 0x20;
+		u32 ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		u32 bdl = readl(chip->hda_regs + base + AZX_REG_SD_BDLPL);
+
+		if (!(ctl & SD_CTL_DMA_START) && !bdl)
+			continue;
+		dev_err(chip->dev, "dma dump: SD 0x%03x ctl 0x%06x sts 0x%02x lpib 0x%x cbl 0x%x lvi %u bdl 0x%08x%08x%s\n",
+			base, ctl & 0xffffff, ctl >> 24,
+			readl(chip->hda_regs + base + AZX_REG_SD_LPIB),
+			readl(chip->hda_regs + base + AZX_REG_SD_CBL),
+			readw(chip->hda_regs + base + AZX_REG_SD_LVI) & 0xff,
+			readl(chip->hda_regs + base + AZX_REG_SD_BDLPU), bdl,
+			ctl & SD_CTL_DMA_START ? " RUN" : "");
+	}
+	ae9_dma_dump_bdl(chip, "playback", chip->playback_bdl, chip->playback_bdl_dma);
+	ae9_dma_dump_bdl(chip, "optical out", chip->opt_bdl, chip->opt_bdl_dma);
+	ae9_dma_dump_bdl(chip, "mic", chip->cap_bdl, chip->cap_bdl_dma);
+	for (i = 0; i < 3; i++)
+		ae9_dma_dump_bdl(chip, xname[i], chip->xcap[i].bdl, chip->xcap[i].bdl_dma);
+}
+
+/*
+ * The card stopped answering (corb.c): stop every stream's DMA engine. A
+ * crashed card's capture engines keep writing, to addresses it makes up
+ * (uv65, 2026-11-14: three running captures wrote 8-byte frames to
+ * unmapped addresses 4 s after the hang; the IOMMU blocked them). Clear
+ * RUN and the stream interrupts on every descriptor; MMIO only, so it is
+ * safe under corb_mutex. The PCMs are stopped from dead_work.
+ */
+void creative_ae9_dma_quiesce(struct creative_chip *chip)
+{
+	u16 g = readw(chip->hda_regs + AZX_REG_GCAP);
+	unsigned int n, i, stopped = 0;
+	u32 ctl;
+
+	if (g == 0xffff)
+		return;
+	n = ae9_sd_count(g);
+	for (i = 0; i < n; i++) {
+		unsigned int base = 0x80 + i * 0x20;
+
+		ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+		if (!(ctl & SD_CTL_DMA_START))
+			continue;
+		/* RUN, IOCE, FEIE, DEIE off */
+		writel(ctl & SD_CTL_WMASK & ~(SD_CTL_DMA_START | 0x1c),
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
+		ae9_sd_wait_stopped(chip, base, "at the hang");
+		stopped |= 1u << i;
+	}
+	/* no stream interrupts either (keep CIE/GIE for the controller) */
+	writel(readl(chip->hda_regs + AZX_REG_INTCTL) & 0xc0000000,
+	       chip->hda_regs + AZX_REG_INTCTL);
+	dev_err(chip->dev, "card stopped answering: stream DMA stopped (descriptors 0x%x)\n", stopped);
+}
+
+static void ae9_pcm_track(struct creative_chip *chip, struct snd_pcm *pcm)
+{
+	if (chip->npcms < ARRAY_SIZE(chip->pcms))
+		chip->pcms[chip->npcms++] = pcm;
+}
+
+/* every open stream to DISCONNECTED: apps get -ENODEV, not a stream that
+ * never moves; prepare and start refuse while the card is dead */
+void creative_ae9_dead_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(w, struct creative_chip, dead_work);
+	struct snd_pcm_substream *ss;
+	unsigned int i, dir, n = 0;
+
+	for (i = 0; i < chip->npcms; i++) {
+		struct snd_pcm *pcm = chip->pcms[i];
+
+		mutex_lock(&pcm->open_mutex);
+		for (dir = 0; dir < 2; dir++)
+			for (ss = pcm->streams[dir].substream; ss; ss = ss->next) {
+				if (!ss->runtime)
+					continue;
+				snd_pcm_stream_lock_irq(ss);
+				if (ss->runtime->state != SNDRV_PCM_STATE_OPEN &&
+				    ss->runtime->state != SNDRV_PCM_STATE_DISCONNECTED &&
+				    !snd_pcm_stop(ss, SNDRV_PCM_STATE_DISCONNECTED))
+					n++;
+				snd_pcm_stream_unlock_irq(ss);
+			}
+		mutex_unlock(&pcm->open_mutex);
+	}
+	dev_err(chip->dev, "card stopped answering: %u open stream(s) disconnected\n", n);
+}
 
 static void ae9_posbuf_off(struct creative_chip *chip)
 {
@@ -258,6 +490,7 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 	ctl &= ~SD_CTL_DMA_START;
 	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
+	ae9_sd_wait_stopped(chip, base, "after stop");
 }
 
 /* ------------------------------------------------------------------ */
@@ -468,41 +701,92 @@ static int ae9_spdif_verb(struct creative_chip *chip, unsigned int nid,
 }
 
 /*
- * spdif_out: optical out plays what the main output plays. HDA lets two
- * converters take the same stream, so converter 0x05 joins the playback
- * stream (same tag, same format). S/PDIF carries stereo up to 24-bit and
- * 192 kHz: 2-channel streams of up to 24 bits only (384 kHz goes out as
- * 4 channels, 5.1 as 6). At 32-bit the converter garbles it, and telling
- * it 24-bit doesn't help: on the link samples go at their real width, so
- * a 24-bit reader of a 32-bit stream gets the left channel right and
- * noise for the right (tested 2026-11-05). So optical is silent at 32-bit.
- * Not through the DSP: the stream as sent, before SBX; app volume shows
- * on optical, the card's Master volume (and the knob) doesn't.
+ * Optical output (codec 2's S/PDIF converter 0x05). Two ways in:
+ * - the separate optical PCM (device 4, "AE-9 Optical Out"; DarkNikGr):
+ *   its own stream, rate and format, and IEC958 status (non-audio for
+ *   AC-3/DTS passthrough); while it's prepared it owns 0x05
+ * - otherwise 0x05 mirrors the main output, as since 0.9.0: HDA lets two
+ *   converters take one stream, so 0x05 joins the playback's (same tag,
+ *   same format)
+ * S/PDIF carries stereo up to 24-bit and 192 kHz: 2-channel streams of up
+ * to 24 bits only (384 kHz goes out as 4 channels, 5.1 as 6). At 32-bit
+ * the converter garbles it (tested 2026-11-05), so a 32-bit main stream
+ * isn't mirrored. Not through the DSP: the stream as sent, before SBX.
  */
 static bool spdif_out = true;
 module_param(spdif_out, bool, 0644);
-MODULE_PARM_DESC(spdif_out, "Optical out plays what the main output plays (1=on, default); also 'Optical Out Playback Switch'");
+/*
+ * Mirror off by default since 0.12.1 (DarkNikGr: with several speakers on
+ * different outputs, they shouldn't all play at once): optical plays only
+ * what's sent to the optical PCM. "Optical Out Mirror Switch" (or
+ * optical_mirror=1) brings back the 0.9-0.12.0 behaviour: the main output
+ * on optical while the optical PCM is unused.
+ */
+static bool optical_mirror;
+module_param(optical_mirror, bool, 0644);
+MODULE_PARM_DESC(optical_mirror, "Optical out mirrors the main output while nothing plays to the optical PCM (0 = off, default since 0.12.1); also 'Optical Out Mirror Switch'");
+MODULE_PARM_DESC(spdif_out, "Optical out on (1, default): the separate optical PCM, or else a mirror of the main output; also 'Optical Out Playback Switch'");
 
-static void ae9_spdif_out_follow(struct creative_chip *chip)
+/* 0x70d, digital converter 1: b0 DigEn, b2 VCFG, b4 COPY, b5 /AUDIO
+ * (non-audio). The boot replay leaves 0x15 (Windows' PCM value). */
+#define AE9_SPDIF_DIG1_PCM	0x15
+#define AE9_SPDIF_DIG1_NONAUDIO	0x20
+
+/*
+ * Bind 0x05 to what should play (caller holds spdif_mutex). A new binding
+ * goes in Windows' order (captures 6/7, notes 32v/37v): 0x70d with DigEn
+ * off, the format, 0x70d on (with the non-audio bit for passthrough), then
+ * the stream tag. The same binding again only re-sends format and tag: a
+ * resume's boot replay resets 0x05 behind our back.
+ */
+static void ae9_spdif_out_apply_locked(struct creative_chip *chip)
 {
-	u16 fmt = chip->pb_format;
+	bool opt = chip->opt_format != 0;
+	u16 fmt = opt ? chip->opt_format : chip->spdif_mirror ? chip->pb_format : 0;
+	unsigned int tag = opt ? CREATIVE_OPT_STREAM_TAG : CREATIVE_PCM_STREAM_TAG;
+	bool nonaudio = opt && (chip->spdif_aes[0] & IEC958_AES0_NONAUDIO);
+	u8 dig1 = AE9_SPDIF_DIG1_PCM | (nonaudio ? AE9_SPDIF_DIG1_NONAUDIO : 0);
 	u32 want = 0;
 
-	if (chip->spdif_out && fmt && (fmt & 0xf) == 1 && ((fmt >> 4) & 0x7) <= 3)
-		want = (u32)fmt << 8 | (CREATIVE_PCM_STREAM_TAG << 4);
-	/* always sent (two verbs per prepare): a resume's boot replay resets
-	 * 0x05 to no stream behind our back */
-	if (want) {
-		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x2, want >> 8);
-		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x706, want & 0xff);
+	/* 2 channels, up to 32-bit, and not 176.4 kHz (44.1k x 4: base bit 14,
+	 * multiplier 3 in bits 13:11), which converter 0x05 can't take; a
+	 * 176.4 kHz main stream simply isn't mirrored */
+	if (chip->spdif_out && fmt && (fmt & 0xf) == 1 && ((fmt >> 4) & 0x7) <= 3 &&
+	    ((fmt >> 11) & 0xf) != 0xb)
+		want = (u32)nonaudio << 24 | (u32)fmt << 8 | (tag << 4);
+	if (want && want != chip->spdif_out_sent) {
+		/* unbound first: Windows changes format and flag only on an
+		 * unbound converter. Switching from the mirror (tag 1, 24-bit)
+		 * straight to a 16-bit optical stream without it played the
+		 * left channel right and the right as full-scale noise
+		 * (2026-11-08) */
+		if (chip->spdif_out_sent)
+			ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x706, 0);
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x70d, dig1 & ~1);
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x2, fmt);
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x70d, dig1);
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x706, tag << 4);
+	} else if (want) {
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x2, fmt);
+		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x706, tag << 4);
 	} else if (chip->spdif_out_sent) {
 		ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x706, 0);
+		if (chip->spdif_out_sent >> 24)		/* back to PCM */
+			ae9_spdif_verb(chip, AE9_SPDIF_OUT_NID, 0x70d, AE9_SPDIF_DIG1_PCM);
 	}
 	if (want != chip->spdif_out_sent)
-		ae9_dbg(chip, "optical out: %s (format 0x%04x)\n",
-			want ? "following the main stream" : "no stream (silent)",
-			want >> 8);
+		ae9_dbg(chip, "optical out: %s (format 0x%04x%s)\n",
+			!want ? "no stream (silent)" : opt ? "separate stream" :
+			"following the main stream", (want >> 8) & 0xffff,
+			nonaudio ? ", non-audio" : "");
 	chip->spdif_out_sent = want;
+}
+
+static void ae9_spdif_out_apply(struct creative_chip *chip)
+{
+	mutex_lock(&chip->spdif_mutex);
+	ae9_spdif_out_apply_locked(chip);
+	mutex_unlock(&chip->spdif_mutex);
 }
 
 static int spdif_out_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
@@ -518,13 +802,51 @@ static int spdif_out_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 	bool on = !!uv->value.integer.value[0];
 
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
 	if (on == chip->spdif_out)
 		return 0;
 	chip->spdif_out = on;
 	spdif_out = on;
-	ae9_spdif_out_follow(chip);	/* takes effect on a playing stream */
+	ae9_spdif_out_apply(chip);	/* takes effect on a playing stream */
 	return 1;
 }
+
+static int spdif_mirror_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+
+	uv->value.integer.value[0] = chip->spdif_mirror;
+	return 0;
+}
+
+static int spdif_mirror_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	bool on = !!uv->value.integer.value[0];
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
+	if (on == chip->spdif_mirror)
+		return 0;
+	mutex_lock(&chip->spdif_mutex);
+	chip->spdif_mirror = on;
+	optical_mirror = on;
+	ae9_spdif_out_apply_locked(chip);	/* takes effect on a playing stream */
+	mutex_unlock(&chip->spdif_mutex);
+	return 1;
+}
+
+static const struct snd_kcontrol_new spdif_mirror_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Optical Out Mirror Switch",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+	.info = snd_ctl_boolean_mono_info,
+	.get = spdif_mirror_get,
+	.put = spdif_mirror_put,
+};
 
 /* not "IEC958 ...": PipeWire's analog output paths switch that one off */
 static const struct snd_kcontrol_new spdif_out_control = {
@@ -653,9 +975,11 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 
 	if (chip->playback_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback hw_params"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
 	}
@@ -702,7 +1026,7 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	 * stream is released, not at every trigger stop (an xrun stop +
 	 * re-prepare would otherwise leave node 0x02 unbound) */
 	chip->pb_format = 0;
-	ae9_spdif_out_follow(chip);
+	ae9_spdif_out_apply(chip);	/* mirror off (unless optical has its own) */
 	if (chip->pcm_start_sent) {
 		if (pcm_stop_block)
 			creative_ae9_cold_pcm_replay(chip, false, false, 0, 0);
@@ -713,9 +1037,11 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 
 	ae9_posbuf_off(chip);
 	if (chip->playback_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback hw_free"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
 	}
@@ -726,6 +1052,17 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 /* ------------------------------------------------------------------ */
 /* prepare — program BDL and stream registers			  */
 /* ------------------------------------------------------------------ */
+
+/*
+ * A headphone profile upload (fx.c) checks that no stream runs, then
+ * holds replay_mutex for ~100 ms. A stream prepared in between waits for
+ * it here instead of starting under the upload (review B11, note 56a).
+ */
+static void ae9_wait_hp_upload(struct creative_chip *chip)
+{
+	mutex_lock(&chip->replay_mutex);
+	mutex_unlock(&chip->replay_mutex);
+}
 
 static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 {
@@ -738,6 +1075,10 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	dma_addr_t addr;
 	int i;
 
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
+	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
 
 	/* Build BDL entries (keep as fallback) */
@@ -790,6 +1131,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 			    lower_32_bits(chip->playback_bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->playback_bdl_dma));
+	ae9_dma_trace_prep(chip, "playback", base, substream, chip->playback_bdl_dma);
 	ae9_posbuf_on(chip);
 
 	/* Windows' playback-start block sets format 0x31 and binds node
@@ -806,10 +1148,16 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 		chip->pcm_start_fmt = format;
 		ae9_dbg(chip, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
-		creative_ae9_fx_spk_follow(chip, runtime->channels);
+		/* Speaker Config follows the stream, but only one that's still
+		 * playing 1.5 s later: PipeWire's probe of the card profile
+		 * opened 2 and 6 channels back and forth at login and every
+		 * open re-sent the whole effects block (Kaiba: 12 flips in
+		 * 19 s, note 60) */
+		chip->spk_follow_ch = runtime->channels;
+		mod_delayed_work(chip->wq, &chip->spk_follow_work, msecs_to_jiffies(1500));
 	}
 	chip->pb_format = format;
-	ae9_spdif_out_follow(chip);	/* after the start block */
+	ae9_spdif_out_apply(chip);	/* after the start block: mirror */
 	return 0;
 }
 
@@ -822,6 +1170,9 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int base = chip->playback_stream_base;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -880,6 +1231,316 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Separate optical playback: PCM device 4, stream base 0x140, tag 3,  */
+/* codec 2 converter 0x05; while it isn't prepared, 0x05 mirrors main.	  */
+/* ------------------------------------------------------------------ */
+static const struct snd_pcm_chmap_elem ae9_opt_chmaps[] = {
+	{ .channels = 2, .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR } },
+	{ }
+};
+
+static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	chip->opt_substream = substream;
+	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+			   SNDRV_PCM_INFO_INTERLEAVED;
+	if (pcm_nowakeup)
+		runtime->hw.info |= SNDRV_PCM_INFO_NO_PERIOD_WAKEUP;
+	runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE;
+	runtime->hw.channels_min = 2;
+	runtime->hw.channels_max = 2;
+	/* no 176.4 kHz: converter 0x05's rate list (param 0x0a = 0x000a05e0,
+	 * Windows' boot read) has 44.1/48/88.2/96/192 */
+	runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
+			    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+			    SNDRV_PCM_RATE_192000;
+	runtime->hw.rate_min = 44100;
+	runtime->hw.rate_max = 192000;
+	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
+	runtime->hw.period_bytes_min = 4096;
+	runtime->hw.period_bytes_max = 128 * 1024;
+	runtime->hw.periods_min = 2;
+	runtime->hw.periods_max = clamp(pcm_periods, 2U, (unsigned int)CREATIVE_PCM_BDL_MAX);
+	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 128);
+	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 128);
+	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
+	return 0;
+}
+
+static int creative_ae9_opt_close(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	chip->opt_substream = NULL;
+	return 0;
+}
+
+static int creative_ae9_opt_hw_params(struct snd_pcm_substream *substream,
+				      struct snd_pcm_hw_params *hw_params)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	size_t alloc_size;
+	int ret;
+
+	if (chip->opt_bdl_raw) {
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out hw_params"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		chip->opt_bdl_raw = NULL;
+		chip->opt_bdl = NULL;
+	}
+	ret = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
+	if (ret < 0)
+		return ret;
+	alloc_size = ae9_dma_size(chip, CREATIVE_PCM_BDL_SIZE + 128);
+	chip->opt_bdl_raw = dma_alloc_coherent(chip->dev, alloc_size,
+					       &chip->opt_bdl_dma, GFP_KERNEL);
+	if (!chip->opt_bdl_raw) {
+		snd_pcm_lib_free_pages(substream);
+		return -ENOMEM;
+	}
+	chip->opt_bdl_size = alloc_size;
+	chip->opt_bdl = PTR_ALIGN(chip->opt_bdl_raw, 128);
+	chip->opt_bdl_dma = ALIGN(chip->opt_bdl_dma, 128);
+	chip->opt_period_size = params_period_bytes(hw_params);
+	return 0;
+}
+
+static int creative_ae9_opt_hw_free(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	chip->opt_format = 0;
+	ae9_spdif_out_apply(chip);
+	if (chip->opt_bdl_raw) {
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out hw_free"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		chip->opt_bdl_raw = NULL;
+		chip->opt_bdl = NULL;
+	}
+	return snd_pcm_lib_free_pages(substream);
+}
+
+static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	unsigned int base = CREATIVE_OPT_STREAM_BASE;
+	unsigned int buf_size = snd_pcm_lib_buffer_bytes(substream);
+	unsigned int period_size = snd_pcm_lib_period_bytes(substream);
+	u16 format;
+	dma_addr_t addr;
+	int i;
+
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
+	ae9_wait_hp_upload(chip);
+	creative_ae9_stream_reset(chip, base);
+	memset(chip->opt_bdl, 0, CREATIVE_PCM_BDL_SIZE);
+	addr = runtime->dma_addr;
+	for (i = 0; i < runtime->periods; i++) {
+		__le64 *bdl_addr = chip->opt_bdl + i * 16;
+		__le32 *bdl_len = chip->opt_bdl + i * 16 + 8;
+		__le32 *bdl_ioc = chip->opt_bdl + i * 16 + 12;
+
+		*bdl_addr = cpu_to_le64(addr);
+		*bdl_len = cpu_to_le32(period_size);
+		*bdl_ioc = cpu_to_le32(runtime->no_period_wakeup ? 0 : 1);
+		addr += period_size;
+	}
+	wmb();
+	{
+		u32 ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+
+		ctl &= ~(0xf << 20);
+		ctl |= ((CREATIVE_OPT_STREAM_TAG & 0xf) << 20);
+		writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+		wmb();
+	}
+	creative_hda_writel(chip, base + AZX_REG_SD_CBL, buf_size);
+	creative_hda_writew(chip, base + AZX_REG_SD_LVI, runtime->periods - 1);
+	format = creative_ae9_stream_format(2,
+			runtime->format == SNDRV_PCM_FORMAT_S16_LE ? 16 : 24,
+			runtime->rate);
+	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
+	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL,
+			    lower_32_bits(chip->opt_bdl_dma));
+	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
+			    upper_32_bits(chip->opt_bdl_dma));
+	ae9_dma_trace_prep(chip, "optical out", base, substream, chip->opt_bdl_dma);
+	chip->opt_format = format;
+	ae9_spdif_out_apply(chip);
+	return 0;
+}
+
+static int creative_ae9_opt_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int base = CREATIVE_OPT_STREAM_BASE;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		creative_ae9_stream_start(chip, base);
+		break;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		creative_ae9_stream_stop(chip, base);
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static snd_pcm_uframes_t
+creative_ae9_opt_pointer(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int pos;
+
+	pos = readl(chip->hda_regs + CREATIVE_OPT_STREAM_BASE + AZX_REG_SD_LPIB);
+	wmb();
+	if (pos >= snd_pcm_lib_buffer_bytes(substream))
+		pos = 0;
+	return bytes_to_frames(substream->runtime, pos);
+}
+
+void creative_ae9_opt_irq(struct creative_chip *chip)
+{
+	unsigned int base = CREATIVE_OPT_STREAM_BASE;
+	u8 sts = readb(chip->hda_regs + base + AZX_REG_SD_STS);
+
+	if (!sts)
+		return;
+	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
+	if ((sts & SD_INT_COMPLETE) && chip->opt_substream)
+		snd_pcm_period_elapsed(chip->opt_substream);
+}
+
+static const struct snd_pcm_ops creative_ae9_opt_pcm_ops = {
+	.open		= creative_ae9_opt_open,
+	.close		= creative_ae9_opt_close,
+	.hw_params	= creative_ae9_opt_hw_params,
+	.hw_free	= creative_ae9_opt_hw_free,
+	.prepare	= creative_ae9_opt_prepare,
+	.trigger	= creative_ae9_opt_trigger,
+	.pointer	= creative_ae9_opt_pointer,
+};
+
+/*
+ * "IEC958 Playback Default" / "Con Mask" on the optical PCM (iface PCM,
+ * device 4; not mixer elements, so PipeWire's analog paths leave them
+ * alone). Of the channel status only AES0's non-audio bit is acted on: it
+ * sets 0x70d's /AUDIO bit for AC-3/DTS passthrough (IEC 61937), applied at
+ * once if the optical stream is bound. Off by default: on PCM data it
+ * makes receivers mute or play noise.
+ */
+static int ae9_iec958_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	ui->type = SNDRV_CTL_ELEM_TYPE_IEC958;
+	ui->count = 1;
+	return 0;
+}
+
+static int ae9_iec958_default_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned int i;
+
+	mutex_lock(&chip->spdif_mutex);
+	for (i = 0; i < 4; i++)
+		uv->value.iec958.status[i] = chip->spdif_aes[i];
+	mutex_unlock(&chip->spdif_mutex);
+	return 0;
+}
+
+static int ae9_iec958_default_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned int i;
+	int changed = 0;
+
+	if (creative_ae9_dead(chip))
+		return -ENODEV;
+
+	mutex_lock(&chip->spdif_mutex);
+	for (i = 0; i < 4; i++) {
+		if (chip->spdif_aes[i] != uv->value.iec958.status[i])
+			changed = 1;
+		chip->spdif_aes[i] = uv->value.iec958.status[i];
+	}
+	if (changed)
+		ae9_spdif_out_apply_locked(chip);
+	mutex_unlock(&chip->spdif_mutex);
+	return changed;
+}
+
+static int ae9_iec958_mask_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.iec958.status[0] = IEC958_AES0_NONAUDIO | IEC958_AES0_CON_NOT_COPYRIGHT;
+	return 0;
+}
+
+static void creative_ae9_opt_iec958_new(struct creative_chip *chip, int device)
+{
+	struct snd_kcontrol_new kn[] = {
+		{ .iface = SNDRV_CTL_ELEM_IFACE_PCM, .device = device,
+		  .name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
+		  .info = ae9_iec958_info, .get = ae9_iec958_default_get,
+		  .put = ae9_iec958_default_put },
+		{ .iface = SNDRV_CTL_ELEM_IFACE_PCM, .device = device,
+		  .access = SNDRV_CTL_ELEM_ACCESS_READ,
+		  .name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, CON_MASK),
+		  .info = ae9_iec958_info, .get = ae9_iec958_mask_get },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(kn); i++)
+		if (snd_ctl_add(chip->card, snd_ctl_new1(&kn[i], chip)) < 0)
+			dev_warn(chip->dev, "optical: %s not added\n", kn[i].name);
+}
+
+static void creative_ae9_opt_new(struct creative_chip *chip)
+{
+	struct snd_pcm *pcm;
+	int ret;
+
+	ret = snd_pcm_new(chip->card, "AE-9 Optical Out", 4, 1, 0, &pcm);
+	if (ret < 0) {
+		dev_warn(chip->dev, "AE-9 Optical Out device not added (%d)\n", ret);
+		return;
+	}
+	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
+	strscpy(pcm->name, "AE-9 Optical Out", sizeof(pcm->name));
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
+			&creative_ae9_opt_pcm_ops);
+	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV,
+					      chip->dev,
+					      ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX),
+					      ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX));
+	ret = snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_PLAYBACK,
+				     ae9_opt_chmaps, 2, 0, NULL);
+	if (ret < 0)
+		dev_warn(chip->dev, "optical channel map not added (%d)\n", ret);
+	creative_ae9_opt_iec958_new(chip, pcm->device);
+}
+
+/* ------------------------------------------------------------------ */
 /* Capture: input stream 0 (BAR0+0x80), tag 1, from codec 1 node 0x07	  */
 /* (the head unit's input: its XLR/TRS jack and its 3.5 mm mic jack	  */
 /* share it; Windows lists them as Microphone and Aux), as in the	  */
@@ -888,7 +1549,6 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 /* format on node 0x07, nothing else (VM capture 2026-11-05).		  */
 /* ------------------------------------------------------------------ */
 #define CREATIVE_CAP_STREAM_BASE	0x80	/* input stream descriptor 0 */
-#define CREATIVE_CAP_STREAM_TAG		1
 #define CREATIVE_CAP_BDL_MAX		8
 
 /*
@@ -949,6 +1609,11 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 	runtime->hw.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000;
 	runtime->hw.rate_min = 48000;
 	runtime->hw.rate_max = 96000;
+	/* Voice Clarity: Windows records at 48 kHz (format 0x31) with it on */
+	if (AE9_CV_WANT(chip)) {
+		runtime->hw.rates = SNDRV_PCM_RATE_48000;
+		runtime->hw.rate_max = 48000;
+	}
 	runtime->hw.buffer_bytes_max = 128 * 1024;	/* ~170 ms at 96 kHz */
 	runtime->hw.period_bytes_min = 1920;	/* 5 ms */
 	runtime->hw.period_bytes_max = 32 * 1024;
@@ -965,14 +1630,17 @@ static int creative_ae9_cap_close(struct snd_pcm_substream *substream)
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 
 	chip->capture_substream = NULL;
+	if (chip->cv.monitor)	/* the monitor keeps the mic input after it */
+		creative_ae9_mic_monitor_apply(chip);
 	return 0;
 }
 
 static void creative_ae9_cap_bdl_free(struct creative_chip *chip)
 {
 	if (chip->cap_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->cap_bdl_size,
-				  chip->cap_bdl_raw, chip->cap_bdl_dma);
+		if (ae9_bdl_may_free(chip, CREATIVE_CAP_STREAM_BASE, chip->cap_bdl_dma, "mic BDL free"))
+			dma_free_coherent(chip->dev, chip->cap_bdl_size,
+					  chip->cap_bdl_raw, chip->cap_bdl_dma);
 		chip->cap_bdl_raw = NULL;
 		chip->cap_bdl = NULL;
 	}
@@ -1010,6 +1678,11 @@ static int creative_ae9_cap_hw_free(struct snd_pcm_substream *substream)
 		creative_ae9_cap_replay(chip, false);
 		chip->cap_start_sent = 0;
 	}
+	chip->cv.mon_bound = false;	/* the stop block unbound it */
+	if (chip->cv.route_on) {	/* Windows: ~30 ms after the ADC unbind */
+		msleep(30);
+		creative_ae9_cv_route(chip, false);
+	}
 	creative_ae9_cap_bdl_free(chip);
 	return snd_pcm_lib_free_pages(substream);
 }
@@ -1026,8 +1699,12 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	unsigned int i;
 	u32 ctl;
 
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
+	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
 
 	memset(chip->cap_bdl, 0, CREATIVE_CAP_BDL_MAX * 16);
@@ -1055,16 +1732,30 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 						    runtime->rate));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
+	ae9_dma_trace_prep(chip, "mic", base, substream, bdl_dma);
 
 	/* Windows' start block once per open (re-prepares after an xrun
 	 * must not resend it), with node 0x07 given this recording's format
 	 * before its bind (see creative_ae9_cap_replay) */
 	chip->cap_format = creative_ae9_stream_format(runtime->channels, cap_bits_now(),
 						      runtime->rate);
+	/* Voice Clarity: the voice processor in BEFORE Windows' start block
+	 * binds the ADC (Windows: format, route, bind; it never moves the mic
+	 * route while 0x07 is bound - unicorn router report, 25 captures) */
+	/* the mic monitor holds 0x07 bound (no recording until now): the
+	 * recording takes it over. Unbind first, as cv_apply does, so the
+	 * route and the new format never land on a bound ADC */
+	if (!chip->cap_start_sent && chip->cv.mon_bound) {
+		u32 resp;
+
+		creative_ae9_corb_send_verb_sync(chip, 0x10770600, &resp);
+		msleep(20);	/* Windows: ~20 ms after the unbind */
+		chip->cv.mon_bound = false;
+	}
+	/* Voice Clarity: the route-in goes inside the start block, after the
+	 * format and before the bind, as Windows (creative_ae9_cap_start) */
 	if (!chip->cap_start_sent) {
-		creative_ae9_cap_replay(chip, true);
-		if (chip->mic_level != 99)
-			creative_ae9_mic_level_apply(chip);
+		creative_ae9_cap_start(chip, AE9_CV_WANT(chip) && !chip->cv.route_on);
 		chip->cap_start_sent = 1;
 		ae9_dbg(chip, "capture prepare: SD_FMT=0x%04x\n",
 			 creative_hda_readw(chip, base + AZX_REG_SD_FORMAT));
@@ -1075,6 +1766,9 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 static int creative_ae9_cap_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1139,6 +1833,12 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 /*     the card plays, both with Direct Mode on and off (with SBX off it */
 /*     is the stream as sent: a 440 Hz test tone came back level-exact  */
 /*     on both channels). 48 or 96 kHz (wuh_96k).			  */
+/*   PCM device 3 "AE-9 Rear RCA In": the head unit's rear RCA L/R	  */
+/*     jacks = codec 2 pin 0x11 -> ADC 0x08 (24-bit up to 192 kHz),	  */
+/*     input stream 3 (BAR0+0xe0), tag 4. Proven by hand 2026-11-07: a  */
+/*     440 Hz tone into the jacks came back only while 0x08 was on the  */
+/*     capture stream. Windows calls it "Aux" (codec 2 on MS hdaudio).  */
+/*     Pin config and pin control (0x22) come from the cold table.	  */
 /* ------------------------------------------------------------------ */
 struct ae9_xcap {
 	const char	*name;
@@ -1147,13 +1847,22 @@ struct ae9_xcap {
 	unsigned int	signal_pin;	/* codec pin whose sense says "signal", 0 none */
 };
 
-static const struct ae9_xcap ae9_xcaps[2] = {
+static const struct ae9_xcap ae9_xcaps[3] = {
+	/* no 176.4 kHz: converter 0x09's rate list (param 0x0a = 0x000a05f0,
+	 * Windows' boot read, capture 2026-11-09) has 32/44.1/48/88.2/96/192 */
 	{ "AE-9 Optical", 0xa0, 2, AE9_SPDIF_CAD, AE9_SPDIF_IN_NID,
 	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
-	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | SNDRV_PCM_RATE_192000,
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_192000,
 	  44100, 192000, AE9_SPDIF_IN_PIN },
 	{ "AE-9 What U Hear", 0xc0, 3, 1, 0x0a,
 	  SNDRV_PCM_RATE_48000, 48000, 48000, 0 },
+	/* no 176.4 kHz: ADC 0x08's rate list (param 0x0a = 0x000a05e4, also in
+	 * Windows' boot read) has
+	 * 44.1/48/88.2/96/192 but not 176.4 (bit 9) */
+	{ "AE-9 Rear RCA In", 0xe0, 4, 2, 0x08,
+	  SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
+	  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_192000,
+	  44100, 192000, 0 },
 };
 #define AE9_XCAP_WUH	1
 
@@ -1171,7 +1880,7 @@ MODULE_PARM_DESC(wuh_96k, "What U Hear at 48 or 96 kHz (1 = yes, default; 0 = 48
 
 
 
-/* PCM device n (1, 2) -> table index */
+/* PCM device n (1, 2, 3) -> table index */
 static unsigned int ae9_xcap_idx(struct snd_pcm_substream *substream)
 {
 	return substream->pcm->device - 1;
@@ -1213,6 +1922,20 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 		runtime->hw.rates |= SNDRV_PCM_RATE_96000;
 		runtime->hw.rate_max = 96000;
 	}
+	if (i == AE9_XCAP_WUH) {
+		/* 2 or 6 channels: Windows records the card's mix as 48 kHz /
+		 * 24-bit / 6 ch from this converter for its PC-side encoder
+		 * loop (capture 6, memory optical-spdif); a software AC-3
+		 * encoder needs the 5.1 mix the same way */
+		static const unsigned int wuh_ch[] = { 2, 6 };
+		static const struct snd_pcm_hw_constraint_list wuh_ch_list = {
+			.count = ARRAY_SIZE(wuh_ch), .list = wuh_ch,
+		};
+
+		runtime->hw.channels_max = 6;
+		snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
+					   &wuh_ch_list);
+	}
 	runtime->hw.buffer_bytes_max = CREATIVE_PCM_BUF_MAX;
 	runtime->hw.period_bytes_min = 1024;
 	runtime->hw.period_bytes_max = CREATIVE_PCM_BUF_MAX / 2;
@@ -1238,7 +1961,8 @@ static void creative_ae9_xcap_bdl_free(struct creative_chip *chip, unsigned int 
 	struct ae9_xcap_state *st = &chip->xcap[i];
 
 	if (st->bdl_raw) {
-		dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
+		if (ae9_bdl_may_free(chip, ae9_xcaps[i].base, st->bdl_dma, "capture BDL free"))
+			dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
 		st->bdl_raw = NULL;
 		st->bdl = NULL;
 	}
@@ -1273,6 +1997,11 @@ static int creative_ae9_xcap_hw_free(struct snd_pcm_substream *substream)
 	unsigned int i = ae9_xcap_idx(substream);
 	const struct ae9_xcap *x = &ae9_xcaps[i];
 
+	if (x->signal_pin) {
+		chip->xcap[i].sil_running = false;
+		hrtimer_cancel(&chip->xcap[i].sil_timer);
+		cancel_delayed_work_sync(&chip->xcap[i].sense_work);
+	}
 	ae9_xcap_verb(chip, x, x->nid, 0x706, 0, NULL);	/* off the stream */
 	creative_ae9_xcap_bdl_free(chip, i);
 	return snd_pcm_lib_free_pages(substream);
@@ -1294,19 +2023,30 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 	u16 format;
 	u32 ctl;
 
+	if (creative_ae9_dead(chip))	/* the card stopped answering */
+		return -ENODEV;
+
 	if (periods > CREATIVE_CAP_BDL_MAX)
 		return -EINVAL;
-	/* Optical: with no S/PDIF signal the codec sends nothing and the
-	 * stream never moves (a read just times out with an I/O error): say
-	 * so instead. Pin sense bit 31 is set while a signal comes in. */
+	ae9_wait_hp_upload(chip);
+	/*
+	 * Optical: with no S/PDIF signal the codec sends nothing and the
+	 * stream never moves. That used to fail here (-EIO), which also made
+	 * PipeWire drop the source. Now the recording runs as silence on a
+	 * timer until a signal comes in (pin sense bit 31), then restarts on
+	 * the real stream (sense_work, an xrun PipeWire recovers from).
+	 */
 	if (x->signal_pin) {
 		u32 sense = 0;
 
-		if (ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
-		    !(sense & 0x80000000)) {
+		st->no_signal = ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
+				!(sense & 0x80000000);
+		if (st->no_signal) {
 			dev_info_ratelimited(chip->dev,
-				"optical in: no signal on the optical input (connect a source, then record)\n");
-			return -EIO;
+				"optical in: no signal; recording silence until one comes in\n");
+			memset(runtime->dma_area, 0, snd_pcm_lib_buffer_bytes(substream));
+			st->sil_period = ns_to_ktime(div_u64((u64)runtime->period_size * NSEC_PER_SEC,
+							     runtime->rate));
 		}
 	}
 	creative_ae9_stream_reset(chip, base);
@@ -1335,6 +2075,7 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL, lower_32_bits(bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
+	ae9_dma_trace_prep(chip, x->name, base, substream, bdl_dma);
 
 	/* the converter onto the stream: same format, tag, channel 0 */
 	ae9_xcap_verb(chip, x, x->nid, 0x2, format, NULL);
@@ -1346,18 +2087,43 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
-	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
+	unsigned int i = ae9_xcap_idx(substream);
+	const struct ae9_xcap *x = &ae9_xcaps[i];
+	struct ae9_xcap_state *st = &chip->xcap[i];
+	unsigned int base = x->base;
+	bool sil = x->signal_pin && st->no_signal;
+
+	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
+		return -ENODEV;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		creative_ae9_stream_start(chip, base);
+		if (sil) {
+			st->sil_t0 = ktime_get();
+			st->sil_running = true;
+			hrtimer_start(&st->sil_timer, st->sil_period, HRTIMER_MODE_REL_SOFT);
+		} else {
+			creative_ae9_stream_start(chip, base);
+		}
+		if (x->signal_pin) {
+			st->last_lpib = ~0U;
+			queue_delayed_work(chip->wq, &st->sense_work, HZ);
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		creative_ae9_stream_stop(chip, base);
+		if (sil) {
+			/* atomic here: no waiting; the tick checks sil_running */
+			st->sil_running = false;
+			hrtimer_try_to_cancel(&st->sil_timer);
+		} else {
+			creative_ae9_stream_stop(chip, base);
+		}
+		if (x->signal_pin)
+			cancel_delayed_work(&st->sense_work);
 		break;
 	default:
 		return -EINVAL;
@@ -1365,12 +2131,80 @@ static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cm
 	return 0;
 }
 
+/* Silence clock: one period per tick, as the stream's interrupt would. */
+static enum hrtimer_restart ae9_sil_tick(struct hrtimer *t)
+{
+	struct ae9_xcap_state *st = container_of(t, struct ae9_xcap_state, sil_timer);
+	struct snd_pcm_substream *ss = st->substream;
+
+	if (!ss || !st->sil_running)
+		return HRTIMER_NORESTART;
+	snd_pcm_period_elapsed(ss);
+	if (!st->sil_running)
+		return HRTIMER_NORESTART;
+	hrtimer_forward_now(t, st->sil_period);
+	return HRTIMER_RESTART;
+}
+
+/*
+ * Optical in, once a second while it records: a signal came in during
+ * silence, or the signal went (or the stream stopped moving) during a real
+ * recording -> an xrun; PipeWire (or the app) prepares again, and prepare
+ * picks the mode. Process context: the sense read is one codec-2 verb.
+ */
+static void ae9_sense_work(struct work_struct *w)
+{
+	struct ae9_xcap_state *st = container_of(to_delayed_work(w),
+						 struct ae9_xcap_state, sense_work);
+	struct creative_chip *chip = st->chip;
+	struct snd_pcm_substream *ss = st->substream;
+	const struct ae9_xcap *x = &ae9_xcaps[0];
+	u32 sense = 0, lpib;
+	bool sig, restart = false;
+
+	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING)
+		return;		/* stopped: the next start queues this again */
+	if (chip->card_gone || chip->card_hung ||
+	    ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) < 0)
+		goto again;
+	sig = sense & 0x80000000;
+	if (st->no_signal && sig) {
+		dev_info(chip->dev, "optical in: signal came in; restarting the recording on it\n");
+		restart = true;
+	} else if (!st->no_signal) {
+		lpib = readl(chip->hda_regs + x->base + AZX_REG_SD_LPIB);
+		if (!sig || lpib == st->last_lpib) {
+			dev_info(chip->dev, "optical in: %s; recording silence until a signal comes in\n",
+				 sig ? "the stream stopped moving" : "signal lost");
+			restart = true;
+		}
+		st->last_lpib = lpib;
+	}
+	if (restart) {
+		snd_pcm_stop_xrun(ss);
+		return;		/* the next start queues this again */
+	}
+again:
+	queue_delayed_work(chip->wq, &st->sense_work, HZ);
+}
+
 static snd_pcm_uframes_t
 creative_ae9_xcap_pointer(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
-	unsigned int base = ae9_xcaps[ae9_xcap_idx(substream)].base;
+	unsigned int i = ae9_xcap_idx(substream);
+	unsigned int base = ae9_xcaps[i].base;
+	struct ae9_xcap_state *st = &chip->xcap[i];
 	unsigned int pos;
+
+	if (ae9_xcaps[i].signal_pin && st->no_signal) {
+		/* from elapsed time, not whole periods: PipeWire's timer
+		 * scheduling reads the position between periods */
+		u64 ns = ktime_to_ns(ktime_sub(ktime_get(), st->sil_t0));
+		u64 frames = mul_u64_u32_div(ns, substream->runtime->rate, NSEC_PER_SEC);
+
+		return do_div(frames, substream->runtime->buffer_size);
+	}
 
 	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
@@ -1419,7 +2253,19 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 		return;
 	}
 	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
 	pcm->private_free = creative_ae9_xcap_pcm_free;
+	chip->xcap[i].chip = chip;
+	if (x->signal_pin) {
+#ifdef AE9_HAVE_HRTIMER_SETUP	/* Makefile: from the kernel's header */
+		hrtimer_setup(&chip->xcap[i].sil_timer, ae9_sil_tick, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL_SOFT);
+#else		/* before 6.13 (Ubuntu 24.04: 6.8) */
+		hrtimer_init(&chip->xcap[i].sil_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+		chip->xcap[i].sil_timer.function = ae9_sil_tick;
+#endif
+		INIT_DELAYED_WORK(&chip->xcap[i].sense_work, ae9_sense_work);
+	}
 	strscpy(pcm->name, x->name, sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &creative_ae9_xcap_ops);
 	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV, chip->dev,
@@ -1448,6 +2294,7 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	}
 
 	pcm->private_data = chip;
+	ae9_pcm_track(chip, pcm);
 	strscpy(pcm->name, "AE-9 Analog", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK,
 			&creative_ae9_pcm_ops);
@@ -1476,10 +2323,16 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 	ret = snd_ctl_add(chip->card, snd_ctl_new1(&spdif_out_control, chip));
 	if (ret < 0)
 		dev_warn(chip->dev, "Optical Out control not added (%d)\n", ret);
+	chip->spdif_mirror = optical_mirror;
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&spdif_mirror_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "Optical Out Mirror control not added (%d)\n", ret);
 	creative_ae9_xcap_new(chip, 0);	/* optical in */
 	creative_ae9_xcap_new(chip, 1);	/* What U Hear */
+	creative_ae9_xcap_new(chip, 2);	/* head unit rear RCA in */
+	creative_ae9_opt_new(chip);	/* separate optical out */
 
-	dev_info(chip->dev, "PCM device initialized (playback + capture, optical in, What U Hear)\n");
+	dev_info(chip->dev, "PCM devices: 0 analog, 1 optical in, 2 What U Hear, 3 rear RCA in, 4 optical out\n");
 	return 0;
 }
 
@@ -1490,11 +2343,21 @@ static void creative_ae9_pcm_free(struct snd_pcm *pcm)
 	struct creative_chip *chip = pcm->private_data;
 
 	if (chip->playback_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback at card free"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
+	}
+	if (chip->opt_bdl_raw) {
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out at card free"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		chip->opt_bdl_raw = NULL;
+		chip->opt_bdl = NULL;
 	}
 	creative_ae9_cap_bdl_free(chip);
 	chip->pcm = NULL;

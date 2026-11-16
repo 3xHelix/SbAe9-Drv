@@ -43,10 +43,15 @@ sec "ALSA capture stream"
 cat /proc/asound/AE9/pcm0c/sub0/hw_params /proc/asound/AE9/pcm0c/sub0/status 2>/dev/null
 
 sec "ALSA controls"
-amixer -c AE9 contents 2>/dev/null | grep -E "^numid|: values=|Item #" | paste - - | sed -E "s/numid=[0-9]+,iface=MIXER,//"
+# one line per control: name + values (enum item lists dropped; pairing lines two at a time broke on them)
+amixer -c AE9 contents 2>/dev/null | awk '/^numid=/{if(l)print l; sub(/numid=[0-9]+,iface=MIXER,/,""); l=$0; next}
+	/: values=/{sub(/^ *: /,""); l=l"  "$0} END{if(l)print l}'
 
 sec "Driver parameters"
 for f in $P/*; do printf '%-22s %s\n' "$(basename $f)" "$(cat $f 2>/dev/null)"; done
+
+sec "Driver state (debugfs state: modes, counters, router streams, chip flags)"
+cat /sys/kernel/debug/creative_ae9/state 2>/dev/null || echo "(no state file: driver older than 0.12.6)"
 
 sec "PipeWire"
 asuser pactl list sinks short
@@ -64,8 +69,17 @@ echo "--- capture streams: SD0 (mic / line-in), SD1 (optical in), SD2 (What U He
 for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
 sec "Card registers (BAR2, the ones the driver logs at bring-up)"
-for o in 0x4 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
+for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
+# ChipIO reads go through codec 1 one verb at a time; hundreds of them
+# (the router scan) while audio plays killed codec 1 on 2026-11-07 22:30
+# (CORB timeouts, IOMMU faults, PSU cycle needed). Skip them while any AE-9
+# stream runs; ALLOW_PLAYING_CHIPIO=1 forces them.
+playing=$(grep -ls "^state: RUNNING" /proc/asound/AE9/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
+if [ -n "$playing" ] && [ "${ALLOW_PLAYING_CHIPIO:-0}" != 1 ]; then
+sec "ChipIO sections skipped"
+echo "skipped: AE-9 stream(s) running ($playing). Stop playback and dump again for them."
+else
 sec "ChipIO: I2S clocks, stream setup, SRC, router apply"
 for a in 0x189000 0x189004 0x189008 0x189024 0x189028 0x18b008 0x18a020 0x18a024 0x18a028 0x19042c; do
 	printf '%-9s %s\n' "$a" "$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')"
@@ -96,12 +110,26 @@ for a in 0x100e30 0x100e30 0x100e30 0x100e30 0x801c 0x40004 0x3f3b4 0x110f00 0x1
 done
 
 sec "ChipIO: audio router 0x190000-0x1901fc (non-zero; src -> dst, state)"
+# Single ChipIO reads glitch while audio plays (an entry can read as 0):
+# read until two reads in a row agree, as the driver does; "unsteady" marks
+# an entry that never did.
+rt_read() {
+	local p= v t
+	for t in 1 2 3 4 5 6; do
+		v=$(dbg "chipior $1" | grep -o '=0x[0-9a-f]*' | tr -d =)
+		[ -n "$v" ] && [ "$v" = "$p" ] && { echo "$v"; return; }
+		p=$v
+	done
+	echo "$v unsteady"
+}
 for i in $(seq 0 127); do
 	a=$(printf '0x%x' $((0x190000 + i * 4)))
-	v=$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*' | tr -d =)
-	[ -n "$v" ] && [ "$v" != 0x0 ] && printf '%s %-8s %02x -> %02x  state %d\n' "$a" "$v" \
-		$((v & 0xff)) $(((v >> 8) & 0xff)) $(((v >> 16) & 3))
+	set -- $(rt_read "$a"); v=${1:-}; note=${2:+  (reads unsteady)}
+	[ -n "$v" ] && [ "$v" != 0x0 ] && printf '%s %-8s %02x -> %02x  state %d%s\n' "$a" "$v" \
+		$((v & 0xff)) $(((v >> 8) & 0xff)) $(((v >> 16) & 3)) "$note"
 done
+
+fi
 
 sec "Codec converter state (GET verbs; replies in the log section below)"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')

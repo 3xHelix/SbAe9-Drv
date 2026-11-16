@@ -6,8 +6,9 @@
 # the matching kernel-devel package must be installed, as dnf does).
 #
 #   sudo scripts/dkms-install.sh            install this source tree's version
-#                                            for the running kernel (and any
-#                                            kernels given as arguments)
+#                                            for every installed kernel with
+#                                            headers (always incl. the running
+#                                            one), or only the kernels given
 #   sudo scripts/dkms-install.sh --remove   take the driver out of DKMS
 #   scripts/dkms-install.sh --check         show how the driver is installed
 #                                            and every copy of it (no changes)
@@ -24,8 +25,20 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 
 # every copy of the module for a kernel, wherever it came from
 copies() { find "/lib/modules/$1" -name "$NAME.ko*" 2>/dev/null | sort; }
-# packaged builds (akmods / kmod RPMs), if any
-packaged() { command -v rpm >/dev/null && rpm -qa "akmod-$NAME*" "kmod-$NAME*" 2>/dev/null || true; }
+# packaged builds, if any: the COPR akmod/kmod RPMs (akmod-creative-ae9,
+# kmod-creative-ae9-<kernel>) and the DKMS packages (creative-ae9-dkms: RPM,
+# .deb/PPA, AUR). Until 0.12.7 this asked rpm for "akmod-$NAME*", which no
+# package is called, so it never refused.
+packaged() {
+	{
+		command -v rpm >/dev/null &&
+			rpm -qa 'akmod-creative-ae9*' 'kmod-creative-ae9*' 'creative-ae9-dkms*'
+		command -v dpkg-query >/dev/null &&
+			dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' creative-ae9-dkms 2>/dev/null |
+			awk '$1 ~ /^ii/ {print $2}'
+		command -v pacman >/dev/null && pacman -Q creative-ae9-dkms 2>/dev/null
+	} 2>/dev/null | grep . || true
+}
 
 if [ "${1:-}" = "--check" ]; then
 	k=$(uname -r)
@@ -35,6 +48,9 @@ if [ "${1:-}" = "--check" ]; then
 	echo "  copies:"
 	copies "$k" | sed 's/^/    /' | grep . || echo "    none (the driver isn't installed for this kernel)"
 	echo "  modprobe loads: $(modinfo -k "$k" -n "$NAME" 2>/dev/null || echo nothing)"
+	ml=$(ls /etc/modules-load.d/creative-ae9.conf /usr/lib/modules-load.d/creative-ae9.conf 2>/dev/null | tr '\n' ' ' || true)
+	[ -n "$ml" ] || ml="none (udev only: the DSP's first start can fail on cold boots)"
+	echo "  early load at boot: $ml"
 	[ "$(copies "$k" | wc -l)" -le 1 ] || echo "  WARNING: more than one copy; keep one install method and remove the others" >&2
 	exit 0
 fi
@@ -47,6 +63,36 @@ if [ "${1:-}" != "--remove" ] && [ -n "$(packaged)" ]; then
 	echo "Use one install method: remove the package first (sudo dnf remove ...), or keep it and skip DKMS." >&2
 	exit 1
 fi
+
+# The command-line tools the packages put in /usr/bin (SbAe9-SBC looks for
+# ae9-hp-profile on the PATH); a source install puts them in /usr/local/bin.
+TOOLS=(ae9-get-firmware.sh ae9-full-dump.sh ae9-dsp-snapshot.sh ae9-read-stress.sh
+       ae9-optical-passthrough ae9-hp-profile ae9-reload.sh)
+BIN=/usr/local/bin
+tools_install() { local t; for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done; }
+tools_remove() { local t; for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done; }
+
+# Early load at boot (systemd-modules-load), as every package does from
+# /usr/lib/modules-load.d: loaded by udev alone, the DSP's first start
+# failed on 11 of 26 cold boots (0.10.1). A source install missed it until
+# 0.12.10 (arkhodakov, PR #3). An existing file is left alone, also one
+# toggle-ae9-mode.sh parked (.off-vfio) or masked (-> /dev/null); --remove
+# deletes it only while it is still our copy.
+ML=/etc/modules-load.d/creative-ae9.conf
+MLSRC=$SRC/config/ae9-modules-load.conf
+early_install() {
+	if [ -e "$ML" ] || [ -L "$ML" ] || [ -e "$ML.off-vfio" ]; then
+		echo "early load: $ML already there (left as it is)"
+		return 0
+	fi
+	install -Dm644 "$MLSRC" "$ML" && echo "early load: $ML"
+}
+early_remove() {
+	if [ -f "$ML" ] && [ ! -L "$ML" ] && cmp -s "$MLSRC" "$ML"; then
+		rm -f "$ML" && echo "early load: $ML removed"
+	fi
+	return 0
+}
 
 registered() { dkms status -m "$NAME" 2>/dev/null | sed -n "s#^$NAME/\([^,: ]*\).*#\1#p" | sort -u; }
 
@@ -61,7 +107,9 @@ drop() {
 if [ "${1:-}" = "--remove" ]; then
 	for v in $(registered); do drop "$v"; done
 	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
-	echo "removed from DKMS; build and copy the module by hand again if you still want it"
+	tools_remove
+	early_remove
+	echo "removed from DKMS (and its tools from $BIN); build and copy the module by hand again if you still want it"
 	left=$(copies "$(uname -r)")
 	[ -z "$left" ] || { echo "still installed for $(uname -r) (not by DKMS):"; echo "$left" | sed 's/^/  /'; }
 	exit 0
@@ -80,24 +128,46 @@ cp "$SRC"/Makefile "$SRC"/creative_ae9*.c "$SRC"/creative_ae9*.h "$SRC"/ca0132_r
 sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$VER\"/" "$SRC/dkms.conf" > "$DEST/dkms.conf"
 dkms add -m "$NAME" -v "$VER"
 
-for k in "$(uname -r)" "$@"; do
+# Every installed kernel with headers, not just the running one: the old
+# version was just removed from all of them, and after a kernel update
+# without a reboot (running kernel's headers gone) building only for
+# `uname -r` left no driver for the next boot (Kaiba, 2026-11-08).
+if [ $# -gt 0 ]; then
+	kernels=("$@")
+else
+	kernels=("$(uname -r)")
+	for d in /lib/modules/*/; do
+		k=$(basename "$d")
+		[ "$k" = "$(uname -r)" ] || [ ! -e "$d/build" ] || kernels+=("$k")
+	done
+fi
+built=0
+for k in "${kernels[@]}"; do
 	if [ ! -d "/lib/modules/$k/build" ]; then
-		echo "skipping $k: no kernel headers (sudo dnf install kernel-devel-$k)" >&2
+		echo "skipping $k: no kernel headers (install that kernel's headers / kernel-devel)" >&2
 		continue
 	fi
 	rm -f "/lib/modules/$k/extra/$NAME.ko"	# the hand-copied one
-	dkms build -m "$NAME" -v "$VER" -k "$k"
-	dkms install -m "$NAME" -v "$VER" -k "$k" --force
+	# one failed kernel doesn't stop the others
+	if dkms build -m "$NAME" -v "$VER" -k "$k" && dkms install -m "$NAME" -v "$VER" -k "$k" --force; then
+		built=$((built + 1))
+	else
+		echo "WARNING: the build for $k failed; the other kernels go on" >&2
+	fi
 done
 dkms status -m "$NAME"
-# make sure the running kernel really has it now
+[ "$built" -gt 0 ] || { echo "ERROR: built for no kernel; don't reboot until this is fixed" >&2; exit 1; }
+# the running kernel may have lost its headers to an update: then the
+# kernel you boot next is what matters
 if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
-	echo "ERROR: $NAME isn't installed for $(uname -r); don't reboot until this is fixed" >&2
-	exit 1
+	echo "note: not installed for the running kernel $(uname -r) (no headers?); built for: ${kernels[*]}" >&2
 fi
-echo "done: $NAME $VER is in DKMS ($(modinfo -k "$(uname -r)" -n "$NAME"));"
+tools_install
+echo "tools: $(printf '%s ' "${TOOLS[@]%.sh}")in $BIN"
+early_install
+echo "done: $NAME $VER is in DKMS, built for $built kernel(s);"
 echo "new kernels get it built automatically. Reboot to load it."
-for k in "$(uname -r)" "$@"; do
+for k in "${kernels[@]}"; do
 	if [ "$(copies "$k" | wc -l)" -gt 1 ]; then
 		echo "WARNING: more than one copy of the module for $k:" >&2
 		copies "$k" | sed 's/^/  /' >&2

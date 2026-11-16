@@ -4,7 +4,7 @@
 # restore-stock-audio.sh — remove the out-of-tree AE-9 driver and its boot
 # setup, so the stock kernel drivers own the card again.
 #
-# Removes what README.md -> Setup installs:
+# Removes what docs/INSTALL-FROM-SOURCE.md installs:
 #   /lib/modules/<kernel>/extra/snd-hda-codec-creative-ae9.ko (and updates/)
 #   /etc/udev/rules.d/00-ae9-override.rules
 #   /etc/modprobe.d/ae9-override.conf, /etc/modprobe.d/ae9-options.conf
