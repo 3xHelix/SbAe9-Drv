@@ -53,6 +53,9 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	u32 rirb_addr_low, rirb_addr_high;
 	u32 ctl;
 
+	/* a new ring: whatever the router chip had selected is unknown now */
+	creative_ae9_r51_reset(chip);
+
 	/* Reuse the rings parked by corb_free() (suspend/resume) */
 	if (!chip->corb_buf && chip->corb_keep) {
 		chip->corb_buf = chip->corb_keep;
@@ -527,8 +530,119 @@ static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
 }
 
 /* ------------------------------------------------------------------ */
+static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *resp);
+
+/*
+ * The router chip (8051) takes its parameters through codec 1 node 0x15:
+ * 0x717 selects a parameter, 0x718 writes its value (deferred job 7D87 reads
+ * the selected id when it runs), 0x711-0x716 are its port and stream
+ * requests. An accepted 0x712/0x713/0x715/0x716/0x718 sets its busy flag
+ * (25h.1, ROM 2563) until that job ran; while it's set, 0x711-0x713 and
+ * 0x715-0x718 are REFUSED: reply 1, the verb dropped (0x714 and 0x710 never
+ * are). A refused 0x717 followed by an accepted 0x718 writes the value into
+ * the PREVIOUS parameter. Windows waits for the busy status first
+ * (FUN_0001b344 -> FUN_0001b270: F01 polled while it reads 1, up to 101
+ * times) and every one of its 0x717/0x718 got reply 0 in 28 captures. We
+ * sent the captured status reads but ignored their answers (F01 read busy
+ * 162 times in 9000 in uv79's log): at the first load after power-on the
+ * start-up tail's "select stream 0x18" was refused (verb log 2026-11-07,
+ * reply 1 twice), stream 0x18 connected to its ROM default DAC point 0xd1
+ * and its DAC groups stayed allocated until a power-off: the 8051's own
+ * DSP-mode routing failed every time after (research 2026-11-15,
+ * 8051-0xd1-leak.md; repaired by hand in uv87, after which the 8051 routed
+ * DSP mode itself).
+ * So: wait for the busy status to clear, check the reply and send again on
+ * a refusal; after 0x712/0x713 wait for its job too (Windows reads the
+ * port result only after that). A value write is never sent after a lost
+ * select (it would land on the previous parameter): counted and refused
+ * (-EBUSY). router_poll=0: as before.
+ */
+static bool router_poll = true;
+module_param(router_poll, bool, 0644);
+MODULE_PARM_DESC(router_poll, "Wait for the router chip's busy status before each of its parameter verbs and resend a refused one, as Windows (1 = yes, default; 0 = send blind, as before 0.12.11)");
+
+#define AE9_R51_STATUS		0x115f0100	/* F01: router chip busy (1) or idle (0) */
+#define AE9_R51_IDLE_TRIES	200		/* ~10 ms of status reads */
+#define AE9_R51_TRIES		4
+
+static bool ae9_r51_param_verb(u32 v)
+{
+	unsigned int id = (v >> 8) & 0xfff;
+
+	return (v >> 20) == 0x115 && id >= 0x711 && id <= 0x718;
+}
+
+static void ae9_r51_wait_idle(struct creative_chip *chip)
+{
+	unsigned int i, n = chip->r51_stuck ? 1 : AE9_R51_IDLE_TRIES;
+	u32 r = 0;
+
+	for (i = 0; i < n; i++) {
+		if (ae9_corb_send_verb_sync(chip, AE9_R51_STATUS, &r) < 0)
+			return;
+		if (!(r & 0xff)) {
+			chip->r51_stuck = false;
+			if (i)	/* it was busy: sent blind, this one could have been refused */
+				chip->r51_waited++;
+			return;
+		}
+	}
+	if (chip->r51_stuck)
+		return;
+	/* its job queue overflowed and the flag stays set until a reset:
+	 * one read per verb from now on, not 200 */
+	chip->r51_stuck = true;
+	chip->r51_never_idle++;
+	dev_warn_ratelimited(chip->dev, "router chip: still busy after %u status reads (0x%02x)\n",
+			     i, r & 0xff);
+}
+
+/* a new router chip (bring-up): nothing selected yet */
+void creative_ae9_r51_reset(struct creative_chip *chip)
+{
+	chip->r51_sel = -1;
+	chip->r51_stuck = false;
+}
+
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp)
+{
+	unsigned int id = (verb >> 8) & 0xfff, t;
+	u32 r = 0;
+	int ret = 0;
+
+	if (!router_poll || !ae9_r51_param_verb(verb))
+		return ae9_corb_send_verb_sync(chip, verb, resp);
+	if (id == 0x718 && chip->r51_sel < 0) {
+		/* its select was lost: the value would land on another one */
+		chip->r51_lost++;
+		dev_warn_ratelimited(chip->dev, "router chip: value 0x%08x not sent, its parameter select was lost\n",
+				     verb);
+		return -EBUSY;
+	}
+	for (t = 0; t < AE9_R51_TRIES; t++) {
+		ae9_r51_wait_idle(chip);
+		ret = ae9_corb_send_verb_sync(chip, verb, &r);
+		if (ret < 0 || (r & 0xff) != 1)
+			break;
+		chip->r51_refused++;	/* reply 1: refused busy */
+	}
+	if (id == 0x717)	/* taken: that's the selected id; else nothing is */
+		chip->r51_sel = ret == 0 && (r & 0xff) != 1 ? (int)(verb & 0xff) : -1;
+	if (ret == 0 && (r & 0xff) == 1) {
+		chip->r51_lost++;
+		dev_warn_ratelimited(chip->dev, "router chip: verb 0x%08x refused %u times (busy): dropped\n",
+				     verb, AE9_R51_TRIES);
+		ret = -EBUSY;
+	} else if (ret == 0 && (id == 0x712 || id == 0x713)) {
+		ae9_r51_wait_idle(chip);	/* its port job, before the result read */
+	}
+	if (resp)
+		*resp = r;
+	return ret;
+}
+
+static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *resp)
 {
 	u16 wp_start;
 	u16 wp;

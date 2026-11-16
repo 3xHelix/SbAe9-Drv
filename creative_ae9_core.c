@@ -1967,7 +1967,7 @@ static int ae9_stream18_drain(struct creative_chip *chip, const char *why)
  */
 static unsigned int stream_drain = 1;
 module_param(stream_drain, uint, 0644);
-MODULE_PARM_DESC(stream_drain, "Shutdown and start-up: release the router chip's stream references (0x05, 0x0b, 0x0f, 0x14, 0x18, 0x0c) until they read 0, as Windows does at device stop (1 = on, default; 0 = old: one blind 0x0c stop, start-up drains 0x18 only)");
+MODULE_PARM_DESC(stream_drain, "Shutdown and start-up: release the router chip's stream references (0x05, 0x0b, 0x0f, 0x14, 0x18, 0x0c) until they read 0, as Windows does at device stop (1 = on, default; 0 = old: one blind 0x0c stop, start-up drains 0x18 only). The stream 0x18 stop after the start-up tail (Windows' Direct-mode boot) and the 0xd1 port free run either way");
 
 static const u8 ae9_drain_ids[] = { 0x05, 0x0b, 0x0f, 0x14, 0x18, 0x0c };
 
@@ -3261,6 +3261,58 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	}
 	kfree(retry);
 
+	/*
+	 * Windows' Direct Mode start-up: its init connects stream 0x18 (DSP out
+	 * -> DACs), then, with Direct Mode the saved setting, reads its count
+	 * and stops it (FUN_00032ee8 -> FUN_00039a48(0) -> FUN_00034250; capture
+	 * 6 seq 5184-5196, 19 of 19 Direct-mode boots). Our tail is Windows'
+	 * DSP-mode boot path and every start-up of ours begins direct (DSP mode
+	 * switches in with the first stream), so do the same; DSP mode on
+	 * connects it again. Then the DAC-port allocator: an allocation left on
+	 * connection point 0xd1 (stream 0x18's ROM default: a refused select at
+	 * an earlier first load connected it there; router_poll stops that)
+	 * holds DAC groups 1-3 until a power-off and makes the 8051's own
+	 * DSP-mode routing fail. Only stream 0x18 can hold 0xd1, so with its
+	 * count at 0 the 8051's own port free (0x713 0xd1: ROM E4A6 -> 656D ->
+	 * 6FFF) releases it (uv87: cfg 0x19 -> 0x18, groups 0x0e -> 0x00, and
+	 * the 8051 routed DSP mode itself after). Logged at every load.
+	 */
+	if (chip->corb_buf && !chip->dsp_active) {
+		int d0, d1, g, d1a, ga, refs, k;
+		u32 r;
+
+		/* the tail's last 8051 jobs first, then the "before" bytes */
+		ae9_8051_wait_idle(chip, "after the start-up tail");
+		d0 = ae9_8051_xram_byte(chip, 0x1058);
+		d1 = ae9_8051_xram_byte(chip, 0x1059);
+		g = ae9_8051_xram_byte(chip, 0x1107);
+		ae9_stream18_drain(chip, "start-up in Direct Mode, as Windows");
+		refs = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_REFS);
+		d1a = ae9_8051_xram_byte(chip, 0x1059);
+		ga = ae9_8051_xram_byte(chip, 0x1107);
+		/* cp 0xc1 shares the config byte: only with nothing on 0xc0-0xcf */
+		if (refs == 0 && d1a > 0 && (d1a & 3) &&
+		    ae9_8051_xram_byte(chip, 0x1106) == 0) {
+			int before = d1a, gb = ga;
+
+			for (k = 0; k < 4 && d1a > 0 && (d1a & 3); k++) {
+				ae9_8051_wait_idle(chip, "before the 0xd1 port free");
+				creative_ae9_corb_send_verb_sync(chip, 0x115713d1, &r);
+				d1a = ae9_8051_xram_byte(chip, 0x1059);
+			}
+			ga = ae9_8051_xram_byte(chip, 0x1107);
+			if (d1a >= 0 && !(d1a & 3))
+				dev_info(chip->dev, "router: freed a DAC allocation left on connection point 0xd1 (an earlier first load): cfg 0x%02x -> 0x%02x, DAC groups 0x%02x -> 0x%02x\n",
+					 before, d1a, gb & 0xff, ga & 0xff);
+			else
+				dev_warn(chip->dev, "router: could not free the DAC allocation on connection point 0xd1 (cfg %d): DSP mode routes it itself (rt_dsp_walk); a power-off clears it\n",
+					 d1a);
+		}
+		/* -1 = a read failed; counters add up since the driver loaded */
+		dev_info(chip->dev, "router: after the start-up tail: 0xd0 cfg %d, 0xd1 cfg %d, DAC groups %d; stream 0x18 drained to %d, now 0xd1 cfg %d, DAC groups %d (router chip param verbs since load: %u waited for it to be idle, %u refused and resent, %u lost)\n",
+			 d0, d1, g, refs, d1a, ga, chip->r51_waited, chip->r51_refused, chip->r51_lost);
+	}
+
 	/* Windows' post-boot BAR2 activity: CA0113 commands, head-unit SPI
 	 * frames (incl. the "-SP-" speaker label), GPIO writes */
 	creative_ae9_bar2_post_replay(chip);
@@ -3863,6 +3915,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		   chip->rirb_late, chip->rirb_late_max_us, chip->rirb_never, chip->rirb_stray,
 		   chip->rirb_badwp);
 	seq_printf(m, "BDLs kept (stream didn't stop): %d\n", atomic_read(&chip->bdl_leaks));
+	seq_printf(m, "router chip param verbs: %u waited for it to be idle, %u refused busy and resent, %u lost, %u busy waits that never cleared\n",
+		   chip->r51_waited, chip->r51_refused, chip->r51_lost, chip->r51_never_idle);
 	seq_printf(m, "head unit: set up again %u time(s)%s\n", chip->hu_reattaches,
 		   chip->hu_ae9_hold ? ", AE-9 shown" : "");
 	seq_printf(m, "head unit boot frames: %u, without reply %u",
@@ -6135,6 +6189,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
+	chip->r51_sel = -1;	/* no router-chip parameter selected yet */
 
 	chip->pci = pdev;
 	chip->dev = &pdev->dev;

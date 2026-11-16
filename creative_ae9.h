@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.11-rc2"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.11-rc3"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -369,6 +369,13 @@ struct creative_chip {
 	unsigned int		rirb_never;	/* entries that hadn't landed after RIRB_LATE_US */
 	unsigned int		rirb_stray;	/* answers from the other codec, skipped */
 	unsigned int		rirb_badwp;	/* RIRBWP read all-ones on a card still there */
+	int			r51_sel;	/* router-chip param index the 8051 took last (0x717), -1 = none or lost */
+	bool			r51_stuck;	/* its busy status never cleared: one status read per verb until it does */
+	unsigned int		r51_refused;	/* router-chip param verbs refused busy and sent again */
+	unsigned int		r51_lost;	/* ... still refused after the retries */
+	unsigned int		r51_never_idle;	/* busy flag never cleared before a param verb */
+	unsigned int		r51_waited;	/* param verbs that had to wait for the busy flag (sent blind,
+						 * they could have been refused) */
 	/* post-boot head-unit replay: frame count, frames without reply and
 	 * the first ones (frame number from 1, the two bytes after the f0
 	 * start byte), for debugfs */
@@ -482,6 +489,7 @@ void creative_ae9_dma_dump(struct creative_chip *chip, const char *why);
 void creative_ae9_dma_quiesce(struct creative_chip *chip);
 void creative_ae9_dead_work(struct work_struct *w);
 void creative_ae9_health_notify(struct creative_chip *chip);
+void creative_ae9_r51_reset(struct creative_chip *chip);
 
 /* For control writes: the card dropped off the bus or stopped answering
  * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing

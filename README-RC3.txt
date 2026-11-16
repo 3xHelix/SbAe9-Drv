@@ -1,7 +1,7 @@
-SbAe9-Drv 0.12.11-rc2 - release candidate, for ASMedia-bridge testers first
+SbAe9-Drv 0.12.11-rc3 - release candidate, for ASMedia-bridge testers first
 ==========================================================================
-(rc2 = rc1 + the "Driver Health" control and a corrected router free-slot count.
- If you already installed rc1, just install rc2 over it.)
+(rc3 = rc2 + the router chip fix below. If you already installed rc1 or rc2,
+ just install rc3 over it.)
 
 This is the 0.12.11 driver before its release: what the author runs daily,
 tested on an IDT-bridge card. We'd love to see it on an ASMedia-bridge card
@@ -23,6 +23,11 @@ What's new since 0.12.10
   - Safer DMA when a stream won't stop, and a hardened command ring (a bad
     read through a PCIe bridge is never used as a position).
   - New: the "Driver Health" control: health counters any user can read.
+  - Fixed: the card's router chip could refuse a setup command at the first
+    load after a power-on (it was still busy; the driver didn't wait). That
+    left a DAC allocation stuck until the next power-off and broke the
+    router chip's own DSP-mode routing. The driver now waits for it, as
+    Windows does, and frees a stuck allocation at load if it finds one.
   Pairs with SbAe9-SBC (current) and SbAe9-AudioMon v0.4.7.
 
 Install (from this folder)
@@ -34,7 +39,7 @@ Install (from this folder)
     first, then  sudo scripts/dkms-install.sh  . To go back:
     sudo scripts/dkms-install.sh --remove  and reinstall the package.
   Then shut down, PSU off ~30 s, boot. Check:
-        cat /sys/module/snd_hda_codec_creative_ae9/version    -> 0.12.11-rc2
+        cat /sys/module/snd_hda_codec_creative_ae9/version    -> 0.12.11-rc3
 
 What helps us most (ASMedia cards especially)
   1. Use it normally for a day or two: DSP mode / SBX, Direct Mode, a few
@@ -53,9 +58,18 @@ What helps us most (ASMedia cards especially)
      The line "router stream 0x18: ..." shows whether your card's router
      chip set up the DSP routes by itself (lanes -> 40 41 50 ...) or left
      them at ff (ours does: we fill them in).
-  4. At least one WARM reboot (no PSU off), one driver reload
+  4. NEW in rc3: after a PSU-cold boot (power off ~30 s, boot), before
+     playing anything:
+        journalctl -k -b | grep -E 'after the start-up tail|freed a DAC|router chip'
+     Please send that line (or lines). "waited for it to be idle N" tells us
+     how often the router chip was busy on your card; "lost" must be 0.
+     Then play something in DSP mode and send:
+        sudo grep 'router stream 0x18' /sys/kernel/debug/creative_ae9/state
+     (lanes reading 40 41 50 51 60 61 42 43 ... = the router chip set up
+     DSP mode by itself, which is what we hope to see.)
+  5. At least one WARM reboot (no PSU off), one driver reload
      (ae9-reload) and one suspend/resume if you use it: sound in Direct
      Mode AND DSP mode afterwards?
-  5. Anything odd: send  journalctl -k -b | grep creative-ae9  and a full dump.
+  6. Anything odd: send  journalctl -k -b | grep creative-ae9  and a full dump.
 Thank you!
-From sbae9 73bf159, 2026-11-15.
+From sbae9 663e6a8, 2026-11-15.
