@@ -1572,6 +1572,7 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 	dma_addr_t buf_dma = 0, bdl_dma = 0;
 	unsigned int port, i, segno = 0, rl;
 	u32 chan = ~0U, resp;
+	bool stuck = false;	/* the transfer stream didn't stop: keep buf/bdl */
 	int ret;
 
 	ret = ae9_request_fw(chip, &fw, AE9_OVERLAY_FILE, AE9_OVERLAY_SIZE);
@@ -1669,7 +1670,12 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 				break;
 			usleep_range(1000, 2000);
 		}
-		xfer_stream_stop(chip, OVL_SD, 1);
+		if (!xfer_stream_stop(chip, OVL_SD, 1)) {
+			/* don't refill buf or restart a stream that won't stop */
+			stuck = true;
+			ret = -EIO;
+			break;
+		}
 		/* leftover word(s) go in directly (Windows: 0x03f3a0 = 0x00800082) */
 		for (i = 0; i < rem; i++)
 			creative_dsp_chipio_write(chip, seg->chip_addr + 4 * i,
@@ -1695,9 +1701,19 @@ unbind:
 	creative_dsp_chipio_addr_invalidate();
 	*chan_out = chan;
 out:
-	if (buf)
+	/* a stream that didn't stop could still fetch them: keep them, as
+	 * hpeq_upload does (ultrareview 2, #7) */
+	/* the caller's second try is still fine: xfer_stream_run resets the
+	 * stream first (its one chance to free a stuck engine), and these
+	 * buffers stay out of reach (never seen in 323 boots, 2026-11-15) */
+	if (stuck) {
+		dev_warn(chip->dev, "overlay: the transfer stream didn't stop; its buffer and BDL are kept, not freed (%d kept)\n",
+			 atomic_inc_return(&chip->bdl_leaks));
+		creative_ae9_health_notify(chip);
+	}
+	if (buf && !stuck)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
-	if (bdl)
+	if (bdl && !stuck)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
 	release_firmware(fw);
 	(void)resp;

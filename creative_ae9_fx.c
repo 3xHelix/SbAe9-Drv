@@ -1062,6 +1062,9 @@ void creative_ae9_fx_hp_work(struct work_struct *w)
 	bool upload;
 	enum hp_sync st;
 
+	if (READ_ONCE(chip->unloading))	/* the card and its controls are going */
+		return;
+
 	if (!fx_live_spk(chip))
 		return;
 	if (chip->hp_last && time_before(jiffies, next)) {
@@ -1478,6 +1481,9 @@ void creative_ae9_fx_spk_follow_work(struct work_struct *w)
 	struct creative_chip *chip = container_of(to_delayed_work(w),
 						  struct creative_chip, spk_follow_work);
 	struct snd_pcm_substream *ss = chip->playback_substream;
+
+	if (READ_ONCE(chip->unloading))
+		return;
 
 	/* only a stream that's still there and running */
 	if (!ss || !ss->runtime || ss->runtime->state != SNDRV_PCM_STATE_RUNNING ||

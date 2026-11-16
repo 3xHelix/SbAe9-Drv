@@ -53,6 +53,9 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	u32 rirb_addr_low, rirb_addr_high;
 	u32 ctl;
 
+	/* a new ring: whatever the router chip had selected is unknown now */
+	creative_ae9_r51_reset(chip);
+
 	/* Reuse the rings parked by corb_free() (suspend/resume) */
 	if (!chip->corb_buf && chip->corb_keep) {
 		chip->corb_buf = chip->corb_keep;
@@ -72,10 +75,8 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 		}
 	}
 
-	/* Allocate DMA-coherent buffer for RIRB (256 * 8 = 2 KB).
-	 * May already be allocated by probe (pre-alloc for ICW priming).
-	 * Reuse it so RIRBWP pre-seeded from ICW responses is preserved.
-	 */
+	/* Allocate DMA-coherent buffer for RIRB (256 * 8 = 2 KB), or reuse
+	 * the one an earlier init allocated (resume, ring restarts). */
 	if (!chip->rirb_buf) {
 		chip->rirb_buf = dmam_alloc_coherent(chip->dev,
 				ae9_dma_size(chip, CREATIVE_RIRB_SIZE), &chip->rirb_dma, GFP_KERNEL);
@@ -231,7 +232,15 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	 * Resetting RIRBWP confuses the CA0132 RIRB engine.
 	 * Seed our software read pointer from the current hardware value.
 	 */
-	chip->rirb_rp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+	{
+		u16 raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+
+		if (raw == 0xffff) {	/* one bad read? (a dead card fails below) */
+			udelay(10);
+			raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
+		}
+		chip->rirb_rp = raw == 0xffff ? 0 : raw & 0xff;
+	}
 
 	/* CORB/RIRB sizes: 256 entries (bits 3-2 = 10 = 0x0a).
 	 * CA0132 appears to ignore CORBSIZE (live dump shows 0x00 with
@@ -415,6 +424,7 @@ static bool rirb_take(struct creative_chip *chip, struct creative_rirb_entry *ri
 		}
 		if (*fl == RIRB_MARK) {
 			chip->rirb_never++;
+			creative_ae9_health_notify(chip);
 			dev_info_ratelimited(chip->dev, "RIRB entry %u never landed (%u us)\n",
 					     i, RIRB_LATE_US);
 			return false;
@@ -427,6 +437,22 @@ static bool rirb_take(struct creative_chip *chip, struct creative_rirb_entry *ri
 	*res = le32_to_cpu(READ_ONCE(rirb[i].response));
 	WRITE_ONCE(rirb[i].response, cpu_to_le32(RIRB_MARK));
 	WRITE_ONCE(rirb[i].flags, cpu_to_le32(RIRB_MARK));
+	return true;
+}
+
+/* RIRBWP's bits 15:8 read 0 on a live card: all-ones is a card off the
+ * bus or one bad read (a bridge glitch); never use it as a write pointer.
+ * Counted when the card is still there, to learn how often that happens. */
+static bool rirb_wp_bad(struct creative_chip *chip, u16 raw, const char *where)
+{
+	if (raw != 0xffff)
+		return false;
+	if (!creative_ae9_gone(chip, where)) {
+		chip->rirb_badwp++;
+		creative_ae9_health_notify(chip);
+		dev_warn_ratelimited(chip->dev, "RIRB: write pointer read all-ones (%s), card still there (%u so far)\n",
+				     where, chip->rirb_badwp);
+	}
 	return true;
 }
 
@@ -447,7 +473,10 @@ void creative_ae9_corb_scan_unsol(struct creative_chip *chip)
 		return;
 	mutex_lock(&chip->corb_mutex);
 	raw = readw(chip->hda_regs + AZX_REG_RIRBWP);
-	if (raw == 0xffff && creative_ae9_gone(chip, "RIRB scan")) {
+	/* all-ones (bits 15:8 read 0 on a live card): gone, or one bad read
+	 * through a bridge; either way don't move rirb_rp to 0xff
+	 * (ultrareview 2) */
+	if (rirb_wp_bad(chip, raw, "RIRB scan")) {
 		mutex_unlock(&chip->corb_mutex);
 		return;
 	}
@@ -490,15 +519,130 @@ static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
 	chip->hung_verb = verb;
 	creative_ae9_dma_dump(chip, "card stopped answering");
 	creative_ae9_dma_quiesce(chip);
-	schedule_work(&chip->dead_work);
+	/* not while unloading: stop_works has cancelled dead_work and the
+	 * PCMs are freed or about to be (ultrareview 2, #1: the shutdown's
+	 * own timeouts re-queued it, use-after-free) */
+	if (!chip->unloading)
+		schedule_work(&chip->dead_work);
 	creative_ae9_dead_notify(chip);
 	dev_err(chip->dev, "card stopped answering: %u command timeouts in a row (last verb 0x%08x, %u in all); no more commands until the driver is reloaded (sudo modprobe -r snd-hda-codec-creative-ae9 && sudo modprobe snd-hda-codec-creative-ae9) or the PC is powered off\n",
 		chip->corb_to_run, verb, chip->corb_timeouts);
 }
 
 /* ------------------------------------------------------------------ */
+static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *resp);
+
+/*
+ * The router chip (8051) takes its parameters through codec 1 node 0x15:
+ * 0x717 selects a parameter, 0x718 writes its value (deferred job 7D87 reads
+ * the selected id when it runs), 0x711-0x716 are its port and stream
+ * requests. An accepted 0x712/0x713/0x715/0x716/0x718 sets its busy flag
+ * (25h.1, ROM 2563) until that job ran; while it's set, 0x711-0x713 and
+ * 0x715-0x718 are REFUSED: reply 1, the verb dropped (0x714 and 0x710 never
+ * are). A refused 0x717 followed by an accepted 0x718 writes the value into
+ * the PREVIOUS parameter. Windows waits for the busy status first
+ * (FUN_0001b344 -> FUN_0001b270: F01 polled while it reads 1, up to 101
+ * times) and every one of its 0x717/0x718 got reply 0 in 28 captures. We
+ * sent the captured status reads but ignored their answers (F01 read busy
+ * 162 times in 9000 in uv79's log): at the first load after power-on the
+ * start-up tail's "select stream 0x18" was refused (verb log 2026-11-07,
+ * reply 1 twice), stream 0x18 connected to its ROM default DAC point 0xd1
+ * and its DAC groups stayed allocated until a power-off: the 8051's own
+ * DSP-mode routing failed every time after (research 2026-11-15,
+ * 8051-0xd1-leak.md; repaired by hand in uv87, after which the 8051 routed
+ * DSP mode itself).
+ * So: wait for the busy status to clear, check the reply and send again on
+ * a refusal; after 0x712/0x713 wait for its job too (Windows reads the
+ * port result only after that). A value write is never sent after a lost
+ * select (it would land on the previous parameter): counted and refused
+ * (-EBUSY). router_poll=0: as before.
+ */
+static bool router_poll = true;
+module_param(router_poll, bool, 0644);
+MODULE_PARM_DESC(router_poll, "Wait for the router chip's busy status before each of its parameter verbs and resend a refused one, as Windows (1 = yes, default; 0 = send blind, as before 0.12.11)");
+
+#define AE9_R51_STATUS		0x115f0100	/* F01: router chip busy (1) or idle (0) */
+#define AE9_R51_IDLE_TRIES	200		/* ~10 ms of status reads */
+#define AE9_R51_TRIES		4
+
+static bool ae9_r51_param_verb(u32 v)
+{
+	unsigned int id = (v >> 8) & 0xfff;
+
+	return (v >> 20) == 0x115 && id >= 0x711 && id <= 0x718;
+}
+
+static void ae9_r51_wait_idle(struct creative_chip *chip)
+{
+	unsigned int i, n = chip->r51_stuck ? 1 : AE9_R51_IDLE_TRIES;
+	u32 r = 0;
+
+	for (i = 0; i < n; i++) {
+		if (ae9_corb_send_verb_sync(chip, AE9_R51_STATUS, &r) < 0)
+			return;
+		if (!(r & 0xff)) {
+			chip->r51_stuck = false;
+			if (i)	/* it was busy: sent blind, this one could have been refused */
+				chip->r51_waited++;
+			return;
+		}
+	}
+	if (chip->r51_stuck)
+		return;
+	/* its job queue overflowed and the flag stays set until a reset:
+	 * one read per verb from now on, not 200 */
+	chip->r51_stuck = true;
+	chip->r51_never_idle++;
+	dev_warn_ratelimited(chip->dev, "router chip: still busy after %u status reads (0x%02x)\n",
+			     i, r & 0xff);
+}
+
+/* a new router chip (bring-up): nothing selected yet */
+void creative_ae9_r51_reset(struct creative_chip *chip)
+{
+	chip->r51_sel = -1;
+	chip->r51_stuck = false;
+}
+
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp)
+{
+	unsigned int id = (verb >> 8) & 0xfff, t;
+	u32 r = 0;
+	int ret = 0;
+
+	if (!router_poll || !ae9_r51_param_verb(verb))
+		return ae9_corb_send_verb_sync(chip, verb, resp);
+	if (id == 0x718 && chip->r51_sel < 0) {
+		/* its select was lost: the value would land on another one */
+		chip->r51_lost++;
+		dev_warn_ratelimited(chip->dev, "router chip: value 0x%08x not sent, its parameter select was lost\n",
+				     verb);
+		return -EBUSY;
+	}
+	for (t = 0; t < AE9_R51_TRIES; t++) {
+		ae9_r51_wait_idle(chip);
+		ret = ae9_corb_send_verb_sync(chip, verb, &r);
+		if (ret < 0 || (r & 0xff) != 1)
+			break;
+		chip->r51_refused++;	/* reply 1: refused busy */
+	}
+	if (id == 0x717)	/* taken: that's the selected id; else nothing is */
+		chip->r51_sel = ret == 0 && (r & 0xff) != 1 ? (int)(verb & 0xff) : -1;
+	if (ret == 0 && (r & 0xff) == 1) {
+		chip->r51_lost++;
+		dev_warn_ratelimited(chip->dev, "router chip: verb 0x%08x refused %u times (busy): dropped\n",
+				     verb, AE9_R51_TRIES);
+		ret = -EBUSY;
+	} else if (ret == 0 && (id == 0x712 || id == 0x713)) {
+		ae9_r51_wait_idle(chip);	/* its port job, before the result read */
+	}
+	if (resp)
+		*resp = r;
+	return ret;
+}
+
+static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *resp)
 {
 	u16 wp_start;
 	u16 wp;
@@ -521,6 +665,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		hung_inject--;
 		dev_err(chip->dev, "CORB verb response timeout (verb=0x%08x, injected)\n", verb);
 		chip->corb_timeouts++;
+		creative_ae9_health_notify(chip);
 		ae9_corb_hung_check(chip, verb);
 		mutex_unlock(&chip->corb_mutex);
 		return -ETIMEDOUT;
@@ -530,6 +675,27 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	 * the unsolicited ones on the way: the DSP announces each SCP reply
 	 * with one, and they often land between our commands. */
 	wp_start = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	/* all-ones: a card off the bus (each marked slot would cost the full
+	 * 200 us wait: ~51 ms under corb_mutex, and 255 false "never landed")
+	 * or one bad read; read once more, then give up on this verb
+	 * (ultrareview 2, #5) */
+	if (wp_start == 0xffff) {
+		udelay(10);
+		wp_start = readw(chip->hda_regs + AZX_REG_RIRBWP);
+	}
+	if (rirb_wp_bad(chip, wp_start, "RIRB drain")) {
+		ret = chip->card_gone || chip->card_hung ? -ENODEV : -EIO;
+		if (ret == -EIO) {
+			dev_warn_ratelimited(chip->dev, "RIRB: verb 0x%08x not sent (write pointer unreadable)\n", verb);
+			/* counts like a timeout: a card whose registers stay
+			 * unreadable still ends up "stopped answering" */
+			chip->corb_timeouts++;
+			creative_ae9_health_notify(chip);
+			ae9_corb_hung_check(chip, verb);
+		}
+		mutex_unlock(&chip->corb_mutex);
+		return ret;
+	}
 	wp_start &= 0xff;
 	{
 		struct creative_rirb_entry *rirb = chip->rirb_buf;
@@ -568,8 +734,13 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 
 			/* all-ones: the card may have dropped off the bus;
 			 * each read of a dead card can stall for a long time */
-			if (raw_wp == 0xffff && creative_ae9_gone(chip, "RIRB poll"))
-				break;
+			if (rirb_wp_bad(chip, raw_wp, "RIRB poll")) {
+				if (chip->card_gone || chip->card_hung)
+					break;
+				/* one bad read: don't take 0xff as the write pointer */
+				udelay(10);
+				continue;
+			}
 			while (cur_wp != wp) {
 				u16 next = (wp + 1) & 0xff;
 				u32 fl, res;
@@ -577,6 +748,17 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				wp = next;
 				if (!rirb_take(chip, rirb, next, &res, &fl))
 					continue;
+				/* an answer from the other codec isn't ours (ultrareview
+				 * 2). It narrows the stale-answer case, it doesn't close
+				 * it: a late answer from the same codec still looks like
+				 * ours; the marks keep those out by timing */
+				if (!(fl & 0x10) && (fl & 0xf) != (verb >> 28)) {
+					chip->rirb_stray++;
+					creative_ae9_health_notify(chip);
+					dev_warn_ratelimited(chip->dev, "RIRB: answer 0x%08x from codec %u while waiting for codec %u (verb 0x%08x): skipped\n",
+							     res, fl & 0xf, verb >> 28, verb);
+					continue;
+				}
 				if (!(fl & 0x10)) {
 					got_res = res;
 					got_fl = fl;
@@ -584,7 +766,10 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				}
 				/* unsolicited — log/count it, keep scanning */
 				rirb_unsol(chip, res, fl);
-				cur_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+				raw_wp = readw(chip->hda_regs + AZX_REG_RIRBWP);
+				if (raw_wp == 0xffff)
+					break;	/* the outer pass re-reads it, guarded */
+				cur_wp = raw_wp & 0xff;
 			}
 			udelay(10);
 		} while (--timeout);
@@ -597,6 +782,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
 	chip->corb_timeouts++;
+	creative_ae9_health_notify(chip);
 	if (chip->dsp_done && !chip->dma_dumped) {	/* the first timeout of this load */
 		chip->dma_dumped = true;
 		creative_ae9_dma_dump(chip, "first command timeout");
@@ -615,8 +801,13 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	 * so the controller would re-send stale entries.
 	 */
 	{
-		u16 cur_rirb_wp = readw(chip->hda_regs + AZX_REG_RIRBWP) & 0xff;
+		u16 cur_rirb_wp = readw(chip->hda_regs + AZX_REG_RIRBWP);
 		int t;
+
+		/* all-ones: don't skip ahead to 0xff; stay at wp */
+		if (rirb_wp_bad(chip, cur_rirb_wp, "RIRB reset"))
+			cur_rirb_wp = wp;
+		cur_rirb_wp &= 0xff;
 
 		writeb(0x00, chip->hda_regs + AZX_REG_CORBCTL);	/* stop */
 		for (t = 0; t < 100 && (readb(chip->hda_regs + AZX_REG_CORBCTL) & 0x02); t++)

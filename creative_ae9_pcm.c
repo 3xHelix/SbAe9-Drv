@@ -94,8 +94,17 @@ static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, c
 
 	for (t = 0; t < 100; t++) {
 		c = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
-		if (c == 0xffffffff)
-			break;
+		/* all-ones: a card off the bus can't fetch anything (stopped);
+		 * otherwise one bad read: once more, then "not stopped" without
+		 * more reads of a maybe-dead card (this runs in trigger STOP
+		 * too, with IRQs off) (ultrareview 2, #2) */
+		if (c == 0xffffffff) {
+			if (chip->card_gone)
+				return true;
+			c = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
+			if (c == 0xffffffff)
+				return false;
+		}
 		if (!(c & SD_CTL_DMA_START)) {
 			if (dma_trace && t)
 				dev_info(chip->dev, "dma: SD 0x%03x stopped after ~%d us (%s)\n",
@@ -107,6 +116,45 @@ static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, c
 	dev_err(chip->dev, "dma: SD 0x%03x still running %s (ctl 0x%08x lpib 0x%x bdl 0x%08x)\n",
 		base, why, c, readl(chip->hda_regs + base + AZX_REG_SD_LPIB),
 		readl(chip->hda_regs + base + AZX_REG_SD_BDLPL));
+	return false;
+}
+
+/*
+ * Before a BDL is freed: a stream whose engine didn't stop could still
+ * fetch it (and then write wherever the recycled page points: IOMMU faults,
+ * or memory corruption without an IOMMU). Keep it then, as hpeq_upload and
+ * xfer_stream_stop do (a stuck stream is left alone, no reset): a small
+ * leak until the next reboot (ultrareview 2, #7). True = free it.
+ * Only if the descriptor still points at THIS BDL: SD4 is also the DSP
+ * firmware and overlay transfer stream (resume_work), and a playback closed
+ * during a resume must not wait on or touch that transfer.
+ * Process context only.
+ */
+static bool ae9_bdl_may_free(struct creative_chip *chip, unsigned int base,
+			     dma_addr_t bdl, const char *what)
+{
+	void __iomem *sd = chip->hda_regs + base;
+	u32 lo = readl(sd + AZX_REG_SD_BDLPL), hi = readl(sd + AZX_REG_SD_BDLPU);
+	u32 want = lower_32_bits(bdl) & ~0x7fU, want_al = lower_32_bits(ALIGN(bdl, 128)) & ~0x7fU;
+
+	if (lo == 0xffffffff || hi == 0xffffffff) {
+		/* off the bus: nothing can fetch it any more; else a bad read
+		 * (a bridge glitch): don't guess, keep it */
+		if (creative_ae9_gone(chip, what))
+			return true;
+		dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x registers unreadable (%s): its BDL is kept, not freed (%d kept)\n",
+				     base, what, atomic_inc_return(&chip->bdl_leaks));
+		creative_ae9_health_notify(chip);
+		return false;
+	} else if (hi != upper_32_bits(bdl) ||
+		   ((lo & ~0x7fU) != want && (lo & ~0x7fU) != want_al)) {
+		return true;	/* the descriptor doesn't use this BDL */
+	} else if (ae9_sd_wait_stopped(chip, base, what)) {
+		return true;
+	}
+	dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x didn't stop (%s): its BDL is kept, not freed (%d kept)\n",
+			     base, what, atomic_inc_return(&chip->bdl_leaks));
+	creative_ae9_health_notify(chip);
 	return false;
 }
 
@@ -134,6 +182,16 @@ static void ae9_dma_dump_bdl(struct creative_chip *chip, const char *name, void 
 		(unsigned long long)le64_to_cpu(*(__le64 *)(bdl + 16)), le32_to_cpu(*(__le32 *)(bdl + 24)));
 }
 
+/* stream descriptors from GCAP (input + output + bidirectional), capped at
+ * the 30 the register map has room for; 0 if the controller reads all-ones
+ * (ultrareview 2, #8: dma_dump and dma_quiesce shared this) */
+static unsigned int ae9_sd_count(u16 g)
+{
+	if (g == 0xffff)
+		return 0;
+	return min_t(unsigned int, ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f), 30);
+}
+
 /* every stream descriptor that runs or has a BDL, and the BDLs we hold:
  * called at the first command timeout and when the card is marked hung */
 void creative_ae9_dma_dump(struct creative_chip *chip, const char *why)
@@ -146,12 +204,12 @@ void creative_ae9_dma_dump(struct creative_chip *chip, const char *why)
 		dev_err(chip->dev, "dma dump (%s): the controller reads all ones\n", why);
 		return;
 	}
-	n = ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f);
+	n = ae9_sd_count(g);
 	dev_err(chip->dev, "dma dump (%s): GCAP 0x%04x, %u streams, DPLBASE 0x%08x, INTCTL 0x%08x, CORB 0x%llx, RIRB 0x%llx\n",
 		why, g, n, readl(chip->hda_regs + AZX_REG_DPLBASE),
 		readl(chip->hda_regs + AZX_REG_INTCTL),
 		(unsigned long long)chip->corb_dma, (unsigned long long)chip->rirb_dma);
-	for (i = 0; i < n && i < 30; i++) {
+	for (i = 0; i < n; i++) {
 		unsigned int base = 0x80 + i * 0x20;
 		u32 ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 		u32 bdl = readl(chip->hda_regs + base + AZX_REG_SD_BDLPL);
@@ -189,8 +247,8 @@ void creative_ae9_dma_quiesce(struct creative_chip *chip)
 
 	if (g == 0xffff)
 		return;
-	n = ((g >> 8) & 0xf) + ((g >> 12) & 0xf) + ((g >> 3) & 0x1f);
-	for (i = 0; i < n && i < 30; i++) {
+	n = ae9_sd_count(g);
+	for (i = 0; i < n; i++) {
 		unsigned int base = 0x80 + i * 0x20;
 
 		ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
@@ -919,9 +977,11 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 
 	if (chip->playback_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback hw_params"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
 	}
@@ -979,10 +1039,11 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 
 	ae9_posbuf_off(chip);
 	if (chip->playback_bdl_raw) {
-		ae9_sd_wait_stopped(chip, chip->playback_stream_base, "at hw_free");
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback hw_free"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
 	}
@@ -1228,8 +1289,10 @@ static int creative_ae9_opt_hw_params(struct snd_pcm_substream *substream,
 	int ret;
 
 	if (chip->opt_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->opt_bdl_size,
-				  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out hw_params"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
 		chip->opt_bdl_raw = NULL;
 		chip->opt_bdl = NULL;
 	}
@@ -1257,9 +1320,10 @@ static int creative_ae9_opt_hw_free(struct snd_pcm_substream *substream)
 	chip->opt_format = 0;
 	ae9_spdif_out_apply(chip);
 	if (chip->opt_bdl_raw) {
-		ae9_sd_wait_stopped(chip, CREATIVE_OPT_STREAM_BASE, "at hw_free");
-		dma_free_coherent(chip->dev, chip->opt_bdl_size,
-				  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out hw_free"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
 		chip->opt_bdl_raw = NULL;
 		chip->opt_bdl = NULL;
 	}
@@ -1576,9 +1640,9 @@ static int creative_ae9_cap_close(struct snd_pcm_substream *substream)
 static void creative_ae9_cap_bdl_free(struct creative_chip *chip)
 {
 	if (chip->cap_bdl_raw) {
-		ae9_sd_wait_stopped(chip, CREATIVE_CAP_STREAM_BASE, "at BDL free");
-		dma_free_coherent(chip->dev, chip->cap_bdl_size,
-				  chip->cap_bdl_raw, chip->cap_bdl_dma);
+		if (ae9_bdl_may_free(chip, CREATIVE_CAP_STREAM_BASE, chip->cap_bdl_dma, "mic BDL free"))
+			dma_free_coherent(chip->dev, chip->cap_bdl_size,
+					  chip->cap_bdl_raw, chip->cap_bdl_dma);
 		chip->cap_bdl_raw = NULL;
 		chip->cap_bdl = NULL;
 	}
@@ -1899,8 +1963,8 @@ static void creative_ae9_xcap_bdl_free(struct creative_chip *chip, unsigned int 
 	struct ae9_xcap_state *st = &chip->xcap[i];
 
 	if (st->bdl_raw) {
-		ae9_sd_wait_stopped(chip, ae9_xcaps[i].base, "at BDL free");
-		dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
+		if (ae9_bdl_may_free(chip, ae9_xcaps[i].base, st->bdl_dma, "capture BDL free"))
+			dma_free_coherent(chip->dev, st->bdl_size, st->bdl_raw, st->bdl_dma);
 		st->bdl_raw = NULL;
 		st->bdl = NULL;
 	}
@@ -2281,15 +2345,19 @@ static void creative_ae9_pcm_free(struct snd_pcm *pcm)
 	struct creative_chip *chip = pcm->private_data;
 
 	if (chip->playback_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->playback_bdl_size,
-				  chip->playback_bdl_raw,
-				  chip->playback_bdl_dma);
+		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
+				     "playback at card free"))
+			dma_free_coherent(chip->dev, chip->playback_bdl_size,
+					  chip->playback_bdl_raw,
+					  chip->playback_bdl_dma);
 		chip->playback_bdl_raw = NULL;
 		chip->playback_bdl = NULL;
 	}
 	if (chip->opt_bdl_raw) {
-		dma_free_coherent(chip->dev, chip->opt_bdl_size,
-				  chip->opt_bdl_raw, chip->opt_bdl_dma);
+		if (ae9_bdl_may_free(chip, CREATIVE_OPT_STREAM_BASE, chip->opt_bdl_dma,
+				     "optical out at card free"))
+			dma_free_coherent(chip->dev, chip->opt_bdl_size,
+					  chip->opt_bdl_raw, chip->opt_bdl_dma);
 		chip->opt_bdl_raw = NULL;
 		chip->opt_bdl = NULL;
 	}

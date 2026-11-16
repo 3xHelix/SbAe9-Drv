@@ -3,6 +3,89 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.11 (2026-11-15)
+Full volume in DSP mode, and switch freely. 🎚️
+
+Works with SbAe9-SBC v0.21.1 and SbAe9-AudioMon v0.4.7. Their next
+versions follow it: SBC's pause between setting changes drops to 2 s and its
+"DSP mode is quieter" notes go; AudioMon gets a "Driver Health" row.
+
+- **Fixed: DSP mode (Direct Mode off) played 6 dB quieter than Direct
+  Mode, and only half of the audio.** The DSP runs at 96 kHz and sends
+  each channel to the DACs on two lanes, every other sample on each; the
+  driver connected only the first lane, so the DACs got half the samples
+  (6 dB down, plus an inaudible ultrasonic mirror image). The card's
+  router chip normally sets these lanes up itself, but on our card its
+  own setup fails and leaves them unconnected. The driver now connects
+  every lane in the router chip's own slots for them, the way Creative's
+  Windows driver routes its Direct Mode. On the card: DSP mode now plays
+  at Direct Mode's level (0.0 dB, was −6.1 dB), Bass Redirect reaches the
+  sub every time, and 5.1 gets each channel's full signal. **⚠️ DSP mode
+  is now 6 dB louder at the same volume, on the headphones too: turn it
+  down before you switch.** `rt_dsp_walk=0` brings back the old routing,
+  `1` connects the front lanes only.
+- **Fixed: the card's router chip could be left half set up after a
+  power-on**, so DSP mode depended on the driver patching its routes. At
+  the first load after a power-on the driver sent the router chip setup
+  commands faster than it takes them; it refuses one while it's still busy
+  with the last, and a refused "select" sends the next value to the wrong
+  setting. One of them left a DAC allocation stuck until the next
+  power-off, and from then on the router chip's own DSP-mode routing failed.
+  The driver now waits until the router chip is ready before each of its
+  commands and checks the answer, as Windows does; it also releases the DSP
+  route at start-up as Windows does, and frees a stuck allocation if it
+  finds one (no power-off needed). On the card, after a power-off: the
+  router chip sets up DSP mode completely by itself. A new start-up line in
+  the kernel log shows it every load.
+- **Fixed: the mic could sound like a chipmunk after a rate change.**
+  With a recording running (Discord, OBS), playing something at 96 or
+  192 kHz and then switching Direct Mode off could leave the mic at about
+  twice the pitch, slightly metallic, until the app reopened it. The
+  card's router chip sometimes hands the running mic the same router
+  slots DSP mode always used for the speakers, and DSP mode wrote over the
+  mic's feed. The driver now leaves any slot that's in use alone and puts
+  its own route elsewhere. On the card: the trigger (192 kHz, then DSP
+  mode) broke the mic in 2 of 3 tries before; 0 of 40 checks after.
+- **Fixed: DSP mode could go silent.** Two more ways into the same router
+  slots (the new lane routing above avoids them entirely; this remains
+  the fallback): at 96 kHz in DSP mode the router chip wires the audio straight
+  into the DSP from those slots, and the driver wrote over the DSP's input
+  (silent until Direct Mode or 48 kHz); and after a few switches the
+  driver could run out of free slots, because a route it moved never gave
+  its slot back (silent in DSP mode until a power-off). Both fixed; on the
+  card, 60 checks across mic trips and 48 ↔ 96 kHz switches in DSP mode,
+  0 silent, the free-slot count steady. The free count is in the debug
+  state (`router free slots`).
+- **Fixed: unloading the driver could crash the kernel** if the card
+  stopped answering during the unload (the usual moment for
+  `sudo modprobe -r`): the "card stopped answering" clean-up was started
+  after the sound devices it touches were already freed. Proven on the
+  card with a forced hang during unload: no crash, card back without a
+  power-off. Found by an outside code review, as were the next two.
+- **Safer DMA when a stream won't stop:** its buffer list is now kept
+  instead of freed (so a stuck engine can't write into reused memory),
+  and a card that dropped off the bus no longer logs false "still
+  running" errors.
+- **Command ring hardening:** an unreadable answer pointer (a card off
+  the bus, or a glitch behind a PCIe bridge) is never used as a position
+  any more, and an answer from the wrong codec is never taken as ours.
+  New counters for that: `never landed`, `other codec`, `unreadable write
+  pointer`, `BDLs kept`, all 0 on a healthy card.
+- **New: "Driver Health"**, a read-only control any user can read
+  (`amixer -c AE9 cget name='Driver Health'`; no root needed, unlike the
+  debug state): those counters plus command timeouts, late ring answers and
+  the router's free slots. SbAe9-AudioMon can show them. The router's
+  free-slot count is now right too (the old one missed slots the router chip
+  had freed itself and drifted down without a real leak), and when the
+  driver has to place a route itself it takes a slot the router chip won't
+  hand out next.
+- Rapid switching no longer wears the card down: 640 random setting
+  changes, some with no gap at all, came back clean every time (the old
+  "card wear" was the early-read bug 0.12.10 fixed). SbAe9-SBC's pause
+  between changes drops to 2 s.
+- Docs: Linux's workaround for this Creative controller quirk dates from
+  2010, not 2009 (0.12.10's entry said 2009).
+
 ## 0.12.10 (2026-11-15)
 No more hangs, and profiles on the fly. 🍁
 

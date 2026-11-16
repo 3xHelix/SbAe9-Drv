@@ -106,6 +106,12 @@ Two stages, as in Windows.
   "EQ Preset" (Windows' 20 presets, Flat to Stadium), "EQ Pre-gain" and ten
   bands (31 Hz-16 kHz, -12..+12 dB) and "Scout Mode Switch" act; otherwise
   they are greyed out and keep their values.
+- **DSP mode plays at the same level as Direct Mode** (since 0.12.11;
+  before, it was 6 dB quieter and only half the samples reached the DACs).
+  **If you're coming from an older version, turn the volume down before you
+  first switch Direct Mode off, on the headphones too.** Bass Redirect
+  sends the bass to the sub on the Center/Sub jack (right channel). SBX's
+  Smart Volume ("Loud" especially) lifts quiet audio a lot: by design.
 - Works on speakers and headphones, across sleep and reboots. With Direct
   Mode off, a new stream after boot, wake or a switch made while stopped
   plays direct for 3 s (`dsp_switch_ms`), then moves to the DSP. Turning
@@ -390,6 +396,13 @@ while playing, to check it on your card.
 - **If the DSP misses its boot handshake** (at load or on resume), the driver
   runs that shutdown and tries again: `resume_tries` (3) attempts,
   `resume_delay_ms` (2000) apart.
+- **"Driver Health"** (read-only, any user): `amixer -c AE9 cget
+  name='Driver Health'` gives 8 numbers: command timeouts, command-ring
+  answers that never landed, answers from the wrong codec, unreadable ring
+  pointer reads, DMA buffers kept because a stream didn't stop (all 0 on a
+  healthy card), then late ring answers, the longest wait for one (µs) and
+  the router's free slots (information). Apps can follow it with `amixer
+  events` (SbAe9-AudioMon does). Since 0.12.11.
 - **Reloading the driver:** `ae9-reload` stops what holds the card,
   reloads the driver and starts everything again (see
   [Troubleshooting](TROUBLESHOOTING.md)).

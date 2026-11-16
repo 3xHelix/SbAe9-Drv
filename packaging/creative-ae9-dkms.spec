@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.10
+Version:        0.12.11
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -120,6 +120,15 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.11-1
+- Driver 0.12.11: DSP mode plays at full level (it was 6 dB quiet and only
+  half the samples reached the DACs; DSP mode is now 6 dB louder at the
+  same volume, headphones too), the router chip is no longer left half set
+  up after a power-on, the mic no longer sounds like a chipmunk after a
+  96/192 kHz stream, DSP mode no longer goes silent after rate changes,
+  unloading with a hung card no longer crashes, safer DMA and a hardened
+  command ring, new "Driver Health" control.
+
 * Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.10-1
 - Driver 0.12.10: no more card hangs after effect changes in DSP mode
   (answers were read before they reached memory, the Creative controller

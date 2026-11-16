@@ -63,7 +63,9 @@ description.
 - `surround` (1, writable at runtime): 6-channel (5.1) playback and the
   4.0/4.1/5.1 speaker configs; 0 = stereo only. `surround_ports`
   (0x50,0x51,0x60,0x61) the router targets for the DSP's center, LFE, rear
-  L/R outputs. `surround_96k` (1, writable at runtime): 5.1 at 96 kHz in
+  L/R outputs in DSP mode (stereo streams too since 0.12.11: Bass Redirect's
+  sub, the rears of 4.0/4.1); each must be a DAC pair's first port
+  (0x40-0x7f with bits 3:1 clear), else the default is used. `surround_96k` (1, writable at runtime): 5.1 at 96 kHz in
   Direct Mode; 0 limits 5.1 to 48 kHz. `surround_192k` (1, writable at
   runtime): 5.1 at 192 kHz in Direct Mode; 0 limits 5.1 to 96 kHz.
 - Playback buffer (all writable at runtime, applied at the next stream):
@@ -102,6 +104,12 @@ description.
 - `vc_quiet_ms` (0, writable at runtime): holds DSP messages this long after
   Voice Clarity routes the mic in (not needed since the start follows
   Windows' order).
+- `rt_dsp_walk` (2, writable at runtime, applied at the next DSP-mode
+  stream start): how DSP mode connects the DSP's outputs to the DACs.
+  2 = all twelve 96 kHz lanes, in the router chip's own slots for them
+  (stream 0x18), as its own layout and Windows; 1 = the front lanes only
+  (no Bass Redirect sub, no rears); 0 = the fixed slots before 0.12.11 (DSP
+  mode 6 dB quieter, only half the samples). Since 0.12.11.
 - Router (kept switchable for diagnosis): `rt_chain_walk` (1, writable at
   runtime) Direct Mode starts use the router slots the router chip gave the
   stream, as Windows (0 = the old fixed slots, which stalled What U Hear);

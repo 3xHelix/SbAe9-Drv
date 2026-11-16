@@ -59,6 +59,12 @@ changing anything.
 - In "Driver state", "STALE" means a leftover route; the driver switches
   those off at the next Direct Mode start.
 
+A quick health check any user can run, any time (0.12.11+):
+`amixer -c AE9 cget name='Driver Health'`. The first five of its eight
+numbers (command timeouts, answers that never landed, answers from the wrong
+codec, unreadable ring pointer, DMA buffers kept) should be 0; if one isn't,
+include that line in your report.
+
 Two more tools for volunteers (read-only):
 
 - `sudo ae9-dsp-snapshot > snap.txt` samples the DSP's control and DMA
@@ -86,16 +92,17 @@ For more detail in the kernel log:
   reset`), tries a few times, and if it says `never answered`, power off at
   the PSU for ~20 s; only that clears it (a warm reboot sometimes does, a
   reload doesn't).
-- **Lots of rapid switching in a row** (sample rates, Direct Mode,
-  stereo/5.1, bit depth, SBX on/off, dozens of times) can wear the card into
-  a bad state: a stream that stutters more and more, plays nothing while the
-  player runs, or a card that stops answering. A warm reboot doesn't clear
-  it, a PSU power-off (or, probably, a 25 s suspend) does. Normal use doesn't
-  get there; give the card a few seconds between changes.
+- **Rapid switching:** before 0.12.10, lots of fast setting changes in a
+  row could wear the card into a bad state. That was the early-read bug
+  0.12.10 fixed: 640 random changes, many with no gap, now come back clean.
+  If anything still goes odd after a burst of changes, `ae9-reload`, and
+  please send a full dump.
 - **SBX: silence or echoey, crunched audio** with Direct Mode off that
   toggling doesn't fix means the card's audio router is in a bad state; only
   a PSU power-off clears it (a warm reboot doesn't). Seen often while SBX was
-  being developed, rarely since.
+  being developed, rarely since; 0.12.11 routes DSP mode in the router
+  chip's own slots, which removes the known causes. If you still see it,
+  send `ae9-full-dump` (its "router stream 0x18" line shows the routes).
 - **Silent restart after a pause** (rare): playback restarting after a pause
   comes up silent even though the stream runs and the audio reaches the card.
   Closing and reopening the player, or `ae9-reload`, brings it back. Cause
@@ -110,6 +117,13 @@ For more detail in the kernel log:
 
 ## Fixed in earlier versions
 
+- 0.12.11: DSP mode (Direct Mode off) played 6 dB quieter than Direct Mode
+  and only half of the audio; the mic could sound like a chipmunk, or DSP
+  mode go silent, after playing something at 96/192 kHz and switching
+  Direct Mode off; unloading the driver could crash the kernel if the card
+  stopped answering during the unload; at the first load after a power-on
+  the card's router chip could be left half set up (a DAC allocation stuck
+  until the next power-off).
 - 0.12.10: the card could stop answering after effect changes in DSP mode
   (SBX on/off and the like), mostly while recording; the occasional lost
   DSP reply behind it is gone too.
