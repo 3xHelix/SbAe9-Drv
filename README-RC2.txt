@@ -1,5 +1,7 @@
-SbAe9-Drv 0.12.11-rc1 - release candidate, for ASMedia-bridge testers first
+SbAe9-Drv 0.12.11-rc2 - release candidate, for ASMedia-bridge testers first
 ==========================================================================
+(rc2 = rc1 + the "Driver Health" control and a corrected router free-slot count.
+ If you already installed rc1, just install rc2 over it.)
 
 This is the 0.12.11 driver before its release: what the author runs daily,
 tested on an IDT-bridge card. We'd love to see it on an ASMedia-bridge card
@@ -20,6 +22,7 @@ What's new since 0.12.10
     card stopped answering during the unload.
   - Safer DMA when a stream won't stop, and a hardened command ring (a bad
     read through a PCIe bridge is never used as a position).
+  - New: the "Driver Health" control: health counters any user can read.
   Pairs with SbAe9-SBC (current) and SbAe9-AudioMon v0.4.7.
 
 Install (from this folder)
@@ -31,19 +34,20 @@ Install (from this folder)
     first, then  sudo scripts/dkms-install.sh  . To go back:
     sudo scripts/dkms-install.sh --remove  and reinstall the package.
   Then shut down, PSU off ~30 s, boot. Check:
-        cat /sys/module/snd_hda_codec_creative_ae9/version    -> 0.12.11-rc1
+        cat /sys/module/snd_hda_codec_creative_ae9/version    -> 0.12.11-rc2
 
 What helps us most (ASMedia cards especially)
   1. Use it normally for a day or two: DSP mode / SBX, Direct Mode, a few
      sample-rate changes (96/192 kHz), headphones/speakers, Discord or any
      app using the mic, What U Hear if you use it.
-  2. The command-ring counters, after a busy session (e.g. toggling
-     SBX/effects a lot with something recording):
-        sudo grep -E 'RIRB|timeouts' /sys/kernel/debug/creative_ae9/state
-     "verb timeouts", "never landed", "other codec" and "unreadable write
-     pointer" should stay 0. "landed late ... (longest wait N us)" is what
-     we most want from an ASMedia card: how late the card's answers land
-     behind your bridge (ours: up to 8 us).
+  2. The health counters, after a busy session (e.g. toggling SBX/effects
+     a lot with something recording). No sudo needed:
+        amixer -c AE9 cget name='Driver Health'
+     It prints 8 numbers: timeouts, never landed, other codec, unreadable
+     write pointer, BDLs kept, late entries, longest wait (us), free slots.
+     The first five should stay 0. The 6th and 7th are what we most want
+     from an ASMedia card: how late the card's answers land behind your
+     bridge (ours: up to 8 us). Please send that line.
   3. One full dump while playing in DSP mode:
         sudo scripts/ae9-full-dump.sh     (or ae9-full-dump if installed)
      The line "router stream 0x18: ..." shows whether your card's router
@@ -54,4 +58,4 @@ What helps us most (ASMedia cards especially)
      Mode AND DSP mode afterwards?
   5. Anything odd: send  journalctl -k -b | grep creative-ae9  and a full dump.
 Thank you!
-From sbae9 5dc5076, 2026-11-15.
+From sbae9 73bf159, 2026-11-15.

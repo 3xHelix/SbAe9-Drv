@@ -421,6 +421,7 @@ static bool rirb_take(struct creative_chip *chip, struct creative_rirb_entry *ri
 		}
 		if (*fl == RIRB_MARK) {
 			chip->rirb_never++;
+			creative_ae9_health_notify(chip);
 			dev_info_ratelimited(chip->dev, "RIRB entry %u never landed (%u us)\n",
 					     i, RIRB_LATE_US);
 			return false;
@@ -445,6 +446,7 @@ static bool rirb_wp_bad(struct creative_chip *chip, u16 raw, const char *where)
 		return false;
 	if (!creative_ae9_gone(chip, where)) {
 		chip->rirb_badwp++;
+		creative_ae9_health_notify(chip);
 		dev_warn_ratelimited(chip->dev, "RIRB: write pointer read all-ones (%s), card still there (%u so far)\n",
 				     where, chip->rirb_badwp);
 	}
@@ -549,6 +551,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 		hung_inject--;
 		dev_err(chip->dev, "CORB verb response timeout (verb=0x%08x, injected)\n", verb);
 		chip->corb_timeouts++;
+		creative_ae9_health_notify(chip);
 		ae9_corb_hung_check(chip, verb);
 		mutex_unlock(&chip->corb_mutex);
 		return -ETIMEDOUT;
@@ -573,6 +576,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 			/* counts like a timeout: a card whose registers stay
 			 * unreadable still ends up "stopped answering" */
 			chip->corb_timeouts++;
+			creative_ae9_health_notify(chip);
 			ae9_corb_hung_check(chip, verb);
 		}
 		mutex_unlock(&chip->corb_mutex);
@@ -636,6 +640,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				 * ours; the marks keep those out by timing */
 				if (!(fl & 0x10) && (fl & 0xf) != (verb >> 28)) {
 					chip->rirb_stray++;
+					creative_ae9_health_notify(chip);
 					dev_warn_ratelimited(chip->dev, "RIRB: answer 0x%08x from codec %u while waiting for codec %u (verb 0x%08x): skipped\n",
 							     res, fl & 0xf, verb >> 28, verb);
 					continue;
@@ -663,6 +668,7 @@ int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 	dev_err(chip->dev,
 		"CORB verb response timeout (verb=0x%08x)\n", verb);
 	chip->corb_timeouts++;
+	creative_ae9_health_notify(chip);
 	if (chip->dsp_done && !chip->dma_dumped) {	/* the first timeout of this load */
 		chip->dma_dumped = true;
 		creative_ae9_dma_dump(chip, "first command timeout");

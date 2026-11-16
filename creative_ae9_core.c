@@ -1002,16 +1002,79 @@ static bool ae9_rt_slot_takeable(unsigned int i, u32 v)
 	       0x190000 + 4 * i != AE9_RT_FRONT_R;
 }
 
-static int ae9_rt_free_slot(const u32 *e, int near)
-{
-	unsigned int i;
+#define AE9_8051_STREAMS	37	/* stream ids 0x00-0x24: list heads XRAM 0x1578 + id */
+static int ae9_8051_xram_byte_locked(struct creative_chip *chip, u16 addr);
+static int ae9_rt_true_free(struct creative_chip *chip, bool force);
 
-	/* the neighbours too only if takeable: never our front pair or the
-	 * low slots (ultrareview 2 follow-up) */
-	if (near > 0 && ae9_rt_slot_takeable(near - 1, e[near - 1]))
+/*
+ * Every router slot that sits in one of the 8051's stream lists (heads XRAM
+ * 0x1578 + id, next 0x1478 + slot, 0xff = end; its allocator, ROM C171/
+ * C19E/C1DB). A slot in no list is free; a slot the 8051 freed keeps its
+ * old src/dst with the state bits clear, so "reads 0" undercounted the
+ * free ones by about half (uv84 T0: 74-104 free, the old rule said 44-46).
+ * Caller holds replay_mutex. Returns the listed slots from 0x0c on, or
+ * -EIO when a read fails or a list makes no sense (a pointer out of range,
+ * a slot seen twice, no end): a short list would hand out a listed slot,
+ * so the caller falls back to the old rule (ultrareview of hf1).
+ */
+static int ae9_rt_list_map(struct creative_chip *chip, unsigned long *inl)
+{
+	unsigned int sid, k;
+	int s, n = 0;
+
+	bitmap_zero(inl, AE9_RT_ENTRIES);
+	for (sid = 0; sid < AE9_8051_STREAMS; sid++) {
+		s = ae9_8051_xram_byte_locked(chip, 0x1578 + sid);
+		for (k = 0; k < AE9_RT_ENTRIES && s != 0xff; k++) {
+			if (s < 0 || s >= AE9_RT_ENTRIES || test_and_set_bit(s, inl))
+				return -EIO;
+			if (s >= 0x0c)
+				n++;
+			s = ae9_8051_xram_byte_locked(chip, 0x1478 + s);
+		}
+		if (s != 0xff)
+			return -EIO;	/* no end within 128 slots */
+	}
+	return n;
+}
+
+/* a slot we may take, given the 8051's lists: in none, nothing live in it
+ * (our own moved routes are live and in no list), not our fixed pair */
+static bool ae9_rt_slot_ok(unsigned int i, u32 v, const unsigned long *inl)
+{
+	if (!inl)
+		return ae9_rt_slot_takeable(i, v);
+	return i >= 0x0c && i < AE9_RT_ENTRIES && !test_bit(i, inl) && !((v >> 16) & 3) &&
+	       0x190000 + 4 * i != AE9_RT_FRONT_L && 0x190000 + 4 * i != AE9_RT_FRONT_R;
+}
+
+/*
+ * A free slot for a route we place ourselves (steering, feed repair). With
+ * the 8051's lists known (inl), from the TOP down: the 8051 hands out the
+ * lowest free slots first, so a route at the bottom was the next one it
+ * would take over (uv80-82: the mic and DSP lists grew into 0x18-0x2f).
+ * Without them (a read failed), as before.
+ */
+static int ae9_rt_free_slot(const u32 *e, int near, const unsigned long *inl)
+{
+	int i;
+
+	/* the neighbours (without a map only: next to one of the 8051's own
+	 * entries is just where it allocates next) too only if takeable:
+	 * never our front pair or the low slots (ultrareview 2 follow-up) */
+	if (!inl && near > 0 && ae9_rt_slot_ok(near - 1, e[near - 1], inl))
 		return near - 1;
-	if (near >= 0 && ae9_rt_slot_takeable(near + 1, e[near + 1]))
+	if (!inl && near >= 0 && near + 1 < AE9_RT_ENTRIES &&
+	    ae9_rt_slot_ok(near + 1, e[near + 1], inl))
 		return near + 1;
+	if (inl) {
+		/* the router uses the whole table: uv83's lanes in 0x7e/0x7f
+		 * played; the 8051 has never allocated above 0x53 (uv84) */
+		for (i = AE9_RT_ENTRIES - 1; i >= 0x0c; i--)
+			if (ae9_rt_slot_ok(i, e[i], inl))
+				return i;
+		return -1;
+	}
 	for (i = 0x0c; i < AE9_RT_ENTRIES; i++)	/* past 0x190030 */
 		if (ae9_rt_slot_takeable(i, e[i]))
 			return i;
@@ -1068,8 +1131,24 @@ static void ae9_rt_moved_add(struct creative_chip *chip, unsigned int slot)
 }
 
 /* returns the slot that now carries the route, or -1 */
+/* the 8051's list map, built once per routing pass when first needed;
+ * state 0 = not built yet, 1 = built, -1 = couldn't be read */
+struct ae9_rt_map {
+	DECLARE_BITMAP(inl, AE9_RT_ENTRIES);
+	int state;
+};
+
+static const unsigned long *ae9_rt_map_get(struct creative_chip *chip, struct ae9_rt_map *m)
+{
+	if (!m)
+		return NULL;
+	if (!m->state)
+		m->state = ae9_rt_list_map(chip, m->inl) >= 0 ? 1 : -1;
+	return m->state > 0 ? m->inl : NULL;
+}
+
 static int ae9_rt_put(struct creative_chip *chip, u32 *e, unsigned int n,
-		      u32 a, u32 want, unsigned int *unsteady,
+		      struct ae9_rt_map *map, u32 a, u32 want, unsigned int *unsteady,
 		      unsigned int *retried, unsigned int *failed)
 {
 	unsigned int i = (a - 0x190000) / 4, j;
@@ -1085,7 +1164,7 @@ static int ae9_rt_put(struct creative_chip *chip, u32 *e, unsigned int n,
 		if (j != i && ((e[j] >> 16) & 3) && (e[j] & 0xffff) == (want & 0xffff))
 			break;
 	if (j == n && n == AE9_RT_ENTRIES)
-		at = ae9_rt_free_slot(e, -1);
+		at = ae9_rt_free_slot(e, -1, ae9_rt_map_get(chip, map));
 	dev_info(chip->dev, "SBX: router: 0x%06x is in use (0x%05x), left alone; 0x%04x %s\n",
 		 a, e[i], want & 0xffff, j < n ? "already on elsewhere" :
 		 at < 0 ? "NOT routed (no free slot)" : "goes to a free slot");
@@ -1288,6 +1367,7 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	u32 e[AE9_RT_ENTRIES];
 	int keep[AE9_DSP_LANES];	/* slots of our DSP -> DAC routes */
 	int lane[AE9_DSP_LANES], head18 = -1, chain = 0;
+	struct ae9_rt_map rtmap = { .state = 0 };
 	unsigned int i, n = 0, ff, seen, walked = 0, lanes_set = 0, lanes_off = 0, wrote = 0;
 	unsigned int lanes_ff = 0, lanes_parked = 0, lanes_stray = 0;
 	unsigned int unsteady = 0, retried = 0, failed = 0;
@@ -1444,7 +1524,7 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 
 			if (!src_to_dsp[i] || feed_at[i] >= 0)
 				continue;
-			at = ae9_rt_free_slot(e, feed_at[!i]);
+			at = ae9_rt_free_slot(e, feed_at[!i], ae9_rt_map_get(chip, &rtmap));
 			if (at < 0)
 				break;
 			e[at] = want;
@@ -1492,9 +1572,9 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 		/* the fixed slots, as before (rt_dsp_walk=0, or the list
 		 * couldn't be trusted, or a stream plays but stream 0x18 isn't
 		 * connected); with no stream there's nothing to route */
-		keep[0] = ae9_rt_put(chip, e, n, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
+		keep[0] = ae9_rt_put(chip, e, n, &rtmap, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
 				     &unsteady, &retried, &failed);
-		keep[1] = ae9_rt_put(chip, e, n, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r,
+		keep[1] = ae9_rt_put(chip, e, n, &rtmap, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r,
 				     &unsteady, &retried, &failed);
 	}
 	if (chip->in05_ch == 6) {
@@ -1554,7 +1634,7 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 				 stale, stale == 1 ? "" : "s");
 		if (!walked) {
 			for (i = 0; i < 4; i++)
-				keep[2 + i] = ae9_rt_put(chip, e, n, AE9_RT_SURROUND + 4 * i,
+				keep[2 + i] = ae9_rt_put(chip, e, n, &rtmap, AE9_RT_SURROUND + 4 * i,
 							 0x10000 | ae9_surround_port(i) << 8 | (0xc2 + i),
 							 &unsteady, &retried, &failed);
 			dev_info(chip->dev, "SBX: router 5.1: DSP c2..c5 -> 0x%02x 0x%02x 0x%02x 0x%02x\n",
@@ -3934,7 +4014,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		if (!feeds)
 			seq_puts(m, " none");
 		seq_puts(m, bad ? "  STALE: a port has two feeds, a route is on twice, or a DSP feed in Direct Mode (power-off clears it)" : "  ok");
-		seq_printf(m, "\nrouter free slots (for moved DSP-mode routes): %u", nfree);
+		seq_printf(m, "\nrouter free slots: %d in no router-chip list (%u by the old rule)",
+			   ae9_rt_true_free(chip, true), nfree);
 	}
 
 	/* codec 1 node 0x15 GET 0xf0f: bit N = ChipIO control flag N
@@ -5106,6 +5187,89 @@ static const struct snd_kcontrol_new hu_out_control = {
  * control device keeps "modprobe -r" from unloading the driver. A reload
  * brings a new card where it reads on.
  */
+/*
+ * Router slots in no router-chip list (ae9_rt_list_map, about 80 XRAM
+ * reads): measured by the heartbeat at most every 30 s, or by debugfs
+ * (force); the "Driver Health" read only returns the cached value (no card
+ * I/O in a control read). -1 until measured; a failed walk keeps the old
+ * value and its age, so the next heartbeat tries again.
+ */
+static int ae9_rt_true_free(struct creative_chip *chip, bool force)
+{
+	DECLARE_BITMAP(inl, AE9_RT_ENTRIES);
+	int n;
+
+	if (!chip->corb_buf || !chip->dsp_done || chip->suspended ||
+	    READ_ONCE(chip->unloading) || creative_ae9_dead(chip))
+		return chip->rt_free_true;
+	mutex_lock(&chip->replay_mutex);
+	if (!force && chip->rt_free_at &&
+	    time_before(jiffies, chip->rt_free_at + 30 * HZ)) {
+		mutex_unlock(&chip->replay_mutex);
+		return chip->rt_free_true;
+	}
+	n = ae9_rt_list_map(chip, inl);
+	creative_dsp_chipio_addr_invalidate();
+	if (n >= 0)
+		chip->rt_free_at = jiffies ?: 1;
+	mutex_unlock(&chip->replay_mutex);
+	if (n >= 0 && n <= AE9_RT_ENTRIES - 0x0c &&
+	    chip->rt_free_true != AE9_RT_ENTRIES - 0x0c - n) {
+		chip->rt_free_true = AE9_RT_ENTRIES - 0x0c - n;
+		creative_ae9_health_notify(chip);
+	}
+	return chip->rt_free_true;
+}
+
+/*
+ * "Driver Health" (read-only, 8 integers), for apps that can't read
+ * debugfs (root only), e.g. AudioMon: [0] verb timeouts, [1] RIRB entries
+ * never landed, [2] answers from the other codec, [3] unreadable RIRB
+ * write pointer, [4] BDLs kept (stream didn't stop) — all 0 on a healthy
+ * card, a change event when one moves; [5] RIRB entries that landed late,
+ * [6] the longest wait for one (us) — information, no events; [7] router
+ * slots in no router-chip list (-1 = not measured; the heartbeat measures
+ * it every 30 s, an event when it changes).
+ */
+static int health_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	ui->count = 8;
+	ui->value.integer.min = -1;
+	ui->value.integer.max = INT_MAX - 1;	/* max - min fits a 32-bit long */
+	return 0;
+}
+
+static int health_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	long *v = uv->value.integer.value;
+
+	v[0] = chip->corb_timeouts;
+	v[1] = chip->rirb_never;
+	v[2] = chip->rirb_stray;
+	v[3] = chip->rirb_badwp;
+	v[4] = atomic_read(&chip->bdl_leaks);
+	v[5] = chip->rirb_late;
+	v[6] = chip->rirb_late_max_us;
+	v[7] = READ_ONCE(chip->rt_free_true);	/* the heartbeat measures it */
+	return 0;
+}
+
+static const struct snd_kcontrol_new health_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Driver Health",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.info = health_info,
+	.get = health_get,
+};
+
+void creative_ae9_health_notify(struct creative_chip *chip)
+{
+	if (chip->health_ctl && chip->card && !chip->unloading)
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->health_ctl->id);
+}
+
 static int answer_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	uv->value.integer.value[0] = !creative_ae9_dead(snd_kcontrol_chip(kc));
@@ -5321,6 +5485,10 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->answer_ctl = snd_ctl_new1(&answer_control, chip);
 	if (snd_ctl_add(chip->card, chip->answer_ctl) < 0)
 		chip->answer_ctl = NULL;
+	chip->rt_free_true = -1;
+	chip->health_ctl = snd_ctl_new1(&health_control, chip);
+	if (snd_ctl_add(chip->card, chip->health_ctl) < 0)
+		chip->health_ctl = NULL;
 	chip->hu_disp_ctl = snd_ctl_new1(&hu_disp_control, chip);
 	if (snd_ctl_add(chip->card, chip->hu_disp_ctl) < 0)
 		chip->hu_disp_ctl = NULL;
@@ -5354,6 +5522,10 @@ static void creative_ae9_hb_work(struct work_struct *work)
 
 	if (READ_ONCE(chip->unloading))
 		return;
+	/* "Driver Health" [7]: at most every 30 s (cheap no-op otherwise) */
+	if (chip->dsp_done && (!chip->rt_free_at ||
+			       time_after(jiffies, chip->rt_free_at + 30 * HZ)))
+		ae9_rt_true_free(chip, false);
 
 	if (chip->dsp_done && chip->hu_paused &&
 	    time_before(jiffies, chip->hu_pause_until)) {
@@ -6142,6 +6314,7 @@ err_card:
 	snd_card_free(chip->card);
 	chip->card = NULL;
 	chip->answer_ctl = NULL;
+	chip->health_ctl = NULL;
 	chip->fx.nkc = 0;
 err_hw:
 	creative_ae9_set_unloading(chip);
@@ -6429,6 +6602,7 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 		snd_card_free(chip->card);
 		chip->card = NULL;
 		chip->answer_ctl = NULL;	/* freed with the card */
+		chip->health_ctl = NULL;
 		chip->fx.nkc = 0;		/* its kcontrols too */
 	}
 	/* anything an ALSA callback re-armed before the card's disconnect

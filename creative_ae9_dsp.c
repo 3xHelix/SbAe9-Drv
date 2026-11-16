@@ -1709,6 +1709,7 @@ out:
 	if (stuck) {
 		dev_warn(chip->dev, "overlay: the transfer stream didn't stop; its buffer and BDL are kept, not freed (%d kept)\n",
 			 atomic_inc_return(&chip->bdl_leaks));
+		creative_ae9_health_notify(chip);
 	}
 	if (buf && !stuck)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);

@@ -58,7 +58,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.11-rc1"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.11-rc2"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -439,6 +439,9 @@ struct creative_chip {
 	int			hu_display_to;	/* pending display on/off, -1 none */
 	struct snd_kcontrol	*hu_disp_ctl;
 	struct snd_kcontrol	*answer_ctl;	/* "Card Answering" */
+	struct snd_kcontrol	*health_ctl;	/* "Driver Health" */
+	int			rt_free_true;	/* router slots in no router-chip list; -1 = not measured */
+	unsigned long		rt_free_at;	/* jiffies of that measurement */
 	bool			hu_st07_valid;
 	u8			hu_st07;	/* 83 01 07 reply byte, logged on change */
 	struct snd_kcontrol	*hu_out_ctl;
@@ -478,6 +481,7 @@ void creative_ae9_dead_notify(struct creative_chip *chip);
 void creative_ae9_dma_dump(struct creative_chip *chip, const char *why);
 void creative_ae9_dma_quiesce(struct creative_chip *chip);
 void creative_ae9_dead_work(struct work_struct *w);
+void creative_ae9_health_notify(struct creative_chip *chip);
 
 /* For control writes: the card dropped off the bus or stopped answering
  * (corb.c): nothing can be applied, say so (-ENODEV) instead of storing

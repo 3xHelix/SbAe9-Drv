@@ -144,6 +144,7 @@ static bool ae9_bdl_may_free(struct creative_chip *chip, unsigned int base,
 			return true;
 		dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x registers unreadable (%s): its BDL is kept, not freed (%d kept)\n",
 				     base, what, atomic_inc_return(&chip->bdl_leaks));
+		creative_ae9_health_notify(chip);
 		return false;
 	} else if (hi != upper_32_bits(bdl) ||
 		   ((lo & ~0x7fU) != want && (lo & ~0x7fU) != want_al)) {
@@ -153,6 +154,7 @@ static bool ae9_bdl_may_free(struct creative_chip *chip, unsigned int base,
 	}
 	dev_warn_ratelimited(chip->dev, "dma: SD 0x%03x didn't stop (%s): its BDL is kept, not freed (%d kept)\n",
 			     base, what, atomic_inc_return(&chip->bdl_leaks));
+	creative_ae9_health_notify(chip);
 	return false;
 }
 
