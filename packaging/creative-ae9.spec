@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.11
+Version:        0.12.12
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -103,6 +103,14 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Tue Nov 17 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.12-1
+- Driver 0.12.12: every command list the driver sends the card is now
+  readable C instead of replayed tables (the card gets exactly the same
+  commands as 0.12.11, proven offline and on the card); a late card answer
+  is caught when it lands instead of timing out; router-chip values only
+  from the task that selected the setting; 42 module options removed
+  (diagnostics, always-on fallbacks, fixed timings), 38 left.
+
 * Sun Nov 15 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.11-1
 - Driver 0.12.11: DSP mode plays at full level (it was 6 dB quiet and only
   half the samples reached the DACs; DSP mode is now 6 dB louder at the

@@ -23,7 +23,6 @@
 /* Per the 0x0071 verb capture: Windows uses stream descriptor index 4
  * (BAR0+0x100) with stream tag 1, bound to DAC node 0x02 on codec 1.
  */
-#define CREATIVE_PCM_STREAM_TAG	1
 #define CREATIVE_PCM_STREAM_BASE	0x100	/* stream descriptor index 4 */
 /* separate optical out: stream descriptor 6, tag 3, what Windows' rule
  * (lowest free output descriptor, tag = descriptor - 3) gives with SD4
@@ -48,32 +47,11 @@
  * errors. 8 (default since 2026-11-05) lets it pick a buffer several
  * quanta long; PipeWire keeps ~21 ms periods, so interrupts (46/s) and
  * latency stay the same. Windows uses 2 entries at 48 kHz stereo, up to
- * 24 for bigger streams. Writable: takes effect at the next stream open. pcm_nowakeup=1 lets PipeWire turn
- * period interrupts off (SNDRV_PCM_INFO_NO_PERIOD_WAKEUP, as
- * snd_hda_intel does); it runs on its own timer anyway.
+ * 24 for bigger streams. Writable: takes effect at the next stream open.
  */
 static unsigned int pcm_periods = 8;
 module_param(pcm_periods, uint, 0644);
 MODULE_PARM_DESC(pcm_periods, "Most playback periods per buffer, 2-32 (default 8; 2 = Windows' 48 kHz layout)");
-static bool pcm_nowakeup;
-module_param(pcm_nowakeup, bool, 0644);
-MODULE_PARM_DESC(pcm_nowakeup, "Let apps disable playback period interrupts (0 = no, default)");
-
-/*
- * DMA position buffer (HD-Audio spec 3.3.32, DPLBASE): the controller
- * writes each stream's DMA read position to memory. LPIB, our pointer, is
- * the position going out on the link; the DMA has already fetched ahead
- * of it, and at tiny PipeWire quantums PipeWire wrote into audio the card
- * had already fetched (static, no xrun). The cure is PipeWire headroom
- * (README, scripts/ae9-headroom.sh). 1 = log the DMA-LPIB gap every 2 s;
- * the pointer always stays LPIB. Writable; takes effect at the next
- * stream start. Reporting the DMA position as the pointer was tried
- * (2026-11-05) and dropped: it moves in ~100-frame jumps, and with
- * headroom in place it only added underruns at 192/384 kHz.
- */
-static unsigned int pcm_posbuf;
-module_param(pcm_posbuf, uint, 0644);
-MODULE_PARM_DESC(pcm_posbuf, "DMA position buffer: 0 off (default), 1 log how far the DMA reads ahead of LPIB");
 
 /*
  * dma_trace=1: log every stream's buffer and BDL address at prepare, for
@@ -300,76 +278,6 @@ void creative_ae9_dead_work(struct work_struct *w)
 	dev_err(chip->dev, "card stopped answering: %u open stream(s) disconnected\n", n);
 }
 
-static void ae9_posbuf_off(struct creative_chip *chip)
-{
-	if (!chip->posbuf)
-		return;
-	/* stop the controller writing before the memory goes away */
-	creative_hda_writel(chip, AZX_REG_DPLBASE, 0);
-	creative_hda_writel(chip, AZX_REG_DPUBASE, 0);
-	creative_hda_readl(chip, AZX_REG_DPLBASE);
-	dma_free_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE), chip->posbuf, chip->posbuf_dma);
-	chip->posbuf = NULL;
-}
-
-static void ae9_posbuf_on(struct creative_chip *chip)
-{
-	if (!pcm_posbuf) {
-		ae9_posbuf_off(chip);
-		return;
-	}
-	if (!chip->posbuf) {
-		chip->posbuf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE),
-						  &chip->posbuf_dma, GFP_KERNEL);
-		if (!chip->posbuf) {
-			dev_warn(chip->dev, "posbuf: no memory, staying on LPIB\n");
-			return;
-		}
-	}
-	memset(chip->posbuf, 0, PAGE_SIZE);
-	chip->pb_min = U32_MAX;
-	chip->pb_max = chip->pb_n = chip->pb_last = chip->pb_moves = 0;
-	chip->pb_sum = 0;
-	chip->pb_next = jiffies + 2 * HZ;
-	creative_hda_writel(chip, AZX_REG_DPUBASE, upper_32_bits(chip->posbuf_dma));
-	creative_hda_writel(chip, AZX_REG_DPLBASE,
-			    lower_32_bits(chip->posbuf_dma) | AZX_DPLBASE_ENABLE);
-}
-
-/* the read-ahead stats: DMA position vs LPIB for this stream */
-static void ae9_posbuf_read(struct creative_chip *chip, u32 lpib, u32 bufsz,
-			    unsigned int frame_bytes)
-{
-	unsigned int idx = (chip->playback_stream_base - 0x80) / 0x20;
-	u32 dma = le32_to_cpu(READ_ONCE(((__le32 *)chip->posbuf)[idx * 2]));
-	u32 gap;
-
-	if (dma != chip->pb_last)
-		chip->pb_moves++;
-	chip->pb_last = dma;
-	if (dma < bufsz && lpib < bufsz) {
-		gap = (dma + bufsz - lpib) % bufsz;
-		chip->pb_min = min(chip->pb_min, gap);
-		chip->pb_max = max(chip->pb_max, gap);
-		chip->pb_sum += gap;
-		chip->pb_n++;
-	}
-	if (time_after(jiffies, chip->pb_next)) {
-		if (chip->pb_n && frame_bytes)
-			dev_info(chip->dev, "posbuf: DMA ahead of LPIB by %u-%u bytes (avg %llu) = %u-%u frames, %u samples, DMA position %s\n",
-				 chip->pb_min, chip->pb_max, div_u64(chip->pb_sum, chip->pb_n),
-				 chip->pb_min / frame_bytes, chip->pb_max / frame_bytes,
-				 chip->pb_n, chip->pb_moves ? "updating" : "NOT updating");
-		else
-			dev_info(chip->dev, "posbuf: no samples (DMA position 0x%x, %s)\n",
-				 dma, chip->pb_moves ? "updating" : "NOT updating");
-		chip->pb_min = U32_MAX;
-		chip->pb_max = chip->pb_n = chip->pb_moves = 0;
-		chip->pb_sum = 0;
-		chip->pb_next = jiffies + 2 * HZ;
-	}
-}
-
 /*
  * Build the 16-bit SDnFMT value (HD-Audio spec 3.7.1, same as the codec's
  * converter format):
@@ -502,7 +410,7 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 /*
  * pcm_rates: 0 = playback at 48 kHz only, as Windows' captured start
  * block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the way
- * Windows does it (creative_ae9_cold_pcm_replay). 2 (default) = also 44.1
+ * Windows does it (creative_ae9_playback_seq). 2 (default) = also 44.1
  * and 88.2 kHz, stereo, through the card's sample-rate converter. These
  * played silent or garbled until the DAC got Windows' 44.1 kHz-family
  * commands (dac_441, 2026-11-06). PipeWire resamples 44.1 kHz files when
@@ -870,8 +778,6 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
-	if (pcm_nowakeup)
-		runtime->hw.info |= SNDRV_PCM_INFO_NO_PERIOD_WAKEUP;
 
 	/* ALSA's default thresholds (start_threshold = 1 underran at once).
 	 * Windows: node 0x02 format 0x31 (2 ch, 24-bit, 48 kHz) and a 2-entry
@@ -1010,16 +916,12 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 }
 
 /*
- * pcm_stop_block: send Windows' playback stop block when the stream is
- * released (1, default) or leave the DSP stream set up (0). Restarts
- * ~110-130 s after a stop came up silent (shorter and much longer gaps
- * were fine), as if the stop starts a timer inside the card; 0 tests
- * whether skipping the stop avoids it. Writable at runtime.
+ * Release: Windows' playback stop block. Restarts ~110-130 s after a stop
+ * came up silent (shorter and much longer gaps were fine), as if the stop
+ * block starts a timer inside the card (2026-11-02); leaving the DSP
+ * stream set up at release instead, to test that, was the pcm_stop_block
+ * option until 0.12.12.
  */
-static unsigned int pcm_stop_block = 1;
-module_param(pcm_stop_block, uint, 0644);
-MODULE_PARM_DESC(pcm_stop_block, "Send Windows' playback stop block at stream release (1=yes, default; 0=skip)");
-
 static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
@@ -1030,14 +932,10 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	chip->pb_format = 0;
 	ae9_spdif_out_apply(chip);	/* mirror off (unless optical has its own) */
 	if (chip->pcm_start_sent) {
-		if (pcm_stop_block)
-			creative_ae9_cold_pcm_replay(chip, false, false, 0, 0);
-		else
-			dev_info(chip->dev, "PCM hw_free: stop block skipped (pcm_stop_block=0)\n");
+		creative_ae9_playback_seq(chip, false, 0, 0);
 		chip->pcm_start_sent = 0;
 	}
 
-	ae9_posbuf_off(chip);
 	if (chip->playback_bdl_raw) {
 		if (ae9_bdl_may_free(chip, chip->playback_stream_base, chip->playback_bdl_dma,
 				     "playback hw_free"))
@@ -1134,7 +1032,6 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->playback_bdl_dma));
 	ae9_dma_trace_prep(chip, "playback", base, substream, chip->playback_bdl_dma);
-	ae9_posbuf_on(chip);
 
 	/* Windows' playback-start block sets format 0x31 and binds node
 	 * 0x02 to tag 1 itself. Once per open: xrun recovery re-prepares,
@@ -1142,7 +1039,7 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	 * DSP. */
 	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate ||
 	    chip->pcm_start_fmt != format) {
-		creative_ae9_cold_pcm_replay(chip, true, false, runtime->rate, format);
+		creative_ae9_playback_seq(chip, true, runtime->rate, format);
 		if (chip->mic_level != 99)
 			creative_ae9_mic_level_apply(chip);
 		chip->pcm_start_sent = 1;
@@ -1199,6 +1096,16 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 /* ------------------------------------------------------------------ */
 /* pointer — report current DMA position				  */
 /* ------------------------------------------------------------------ */
+/*
+ * LPIB is the position going out on the link; the DMA has already fetched
+ * ahead of it (measured with the DMA position buffer, HD-Audio spec
+ * 3.3.32, through the pcm_posbuf option, removed in 0.12.12), and at tiny
+ * PipeWire quantums PipeWire wrote into audio the card had already fetched
+ * (static, no xrun). The cure is PipeWire headroom (README,
+ * scripts/ae9-headroom.sh). Reporting the DMA position as the pointer was
+ * tried (2026-11-05) and dropped: it moves in ~100-frame jumps, and with
+ * headroom in place it only added underruns at 192/384 kHz.
+ */
 
 static snd_pcm_uframes_t
 creative_ae9_pcm_pointer(struct snd_pcm_substream *substream)
@@ -1209,9 +1116,6 @@ creative_ae9_pcm_pointer(struct snd_pcm_substream *substream)
 
 	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	wmb();
-	if (chip->posbuf)	/* pcm_posbuf: read-ahead stats only */
-		ae9_posbuf_read(chip, pos, snd_pcm_lib_buffer_bytes(substream),
-				frames_to_bytes(substream->runtime, 1));
 	/* Mask to buffer size to prevent pos == buffer_size (invalid to ALSA) */
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
 		pos = 0;
@@ -1249,8 +1153,6 @@ static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
 	chip->opt_substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			   SNDRV_PCM_INFO_INTERLEAVED;
-	if (pcm_nowakeup)
-		runtime->hw.info |= SNDRV_PCM_INFO_NO_PERIOD_WAKEUP;
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE;
 	runtime->hw.channels_min = 2;
 	runtime->hw.channels_max = 2;
@@ -1677,7 +1579,7 @@ static int creative_ae9_cap_hw_free(struct snd_pcm_substream *substream)
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 
 	if (chip->cap_start_sent) {
-		creative_ae9_cap_replay(chip, false);
+		creative_ae9_capture_seq(chip, false);
 		chip->cap_start_sent = 0;
 	}
 	chip->cv.mon_bound = false;	/* the stop block unbound it */
@@ -1736,9 +1638,11 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU, upper_32_bits(bdl_dma));
 	ae9_dma_trace_prep(chip, "mic", base, substream, bdl_dma);
 
-	/* Windows' start block once per open (re-prepares after an xrun
+	/*
+	 * Windows' start block once per open (re-prepares after an xrun
 	 * must not resend it), with node 0x07 given this recording's format
-	 * before its bind (see creative_ae9_cap_replay) */
+	 * before its bind (see creative_ae9_capture_seq)
+	 */
 	chip->cap_format = creative_ae9_stream_format(runtime->channels, cap_bits_now(),
 						      runtime->rate);
 	/* Voice Clarity: the voice processor in BEFORE Windows' start block

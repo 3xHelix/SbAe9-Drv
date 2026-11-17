@@ -19,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/hrtimer.h>
+#include <linux/bitmap.h>
 #include <sound/core.h>
 #include <sound/hda_register.h>
 
@@ -58,7 +59,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.11"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.12"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -156,13 +157,12 @@ struct creative_chip {
 						 * (the PCMs and card go away) */
 	atomic_t		bdl_leaks;	/* BDLs kept: their stream didn't stop */
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
-	bool			rings_deferred;	/* start CORB/RIRB after the firmware
-						 * stream (fw_rings_off=1) */
 	size_t			dma_pad;	/* spare bytes after every DMA buffer */
 	void __iomem		*ext_regs;	/* BAR2 */
 
 	spinlock_t		lock;
 	struct mutex		corb_mutex;	/* serialise CORB verb sends */
+	struct mutex		r51_mutex;	/* one router-chip param verb (wait, send, resend) at a time */
 	struct mutex		scp_mutex;	/* one SCP message at a time */
 	struct mutex		replay_mutex;	/* one captured verb block at a time */
 	struct mutex		ca0113_mutex;	/* one CA0113 command list at a time */
@@ -184,6 +184,15 @@ struct creative_chip {
 	u16			corb_wp;
 	/* Last RIRB read pointer (for response processing) */
 	u16			rirb_rp;
+	/* RIRB slots given up on (not landed after RIRB_LATE_US) and watched
+	 * until they land or the ring has moved on (corb.c, rirb_sweep) */
+	DECLARE_BITMAP(rirb_watch, CREATIVE_RIRB_ENTRIES);
+	unsigned int		rirb_nwatch;
+	int			rirb_send_wp;	/* RIRBWP when the verb in flight was sent; -1 = none */
+	int			rirb_wp0;	/* RIRBWP when the ring was marked at init, until rirb_rp is seeded; -1 = none */
+	int			rirb_held;	/* rirb_inject: slot whose landed entry is held back; -1 = none */
+	u32			rirb_held_res, rirb_held_fl;
+	ktime_t			rirb_held_until;
 
 	/* IRQ */
 	int			irq;
@@ -204,12 +213,6 @@ struct creative_chip {
 	unsigned int		playback_period_size;
 	unsigned int		playback_stream_tag;
 	unsigned int		playback_stream_base; /* SDO offset in BAR0 */
-	/* DMA position buffer (pcm_posbuf): where the DMA has read to */
-	void			*posbuf;
-	dma_addr_t		posbuf_dma;
-	u32			pb_min, pb_max, pb_n, pb_last, pb_moves;
-	u64			pb_sum;
-	unsigned long		pb_next;
 	struct snd_pcm_substream *playback_substream; /* for period_elapsed */
 	/* capture (input stream 0, XLR via codec 1 node 0x07) */
 	struct snd_pcm_substream *capture_substream;
@@ -369,7 +372,13 @@ struct creative_chip {
 	unsigned int		rirb_never;	/* entries that hadn't landed after RIRB_LATE_US */
 	unsigned int		rirb_stray;	/* answers from the other codec, skipped */
 	unsigned int		rirb_badwp;	/* RIRBWP read all-ones on a card still there */
+	unsigned int		rirb_wlanded;	/* given-up slots that landed later (read and marked) */
+	unsigned int		rirb_wanswer;	/* ...of which the answer to the verb in flight, used */
+	unsigned int		rirb_wexpired;	/* watched slots that never landed (watch ended) */
+	unsigned int		rirb_injected;	/* rirb_inject test give-ups */
 	int			r51_sel;	/* router-chip param index the 8051 took last (0x717), -1 = none or lost */
+	const void		*r51_owner;	/* task that sent that select (compared, never dereferenced) */
+	unsigned int		r51_crossed;	/* values refused: another task's select came between */
 	bool			r51_stuck;	/* its busy status never cleared: one status read per verb until it does */
 	unsigned int		r51_refused;	/* router-chip param verbs refused busy and sent again */
 	unsigned int		r51_lost;	/* ... still refused after the retries */
@@ -538,6 +547,9 @@ void creative_ae9_corb_free(struct creative_chip *chip);
 int  creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb);
 int creative_ae9_corb_send_verb_sync(struct creative_chip *chip,
 				     u32 verb, u32 *resp);
+/* debugfs: a router-chip value may follow a select sent by another process */
+int creative_ae9_corb_send_verb_dbg(struct creative_chip *chip,
+				    u32 verb, u32 *resp);
 
 /* creative_ae9_i2c.c */
 int creative_i2c_dsp_init(struct creative_chip *chip);
@@ -556,25 +568,75 @@ u32 creative_ae9_verb(unsigned int cad, unsigned int nid,
 		      unsigned int verb_id, unsigned int payload);
 int creative_ae9_hw_reset(struct creative_chip *chip);
 
+/*
+ * The start-up tail (creative_ae9_seq.c, creative_ae9_tail()): what it sent,
+ * for the summary line, and the DSP messages that failed or were skipped,
+ * for creative_ae9_tail_resend()
+ */
+#define AE9_TAIL_RETRY_MAX	64
+
+struct ae9_tail_msg {
+	u32 hdr, val;
+};
+
+struct ae9_tail {
+	unsigned int msgs, msg_err, msg_skipped, msg_dropped, verbs, verb_err;
+	unsigned int consec_err;		/* DSP messages failed in a row */
+	unsigned int nretry;
+	struct ae9_tail_msg *retry;		/* AE9_TAIL_RETRY_MAX, or NULL: none kept */
+};
+
+/* a head-unit frame: f0 <command> <length> <length bytes> f7 (i2c.c; creative_ae9_seq_run.c) */
+struct ae9_hu_frame {
+	u8 len;
+	u8 d[13];
+};
+
+/* creative_ae9_seq.c, creative_ae9_seq_run.c: Windows' command sequences, as code */
+int creative_ae9_cold_verb(struct creative_chip *chip, u32 verb, u32 *resp);
+#define AE9_RAMP_N	7	/* analog ramp status bytes (ae9_ramp_xram) */
+extern const u16 ae9_ramp_xram[];	/* sized by its initializer, checked in seq.c */
+bool ae9_ramp_failed(const int ramp[AE9_RAMP_N]);
+bool creative_ae9_recovery_pass(struct creative_chip *chip, int ramp[AE9_RAMP_N]);
+void creative_ae9_predownload(struct creative_chip *chip);
+void creative_ae9_dl_prefix(struct creative_chip *chip);
+void creative_ae9_cap_start(struct creative_chip *chip, bool route_vc);
+void creative_ae9_capture_seq(struct creative_chip *chip, bool start);
+void creative_ae9_playback_seq(struct creative_chip *chip, bool start,
+			       unsigned int rate, u16 format);
+void creative_ae9_dsp_route_on(struct creative_chip *chip, bool release18);
+void creative_ae9_dsp_route_off(struct creative_chip *chip);
+void creative_ae9_stream_release(struct creative_chip *chip, u8 sid);
+void creative_ae9_dsp_in_channels(struct creative_chip *chip, u16 format);
+void creative_ae9_dsp_bind(struct creative_chip *chip, u16 format);
+void creative_ae9_dsp_unbind(struct creative_chip *chip);
+void creative_ae9_dsp_rebind(struct creative_chip *chip, u16 format);
+void creative_ae9_out_switch(struct creative_chip *chip, bool hp, bool lo_virt);
+void creative_ae9_out_jack(struct creative_chip *chip, bool lo);
+void creative_ae9_power_down(struct creative_chip *chip, bool cold);
+void creative_ae9_post_dsp_setup(struct creative_chip *chip);
+#define AE9_HU_POLL_FRAMES	15	/* Windows' head-unit poll: creative_ae9_hu_poll[] */
+/* sized by its initializer, checked in seq_run.c */
+extern const struct ae9_hu_frame *const creative_ae9_hu_poll[];
+int creative_ae9_hu_setup_again(struct creative_chip *chip, bool light, bool jack_on,
+				bool display);
+void creative_ae9_bar2_init_windows(struct creative_chip *chip);
+void creative_ae9_tail(struct creative_chip *chip, struct ae9_tail *t);
+void creative_ae9_tail_resend(struct creative_chip *chip, struct ae9_tail *t);
+
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
 			      unsigned int addx, unsigned int data);
-void creative_dsp_dbg_block_log(struct creative_chip *chip, const char *when);
 int creative_dsp_chipio_read(struct creative_chip *chip,
 			     unsigned int addx, unsigned int *data);
 int creative_dsp_prepare(struct creative_chip *chip);
 int creative_dsp_load_firmware(struct creative_chip *chip);
 void creative_ae9_vlog(u32 val, u32 ex, bool is_resp);
-void creative_ae9_cold_pcm_replay(struct creative_chip *chip, bool start, bool atomic,
-				  unsigned int rate, u16 format);
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
-void creative_ae9_cap_replay(struct creative_chip *chip, bool start);
-void creative_ae9_cap_start(struct creative_chip *chip, bool route_vc);
 void creative_ae9_cap_irq(struct creative_chip *chip);
 void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i);
 void creative_ae9_opt_irq(struct creative_chip *chip);
-extern unsigned int ae9_sentinel_clear;
 int creative_dsp_out_mute_get(struct creative_chip *chip, u32 *val);
 int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
@@ -612,6 +674,7 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip);
  * Voice Clarity master alone is UI-only (cap4: master on, nothing on ->
  * conns 96 kHz, no route) */
 #define CREATIVE_CAP_STREAM_TAG	1	/* mic capture stream tag (ADC 0x07 bind) */
+#define CREATIVE_PCM_STREAM_TAG	1	/* playback stream tag (converter 0x02 bind) */
 #define AE9_CV_WANT(c)	((c)->cv.on && ((c)->cv.fx[0] || (c)->cv.fx[1] || \
 			 (c)->cv.fx[2] || (c)->cv.miceq || (c)->cv.voicefx))
 void creative_ae9_fx_restore(struct creative_chip *chip);
@@ -627,10 +690,16 @@ void creative_ae9_fx_spk_follow_work(struct work_struct *w);
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip);
 void creative_ae9_dsp_mode(struct creative_chip *chip, bool dsp);
 void creative_ae9_dsp_mode_start(struct creative_chip *chip, u16 format);
-void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
-				size_t n, const char *what);
-void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
-				      const u8 (*cmds)[3], size_t n);
+void creative_ae9_rt_direct_walk(struct creative_chip *chip, unsigned int nslots, bool six);
+void creative_ae9_rt_dsp_dac_off_all(struct creative_chip *chip, const char *why);
+int creative_ae9_streams_drain(struct creative_chip *chip, const char *why);
+void creative_ae9_hu_ae9_hold(struct creative_chip *chip);
+/* the audio router (ChipIO 0x190000..): 1 here applies the table after route changes */
+#define AE9_RT_APPLY		0x19042c
+void creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
+			      size_t n, const char *what);
+void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
+				    const u8 (*cmds)[3], size_t n);
 u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 
 /* ------------------------------------------------------------------ */

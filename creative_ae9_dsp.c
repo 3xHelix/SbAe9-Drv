@@ -47,105 +47,28 @@
  * 0x800000-0x8000fc holds the firmware's SCP queue pointers. It reads
  * 0x0bad0add on real hardware too, not only under QEMU. Zeroing it while
  * the firmware runs (as the old code did right after boot) wipes those
- * pointers. Windows never touches this region.
+ * pointers. Windows never touches this region, and neither do we (the
+ * sentinel_clear option that zeroed it was removed in 0.12.12).
  */
-unsigned int ae9_sentinel_clear;
-module_param_named(sentinel_clear, ae9_sentinel_clear, uint, 0444);
-MODULE_PARM_DESC(sentinel_clear, "Zero 0x800000-0x8000fc when it reads 0x0bad0add: 1=before download and after boot (old), 2=before download only, 0=never (default)");
 
 /*
- * scp_event=1: handle SCP replies the way the Windows capture does. The
- * DSP announces each reply with an unsolicited response; Windows only
- * then reads it (0x702/0xF01/0xF02 header, 0x704 p=2/0xF01/0xF04 count,
+ * SCP replies are handled the way the Windows capture does. The DSP
+ * announces each reply with an unsolicited response; Windows only then
+ * reads it (0x702/0xF01/0xF02 header, 0x704 p=2/0xF01/0xF04 count,
  * 0x702/0xF01/0xF02 per data word). In the capture all 160 post-reads
  * follow an announcement; our old path sent thousands speculatively
- * (queue drain before every message, polling for GET replies).
+ * (queue drain before every message, polling for GET replies). See
+ * scp_ev().
  */
-static unsigned int scp_event = 1;
-module_param(scp_event, uint, 0444);
-MODULE_PARM_DESC(scp_event, "Read SCP replies only after the DSP announces them, as Windows does (1=on, default)");
-
-/*
- * stream_rings_off=1: stop the command rings while a boot stream runs
- * (firmware download, overlay transfer) and send commands through the
- * immediate interface meanwhile; restart the rings after each. On an
- * ASMedia-bridged card the rings running alongside any stream took the
- * card off the bus (bugzilla 219552 round 2), each alone was fine.
- */
-static unsigned int stream_rings_off;
-module_param(stream_rings_off, uint, 0444);
-MODULE_PARM_DESC(stream_rings_off, "Stop the command rings during the boot streams (firmware, overlay) (1=yes; 0=no, default; diagnostic)");
-
-/*
- * fw_posbuf=1: turn on the DMA position buffer during the firmware
- * download, so the card writes to memory while the stream reads. With
- * the rings off this tells whether any card write during a stream (the
- * RIRB is the card's other writer) takes an ASMedia bridge down.
- */
-static unsigned int fw_posbuf;
-module_param(fw_posbuf, uint, 0444);
-MODULE_PARM_DESC(fw_posbuf, "DMA position buffer on during the firmware download (1=yes; 0=no, default; diagnostic)");
-
-/* stream_rings_off: park the rings before a stream; true when parked */
-static bool ae9_rings_park(struct creative_chip *chip, const char *what)
-{
-	unsigned int t;
-
-	if (!stream_rings_off || !chip->corb_buf || chip->card_gone)
-		return false;
-	creative_ae9_corb_free(chip);
-	/* wait for both ring engines to report stopped (RUN bits clear) */
-	for (t = 0; t < 100; t++) {
-		if (!(creative_hda_readb(chip, AZX_REG_CORBCTL) & 0x02) &&
-		    !(creative_hda_readb(chip, AZX_REG_RIRBCTL) & 0x02))
-			break;
-		udelay(10);
-	}
-	/* re-arm the immediate interface the way the bring-up does before
-	 * the rings first start: once the rings have run, it stays busy
-	 * (IRS=0x5) until this is done again (tested on the IDT card) */
-	creative_hda_writeb(chip, AZX_REG_IRS, 0x5);
-	creative_hda_writeb(chip, AZX_REG_IRS, 0x0);
-	creative_hda_writeb(chip, AZX_REG_IRS, 0x4);
-	chip->last_irs_ack = 0x6;
-	dev_info(chip->dev, "%s: command rings stopped for the stream (%u us; IRS now 0x%04x)\n",
-		 what, t * 10, creative_hda_readw(chip, AZX_REG_IRS));
-	return true;
-}
-
-static int ae9_rings_unpark(struct creative_chip *chip, const char *what)
-{
-	int ret;
-
-	if (chip->card_gone)
-		return -ENODEV;
-	ret = creative_ae9_corb_init(chip);
-	dev_info(chip->dev, "%s: command rings back after the stream: %d\n", what, ret);
-	if (creative_ae9_gone(chip, what))
-		return -ENODEV;
-	return ret;
-}
-
-/*
- * fw_verify=1: after the firmware download and before starting the DSP,
- * read samples of every segment back through ChipIO and compare them with
- * the image. Done while the DSP is still halted, so data memory hasn't
- * been touched by running firmware yet.
- */
-static unsigned int fw_verify;
-module_param(fw_verify, uint, 0444);
-MODULE_PARM_DESC(fw_verify, "Read back the downloaded firmware before starting the DSP and compare (1=on)");
 
 #define DSPLOAD_BDL_BYTES	1024	/* room for 64 entries */
 
 /*
- * overlay=1: during the boot handshake, after state 3, transfer the overlay
- * image (ctefx-ae9-overlay.bin, the second FLS image in CtxHda.sys; see
- * extract_overlay.py) the way the cold-boot capture does (seq 4468-4845).
+ * During the boot handshake, after state 3, the overlay image
+ * (ctefx-ae9-overlay.bin, the second FLS image in CtxHda.sys; see
+ * extract_overlay.py) is transferred the way the cold-boot capture does
+ * (seq 4468-4845).
  */
-static unsigned int overlay = 1;
-module_param(overlay, uint, 0444);
-MODULE_PARM_DESC(overlay, "Transfer the DSP overlay image (ctefx-ae9-overlay.bin) during the boot handshake (1=on, default)");
 #define AE9_OVERLAY_FILE	"ctefx-ae9-overlay.bin"
 
 /*
@@ -154,11 +77,10 @@ MODULE_PARM_DESC(overlay, "Transfer the DSP overlay image (ctefx-ae9-overlay.bin
  * (FUN_00014ea8: 0x0c = 3/4/5/0, each polled for 2 s) fails, it sends
  * DSP_INIT (DSPIO 0x703) until the reply isn't 1 (FUN_0001b024), waits
  * 0.5 s and downloads again: 3 downloads in all. No shutdown, no power
- * cycle. dsp_soft_tries = downloads per bring-up (1 = old behaviour).
+ * cycle. AE9_DSP_SOFT_TRIES = downloads per bring-up (before 0.12.4: 1;
+ * the dsp_soft_tries option until 0.12.12).
  */
-static unsigned int dsp_soft_tries = 3;
-module_param(dsp_soft_tries, uint, 0644);
-MODULE_PARM_DESC(dsp_soft_tries, "DSP downloads per bring-up when one fails, with Windows' DSP_INIT + 0.5 s between them (3 = Windows, default; 1 = none)");
+#define AE9_DSP_SOFT_TRIES	3
 
 /*
  * Test only: make the next DSP load(s) fail on purpose, to exercise the
@@ -178,12 +100,13 @@ static bool dsp_fail_fast(struct creative_chip *chip)
 	return chip->resuming || chip->dsp_soft_left;
 }
 
-/* wait between a CA0113 command's value write and its commit: 20 ms for
- * the boot commands; volume changes (replay_quiet) use hu_cmd_settle_us */
+/*
+ * Wait between a CA0113 command's value write and its commit: 20 ms for
+ * the boot commands; volume changes (replay_quiet) use 4 ms (the
+ * hu_cmd_settle_us option until 0.12.12).
+ */
 #define CA0113_SETTLE_US	20000
-static unsigned int hu_cmd_settle_us = 4000;
-module_param(hu_cmd_settle_us, uint, 0644);
-MODULE_PARM_DESC(hu_cmd_settle_us, "post_windows: CA0113 settle time for volume changes (us)");
+#define CA0113_VOL_SETTLE_US	4000
 
 /*
  * After the voice processor is routed in (VIP source 1), the DSP takes no
@@ -194,37 +117,14 @@ MODULE_PARM_DESC(hu_cmd_settle_us, "post_windows: CA0113 settle time for volume 
  * (28 route-ins in 4 captures). Hold any DSP message this long after a
  * route-in (0 = off).
  */
-/* Off by default: Windows' order (route-in just before the bind) and the
+/* Off: Windows' order (route-in just before the bind) and the
  * level block once per DSP load already end the route-in stalls (card
- * test 2026-11-09: 0 kicks in 12 takes with and without the hold) */
-static unsigned int vc_quiet_ms;
-module_param(vc_quiet_ms, uint, 0644);
-MODULE_PARM_DESC(vc_quiet_ms, "Hold DSP messages this long after Voice Clarity routes the mic in, as Windows (ms; default 0 = off)");
+ * test 2026-11-09: 0 kicks in 12 takes with and without the hold; the
+ * vc_quiet_ms option that set it was removed in 0.12.12) */
+#define AE9_VC_QUIET_MS		0
 
 #define CAD			1		/* main codec address */
-#define WIDGET_CHIP_CTRL	0x15
-#define WIDGET_DSP_CTRL		0x16
-
-/* ChipIO vendor verbs */
-#define VENDOR_CHIPIO_ADDRESS_LOW	0x000
-#define VENDOR_CHIPIO_ADDRESS_HIGH	0x100
-#define VENDOR_CHIPIO_DATA_LOW		0x300
-#define VENDOR_CHIPIO_DATA_HIGH		0x400
-#define VENDOR_CHIPIO_STATUS		0xF01
-#define VENDOR_CHIPIO_HIC_POST_READ	0x702
-#define VENDOR_CHIPIO_HIC_READ_DATA	0xF03
-#define VENDOR_CHIPIO_FLAG_SET		0x70F
-#define VENDOR_CHIPIO_PARAM_SET		0x710
-#define VENDOR_CHIPIO_8051_DATA_WRITE	0x707
-#define VENDOR_CHIPIO_PLL_PMU_WRITE	0x70C
-#define VENDOR_CHIPIO_8051_ADDRESS_LOW	0x70D
-#define VENDOR_CHIPIO_8051_ADDRESS_HIGH	0x70E
-#define VENDOR_CHIPIO_CT_EXTENSIONS_ENABLE 0x70A
-#define VENDOR_CHIPIO_STREAM_FORMAT	0x200
-#define VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET 0x711
-#define VENDOR_CHIPIO_PORT_ALLOC_SET	0x712
-#define VENDOR_CHIPIO_PORT_ALLOC_GET	0xF12
-#define VENDOR_CHIPIO_PORT_FREE_SET	0x713
+/* the ChipIO and DSPIO vendor verbs and control ids: ca0132_regs.h */
 #define MEM_CONNID_DSP			16
 #define DMA_TRANSFER_FRAME_SIZE_NWORDS	8
 #define INVALID_DMA_CHANNEL		(~0U)
@@ -272,14 +172,6 @@ static int fls_image_check(struct creative_chip *chip, const struct firmware *fw
 /* hda format field accessors */
 #define get_hdafmt_chs(fmt)	((fmt) & 0xf)
 #define get_hdafmt_rate(fmt)	(((fmt) >> 8) & 0x7f)
-
-/* DSPIO vendor verbs */
-#define VENDOR_DSPIO_SCP_WRITE_DATA_LOW	 0x000
-#define VENDOR_DSPIO_SCP_WRITE_DATA_HIGH 0x100
-#define VENDOR_DSPIO_STATUS		 0xF01
-#define VENDOR_DSPIO_SCP_POST_READ_DATA	 0x702
-#define VENDOR_DSPIO_SCP_READ_DATA	 0xF02
-#define VENDOR_DSPIO_DSP_INIT		 0x703
 
 /* status codes */
 #define VENDOR_STATUS_CHIPIO_OK		0x00
@@ -535,15 +427,12 @@ static int dspio_send(struct creative_chip *chip, unsigned int reg,
  * Rules here:
  * - wait out busy (1) before a word, up to 2 s; never write into busy
  * - a word answered 2 is sent again (low + high half) after a short pause,
- *   1, 2, 4, 8, 16, then 20 ms, until it goes in or 2 s have passed
- *   (scp_full_resend=1, default); scp_full_resend=0 counts it as sent
- *   (the old reading; diagnostic only, the word is lost)
+ *   1, 2, 4, 8, 16, then 20 ms, until it goes in or 2 s have passed (the
+ *   old reading counted it as sent and the word was lost; switchable with
+ *   scp_full_resend until 0.12.12)
  * - return 0 only for a word that went in, < 0 for one that did not; the
  *   caller (scp_send_words) keeps the rest of a cut message
  */
-static unsigned int scp_full_resend = 1;
-module_param(scp_full_resend, uint, 0644);
-MODULE_PARM_DESC(scp_full_resend, "A DSP word answered with 'command queue full' did not go in: send it again until it does (1 = default, as the router chip's program shows; 0 = count it as sent, the word is lost; diagnostic)");
 
 /* Test hook for the resend path (cards that never fill the queue): every
  * Nth word's first send stops after the low half and reports "full", as a
@@ -655,16 +544,12 @@ static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 			 * it, a suspect in the one Linux DSP halt (note 52d).
 			 */
 			creative_dsp_chipio_read(chip, DSP_DBGCNTL_INST_OFFSET, &dbg);
-			dev_warn_ratelimited(chip->dev, "DSP command queue full after word 0x%08x (DBGCNTL 0x%08x): %s (%u so far)\n",
-					     scp_data, dbg,
-					     scp_full_resend ? "sending it again" :
-					     "counted as sent", chip->scp_full_words);
+			dev_warn_ratelimited(chip->dev, "DSP command queue full after word 0x%08x (DBGCNTL 0x%08x): sending it again (%u so far)\n",
+					     scp_data, dbg, chip->scp_full_words);
 			kicked = true;
 			if (dsp_kick(chip) == -EIO)
 				return -EIO;	/* halted itself: don't wait */
 		}
-		if (!scp_full_resend)
-			return 0;
 		if (chip->card_gone)
 			return -ENODEV;
 		if (!time_before(jiffies, start + msecs_to_jiffies(SCP_ROOM_WAIT_MS))) {
@@ -804,10 +689,10 @@ static void scp_drain_announced(struct creative_chip *chip);
  * behind (see dspio_scp_unlocked). 0 = old behaviour, for comparison. */
 
 /* The DSP announces SCP replies through the RIRB: without running rings
- * (corb_rings=0, or fw_rings_off=1 before the rings start) poll instead. */
+ * (before they start, or after corb_free) poll instead. */
 static bool scp_ev(struct creative_chip *chip)
 {
-	return scp_event && chip->corb_buf;
+	return chip->corb_buf;
 }
 
 static void dspio_clear_response_queue(struct creative_chip *chip)
@@ -1059,7 +944,7 @@ static int dspio_scp(struct creative_chip *chip, int mod_id, int src_id,
 	if (time_before(jiffies, chip->scp_quiet_until)) {
 		unsigned long left = chip->scp_quiet_until - jiffies;
 
-		if (left <= msecs_to_jiffies(vc_quiet_ms)) {
+		if (left <= msecs_to_jiffies(AE9_VC_QUIET_MS)) {
 			ae9_dbg(chip, "scp 0x%02x/0x%02x held %u ms (voice processor route-in)\n",
 				mod_id, req, jiffies_to_msecs(left));
 			msleep(jiffies_to_msecs(left));
@@ -1548,19 +1433,9 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out);
 
 static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
 {
-	bool parked;
-	int ret, u;
-
 	if (chip->card_gone)
 		return -ENODEV;
-	parked = ae9_rings_park(chip, "overlay");
-	ret = dsp_overlay_xfer_once(chip, chan_out);
-	if (parked) {
-		u = ae9_rings_unpark(chip, "overlay");
-		if (u == -ENODEV)
-			return u;
-	}
-	return ret;
+	return dsp_overlay_xfer_once(chip, chan_out);
 }
 
 static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
@@ -2202,8 +2077,9 @@ static bool dsp_overlay_landed(struct creative_chip *chip, u32 *got)
  * MASTERCONTROL boot handshake, run by Windows straight after starting the
  * freshly downloaded firmware (capture seq 4576-5163, see
  * WINDOWS-CAPTURE-ANALYSIS.md). The overlay transfer Windows does between
- * the DMA channel alloc and free (GET 0x3a/0x3b) is not reproduced: its
- * payload isn't in the capture.
+ * the DMA channel alloc and free (GET 0x3a/0x3b) is reproduced with the
+ * image extract_overlay.py takes from CtxHda.sys (its payload isn't in the
+ * capture).
  */
 int creative_dsp_boot_handshake(struct creative_chip *chip)
 {
@@ -2220,30 +2096,27 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			return -ENODEV;
 		if (i == 1) {
 			/* Between states 3 and 4: DMA channel alloc, overlay
-			 * transfer (overlay=1), channel free, then 0x0b = 1,
-			 * as Windows does. */
-			ret = -ENOENT;
+			 * transfer, channel free, then 0x0b = 1, as Windows
+			 * does.
+			 */
+			u32 chk = 0;
+			bool landed;
+
 			chan = ~0U;
-			bool landed = false;
-
-			if (overlay) {
-				u32 chk = 0;
-
+			ret = dsp_overlay_xfer(chip, &chan);
+			landed = dsp_overlay_landed(chip, &chk);
+			if (!landed) {
+				/* free the channel, then go again */
+				dev_warn(chip->dev,
+					 "overlay: didn't land (ret=%d, check word 0x%08x), sending it again\n",
+					 ret, chk);
+				if (chan != ~0U)
+					scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);
+				chan = ~0U;
 				ret = dsp_overlay_xfer(chip, &chan);
 				landed = dsp_overlay_landed(chip, &chk);
-				if (!landed) {
-					/* free the channel, then go again */
-					dev_warn(chip->dev,
-						 "overlay: didn't land (ret=%d, check word 0x%08x), sending it again\n",
-						 ret, chk);
-					if (chan != ~0U)
-						scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);
-					chan = ~0U;
-					ret = dsp_overlay_xfer(chip, &chan);
-					landed = dsp_overlay_landed(chip, &chk);
-					dev_info(chip->dev, "overlay: second try ret=%d, %s (check word 0x%08x)\n",
-						 ret, landed ? "landed" : "STILL NOT landed", chk);
-				}
+				dev_info(chip->dev, "overlay: second try ret=%d, %s (check word 0x%08x)\n",
+					 ret, landed ? "landed" : "STILL NOT landed", chk);
 			}
 			/* an SCP error with the data in place still counts */
 			chip->overlay_sent = ret == 0 || landed;
@@ -2452,32 +2325,6 @@ static int dsp_dbgcntl_read_stable(struct creative_chip *chip, unsigned int *reg
 	return -EIO;
 }
 
-/*
- * DSP debug block, read only: 0x100e2c (low half = the live program
- * counter), DBGCNTL 0x100e30 (top half = the program counter) and 0x100e34
- * (0xf1000000 at run time: the firmware header and Windows write it; what
- * the DSP uses it for is open). Logged at the bring-up steps to learn its
- * power-on value and when it changes (debug_block_log=1, default 0).
- */
-static bool debug_block_log;
-module_param(debug_block_log, bool, 0644);
-MODULE_PARM_DESC(debug_block_log, "Log the DSP debug block (0x100e2c/30/34) at each bring-up step, read only (1 = yes; default 0)");
-
-void creative_dsp_dbg_block_log(struct creative_chip *chip, const char *when)
-{
-	static const unsigned int a[] = { 0x100e2c, 0x100e30, 0x100e34, 0x100e38 };
-	unsigned int v[ARRAY_SIZE(a)], i;
-
-	if (!debug_block_log)
-		return;
-	for (i = 0; i < ARRAY_SIZE(a); i++) {
-		v[i] = 0xdeadbeef;
-		creative_dsp_chipio_read(chip, a[i], &v[i]);
-	}
-	dev_info(chip->dev, "DSP debug block (%s): e2c=0x%08x e30=0x%08x e34=0x%08x e38=0x%08x\n",
-		 when, v[0], v[1], v[2], v[3]);
-}
-
 static int dsp_set_run_state(struct creative_chip *chip)
 {
 	unsigned int reg, halt_state;
@@ -2490,7 +2337,6 @@ static int dsp_set_run_state(struct creative_chip *chip)
 	if (halt_state != 0)
 		dev_info(chip->dev, "DSP halt state %u (DBGCNTL 0x%08x): setting it running\n",
 			 halt_state, reg);
-	creative_dsp_dbg_block_log(chip, halt_state ? "downloaded, halted" : "downloaded, running");
 	if (halt_state != 0) {
 		reg &= ~((halt_state << DSP_DBGCNTL_SS_LOBIT) &
 			 DSP_DBGCNTL_SS_MASK);
@@ -2626,8 +2472,6 @@ struct ae9_dma_engine {
 	size_t buf_size;
 	unsigned short hda_format;
 	unsigned char stream_tag;
-	void *posbuf;		/* fw_posbuf=1 */
-	dma_addr_t posbuf_dma;
 };
 
 /* Reset the download stream (read position back to 0) and reprogram it,
@@ -2717,16 +2561,6 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	writel(upper_32_bits(dma->bdl_dma),
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_BDLPU);
 	wmb();
-	if (fw_posbuf && !chip->posbuf) {
-		dma->posbuf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE),
-						 &dma->posbuf_dma, GFP_KERNEL);
-		if (dma->posbuf) {
-			writel(upper_32_bits(dma->posbuf_dma), chip->hda_regs + AZX_REG_DPUBASE);
-			writel(lower_32_bits(dma->posbuf_dma) | 1, chip->hda_regs + AZX_REG_DPLBASE);
-			dev_info(chip->dev, "fw_posbuf: DMA position buffer on at 0x%llx\n",
-				 (u64)dma->posbuf_dma);
-		}
-	}
 	return 0;
 }
 
@@ -2747,26 +2581,6 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 	writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
-	if (dma->posbuf) {
-		writel(0, chip->hda_regs + AZX_REG_DPLBASE);
-		writel(0, chip->hda_regs + AZX_REG_DPUBASE);
-		readl(chip->hda_regs + AZX_REG_DPLBASE);
-		{
-			/* which slot this controller uses for the download
-			 * stream isn't known: log the busiest one */
-			__le32 *pb = dma->posbuf;
-			unsigned int i, best = 0;
-
-			for (i = 0; i < 16; i += 2)
-				if (le32_to_cpu(pb[i]) > le32_to_cpu(pb[best]))
-					best = i;
-			dev_info(chip->dev, "fw_posbuf: slot %u position 0x%x after the download\n",
-				 best / 2, le32_to_cpu(pb[best]));
-		}
-		dma_free_coherent(chip->dev, ae9_dma_size(chip, PAGE_SIZE), dma->posbuf,
-				  dma->posbuf_dma);
-		dma->posbuf = NULL;
-	}
 	if (dma->buf)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
@@ -3088,70 +2902,11 @@ exit:
 	return status;
 }
 
-/*
- * Where ChipIO reads an image word. The image addresses the DSP's aux RAM
- * the way the DSP does, straight after main X / Y RAM (X_END..X_EXT,
- * Y_END..Y_EXT), and the download's DSP DMA writes it there; ChipIO maps
- * that aux RAM elsewhere (AXRAM_CHIP_OFFSET, AYRAM_CHIP_OFFSET). Reading
- * the image address itself gave the old "27 + 24 mismatches", all in
- * those two ranges (WINDOWS-CAPTURE-ANALYSIS §21).
- */
-static unsigned int dsp_verify_addr(unsigned int addr, bool *aux)
-{
-	*aux = true;
-	if (addr >= X_END && addr < X_EXT)
-		return AXRAM_CHIP_OFFSET + (addr - X_END);
-	if (addr >= Y_END && addr < Y_EXT)
-		return AYRAM_CHIP_OFFSET + (addr - Y_END);
-	*aux = false;
-	return addr;
-}
-
-static void dsp_verify_image(struct creative_chip *chip,
-			     const struct ae9_dsp_image_seg *fls)
-{
-	unsigned int seg = 0;
-
-	for (; fls && !seg_is_last(fls); fls = seg_next(fls), seg++) {
-		unsigned int i, ok = 0, bad = 0, shown = 0, aux_ok = 0, aux_bad = 0;
-
-		if (seg_is_hci(fls))
-			continue;
-		for (i = 0; i < fls->count; i = (i + 97 < fls->count ||
-						 i == fls->count - 1) ?
-						i + 97 : fls->count - 1) {
-			unsigned int got = 0, img = fls->chip_addr + 4 * i, addr;
-			bool aux;
-
-			addr = dsp_verify_addr(img, &aux);
-			creative_dsp_chipio_addr_invalidate();
-			creative_dsp_chipio_read(chip, addr, &got);
-			if (got == fls->data[i]) {
-				ok++;
-				aux_ok += aux;
-			} else {
-				bad++;
-				aux_bad += aux;
-				if (shown++ < 5)
-					dev_info(chip->dev,
-						 "fw_verify: seg%u word %u addr 0x%06x%s got 0x%08x want 0x%08x\n",
-						 seg, i, img, aux ? " (aux)" : "", got, fls->data[i]);
-			}
-			if (i == fls->count - 1)
-				break;
-		}
-		dev_info(chip->dev,
-			 "fw_verify: seg%u chip 0x%06x %u words: %u match, %u mismatch (aux RAM: %u match, %u mismatch)\n",
-			 seg, fls->chip_addr, fls->count, ok, bad, aux_ok, aux_bad);
-	}
-}
-
 static int dspload_image(struct creative_chip *chip,
 			 const struct ae9_dsp_image_seg *fls)
 {
 	unsigned int sample_rate = 48000;
 	unsigned short channels = DMA_TRANSFER_FRAME_SIZE_NWORDS;
-	bool parked;
 	int status;
 
 	while (channels > 16) {
@@ -3159,29 +2914,10 @@ static int dspload_image(struct creative_chip *chip,
 		channels /= 2;
 	}
 
-	parked = ae9_rings_park(chip, "firmware");
 	status = dspxfr_image(chip, fls, sample_rate, channels);
-	if (parked) {
-		int u = ae9_rings_unpark(chip, "firmware");
-
-		if (u == -ENODEV)
-			return u;
-	}
-	if (chip->rings_deferred && !chip->card_gone) {
-		/* fw_rings_off=1: the firmware stream has stopped; start the
-		 * command rings now, before the boot handshake */
-		int cret = creative_ae9_corb_init(chip);
-
-		chip->rings_deferred = false;
-		dev_info(chip->dev, "corb_init after the firmware stream: %d\n", cret);
-		if (creative_ae9_gone(chip, "CORB/RIRB start after the firmware"))
-			return -ENODEV;
-	}
 	if (status < 0)
 		return status;
 	dspload_post_setup(chip);
-	if (fw_verify)
-		dsp_verify_image(chip, fls);
 	/* the MASTERCONTROL boot handshake straight after the run, as Windows */
 	{
 		int r = dsp_set_run_state(chip);
@@ -3233,33 +2969,6 @@ static bool dspload_is_loaded(struct creative_chip *chip)
 #define SPEAKER_TUNING_USE_SPEAKER_EQ	0x1f
 #define SPEAKER_TUNING_MUTE		0x3a
 
-/* ChipIO control-param + stream control */
-#define VENDOR_CHIPIO_PARAM_SET2	0x710	/* (alias of PARAM_SET) */
-/* Extended chipio_set_control_param verbs — confirmed from decompiled driver
- * and cold-boot CORB capture (0x717 p=param_id, 0x718 p=param_val).
- * NOTE: 0x711/0x712 are PORT_ALLOC_CONFIG_SET/PORT_ALLOC_SET (different ops).
- */
-#define VENDOR_CHIPIO_PARAM_EX_ID_SET		0x717
-#define VENDOR_CHIPIO_PARAM_EX_VALUE_SET	0x718
-#define VENDOR_CHIPIO_8051_WRITE_DIRECT	0x500
-#define CONTROL_PARAM_ASI		23
-#define CONTROL_PARAM_STREAM_ID		24
-#define CONTROL_PARAM_STREAM_SOURCE_CONN	25
-#define CONTROL_PARAM_STREAM_DEST_CONN	26
-#define CONTROL_PARAM_STREAMS_CHANNELS	27
-#define CONTROL_PARAM_STREAM_CONTROL	28
-#define CONTROL_PARAM_CONN_POINT_ID	29	/* confirmed: decompiled enum + coldboot CORB */
-#define CONTROL_PARAM_CONN_POINT_SR	30	/* confirmed: decompiled enum + coldboot CORB */
-#define CONTROL_FLAG_DSP_96KHZ		9
-#define CONTROL_FLAG_DAC_96KHZ		8
-#define CONTROL_FLAG_ADC_B_96KHZ	6
-#define CONTROL_FLAG_ADC_C_96KHZ	7
-#define CONTROL_FLAG_SRC_RATE_96KHZ	11
-#define CONTROL_FLAG_IDLE_ENABLE	2
-#define CONTROL_FLAG_SPDIF2OUT		4
-#define CONTROL_FLAG_PORT_A_10KOHM_LOAD	20
-#define CONTROL_FLAG_PORT_D_10KOHM_LOAD	21
-#define CONTROL_FLAG_ASI_96KHZ		22
 #define SR_96_000			0x0b
 #define SR_48_000			0x09
 #define MEM_CONNID_WUH			10
@@ -3295,8 +3004,8 @@ static void ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 	mutex_unlock(&chip->ca0113_mutex);
 }
 
-void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
-				size_t n, const char *what)
+void creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
+			      size_t n, const char *what)
 {
 	ca0113_list(chip, cmds, n, CA0113_SETTLE_US);
 	if (chip->dsp_done)
@@ -3306,10 +3015,10 @@ void creative_dsp_ca0113_replay(struct creative_chip *chip, const u8 (*cmds)[3],
 }
 
 /* Same without the log line and with the short settle time (volume). */
-void creative_dsp_ca0113_replay_quiet(struct creative_chip *chip,
-				      const u8 (*cmds)[3], size_t n)
+void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
+				    const u8 (*cmds)[3], size_t n)
 {
-	ca0113_list(chip, cmds, n, hu_cmd_settle_us);
+	ca0113_list(chip, cmds, n, CA0113_VOL_SETTLE_US);
 }
 
 /*
@@ -3394,19 +3103,6 @@ u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 ra
 	return raw[1] & 0xff;
 }
 
-/*
- * Windows' verbs at the top of each download (FUN_0012d914; the last 20 of
- * ae9_cold_prefw, idx 795-814): PLL/PMU 0x00 = 0xff, the 96 kHz flags
- * 9/8/6/7/11, connection points 0x0a/0x0b at 48 kHz. The cold replay sent
- * them before the first try; a re-download sends them again, as Windows.
- */
-static const u32 ae9_dl_prefix[] = {
-	0x11570d00, 0x11570cff, 0x11570f89, 0x11570f88, 0x11570f86,
-	0x11570f87, 0x11570f8b, 0x115f0100, 0x1157171d, 0x1157180a,
-	0x115f0100, 0x1157171e, 0x11571809, 0x115f0100, 0x1157171d,
-	0x1157180b, 0x115f0100, 0x1157171e, 0x11571809, 0x115f0100,
-};
-
 /* worth a re-download: not a missing card, firmware file or memory */
 static bool dsp_soft_retry_wanted(struct creative_chip *chip, int ret)
 {
@@ -3423,8 +3119,6 @@ static bool dsp_soft_retry_wanted(struct creative_chip *chip, int ret)
 static void dsp_soft_reset(struct creative_chip *chip, unsigned int attempt,
 			   int why)
 {
-	u32 resp;
-	size_t i;
 	int r;
 
 	creative_dsp_chipio_addr_invalidate();
@@ -3433,8 +3127,7 @@ static void dsp_soft_reset(struct creative_chip *chip, unsigned int attempt,
 		 attempt, why, chip->hs_done && !chip->hs_ok ? ", boot handshake" : "",
 		 r, r == -EIO ? " (still busy after 1 s)" : "");
 	msleep(500);
-	for (i = 0; i < ARRAY_SIZE(ae9_dl_prefix); i++)
-		verb_send(chip, ae9_dl_prefix[i], &resp);
+	creative_ae9_dl_prefix(chip);	/* Windows' verbs at the top of a download */
 	creative_dsp_chipio_addr_invalidate();
 	chip->hs_done = 0;
 	chip->hs_ok = false;
@@ -3450,7 +3143,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 {
 	const struct firmware *fw;
 	const struct ae9_dsp_image_seg *fls;
-	unsigned int attempt, tries = max(dsp_soft_tries, 1U);
+	unsigned int attempt, tries = AE9_DSP_SOFT_TRIES;
 	unsigned long timeout;
 	int ret;
 
@@ -3511,7 +3204,6 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	}
 	fls = (const struct ae9_dsp_image_seg *)fw->data;
 
-	creative_dsp_dbg_block_log(chip, "before the download");
 	dev_info(chip->dev, "downloading DSP firmware (%zu bytes)...\n",
 		 fw->size);
 
@@ -3556,7 +3248,6 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	do {
 		if (dspload_is_loaded(chip)) {
 			dev_info(chip->dev, "DSP firmware downloaded and running\n");
-			creative_dsp_dbg_block_log(chip, "running");
 
 			{
 				unsigned int loop_val = 0, dbgcntl = 0;
@@ -3571,32 +3262,20 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 			}
 
 			/*
-			 * If EXRAM was zeroed by QEMU (0x800000=0x0bad0add),
-			 * the SCP queue pointers at 0x800000 are corrupt.
-			 * The firmware doesn't clear this region on boot.
-			 * Zero it explicitly so the 8051 SCP queue works.
+			 * 0x800000-0x8000fc (the firmware's SCP queue
+			 * pointers, see the top of this file) is left alone
+			 * after the boot, as Windows does. The old code zeroed
+			 * it here when it read 0x0bad0add, which wiped those
+			 * pointers (sentinel_clear, removed in 0.12.12).
 			 */
 			{
 				unsigned int sentinel = 0;
+
 				creative_dsp_chipio_read(chip, 0x800000,
 							 &sentinel);
-				if (sentinel == 0x0bad0add && ae9_sentinel_clear != 1)
+				if (sentinel == 0x0bad0add)
 					dev_info(chip->dev,
-						 "0x800000=0x0bad0add left alone after boot (sentinel_clear=%u)\n",
-						 ae9_sentinel_clear);
-				if (sentinel == 0x0bad0add && ae9_sentinel_clear == 1) {
-					unsigned int i;
-					dev_info(chip->dev,
-						 "Clearing QEMU SCP sentinel region 0x800000-0x8000fc\n");
-					/* QEMU zeros EXRAM with 0x0bad0add across
-					 * the entire SCP queue area. The 8051
-					 * firmware doesn't clear this region.
-					 * Zero all 64 DWORDs (256 bytes). */
-					for (i = 0; i < 64; i++)
-						creative_dsp_chipio_write(chip,
-							0x800000 + i * 4,
-							0x00000000);
-				}
+						 "0x800000=0x0bad0add left alone after boot\n");
 			}
 			/*
 			 * Wait for the 8051 to fully initialize its EXRAM
@@ -3784,7 +3463,6 @@ static int dspio_set_uint_param(struct creative_chip *chip, int mod_id,
 #define MEM_CONNID_MICIN1	3
 #define MEM_CONNID_MICOUT1	12
 #define SR_16_000		0x04
-#define CONTROL_PARAM_VIP_SOURCE 1
 #define FLOAT_THREE		0x40400000
 
 /* The effects, by Creative's own enums (CtxHdC64.DLL, notes 13), ca0132's
@@ -3908,8 +3586,8 @@ void creative_ae9_cv_route(struct creative_chip *chip, bool on)
 		chipio_set_control_param(chip, CONTROL_PARAM_VIP_SOURCE, 1);
 		/* the DSP now sets the voice processor up and takes no
 		 * messages for a while: hold the next one (dspio_scp) */
-		if (vc_quiet_ms)
-			chip->scp_quiet_until = jiffies + msecs_to_jiffies(vc_quiet_ms);
+		if (AE9_VC_QUIET_MS)
+			chip->scp_quiet_until = jiffies + msecs_to_jiffies(AE9_VC_QUIET_MS);
 	} else {
 		/* Windows' recording stop (cap4 s8): VIP 0, 0x80/05 0, the
 		 * status read, then the mic connections set to 16 kHz again and
@@ -4157,7 +3835,7 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 	 * (2026-11-09 uv1i A2).
 	 */
 	if (chip->cv.monitor && !chip->capture_substream && !chip->cv.mon_bound) {
-		creative_ae9_cap_replay(chip, true);	/* level block once per DSP load */
+		creative_ae9_capture_seq(chip, true);	/* level block once per DSP load */
 		chip->cv.mon_bound = true;
 		msleep(50);
 	}
@@ -4180,7 +3858,7 @@ void creative_ae9_mic_monitor_apply(struct creative_chip *chip)
 	if (chip->cv.monitor)
 		chip->cv.mon_used = true;	/* since this DSP load */
 	if (!chip->cv.monitor && chip->cv.mon_bound && !chip->capture_substream) {
-		creative_ae9_cap_replay(chip, false);
+		creative_ae9_capture_seq(chip, false);
 		chip->cv.mon_bound = false;
 	}
 	dev_info(chip->dev, "Mic Monitor %s%s%s\n", chip->cv.monitor ? "on" : "off",

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 3xHelix
 # Creative Sound Blaster AE-9 HDA controller module
 
-snd-hda-codec-creative-ae9-objs := creative_ae9_core.o creative_ae9_corb.o creative_ae9_pcm.o creative_ae9_i2c.o creative_ae9_dsp.o creative_ae9_fx.o
+snd-hda-codec-creative-ae9-objs := creative_ae9_core.o creative_ae9_corb.o creative_ae9_pcm.o creative_ae9_i2c.o creative_ae9_dsp.o creative_ae9_fx.o creative_ae9_seq.o creative_ae9_seq_run.o
 
 obj-m += snd-hda-codec-creative-ae9.o
 

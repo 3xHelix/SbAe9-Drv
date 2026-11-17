@@ -10,7 +10,7 @@ CtxHda.sys embeds several FLS images (see extract_firmware.py). The first
 (655436 bytes) is the main DSP image, ctefx-desktop.bin. The second (432
 bytes: 78 words to chip 0x0b7b10, 21 words to chip 0x03f3a0) is the overlay
 Windows transfers during the MASTERCONTROL boot handshake (GET 0x80/0x3a +
-0x3b, between boot states 3 and 4). The driver loads it with overlay=1.
+0x3b, between boot states 3 and 4). The driver transfers it there too.
 """
 import struct
 import sys

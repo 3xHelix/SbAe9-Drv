@@ -702,13 +702,9 @@ static bool fx_hp_virt(struct creative_chip *chip)
  * it still reads muted (or the read fails) unmute again after 10 ms, at
  * most 10 times. Sent even when the DSP was marked as not answering: the
  * opening mute may already be in, and a lost unmute leaves DSP-mode
- * playback silent until the next effect change.
- * unmute_check=0: one unmute, no read-back (before 0.12.6).
+ * playback silent until the next effect change. Before 0.12.6: one
+ * unmute, no read-back (the unmute_check option until 0.12.12).
  */
-static unsigned int unmute_check = 1;
-module_param(unmute_check, uint, 0644);
-MODULE_PARM_DESC(unmute_check, "DSP output unmute after effect changes: read it back and resend until it took, as Windows (1 = yes, default; 0 = one unmute, no check)");
-
 static void fx_unmute_verify(struct creative_chip *chip)
 {
 	u32 hdr = (0x3a << 17) | (0x20 << 8) | FX_MID_OUT, zero = 0, val = ~0U, val0 = 0;
@@ -725,7 +721,7 @@ static void fx_unmute_verify(struct creative_chip *chip)
 			dev_info(chip->dev, "fx: unmute (0x96/0x3a = 0) FAILED (%d)\n", ret);
 		/* a DSP that stopped answering gets the one unmute, no
 		 * read-backs (each failed read waits up to 1 s) */
-		if (!unmute_check || chip->dsp_halted || chip->fx.dead)
+		if (chip->dsp_halted || chip->fx.dead)
 			return;
 		usleep_range(3000, 4000);	/* Windows reads 2-3 ms after the unmute */
 		got = creative_dsp_out_mute_get(chip, &val);
@@ -753,15 +749,12 @@ static void fx_unmute_verify(struct creative_chip *chip)
 /*
  * Windows unmutes the DSP output at every stream start and stop (CtxHda
  * FUN_0001964c from the stream SetState, no read-back). In DSP mode only:
- * Direct Mode doesn't pass the DSP output. pcm_unmute=0: not sent.
+ * Direct Mode doesn't pass the DSP output. Since 0.12.6 (the pcm_unmute
+ * option until 0.12.12).
  */
-static unsigned int pcm_unmute = 1;
-module_param(pcm_unmute, uint, 0644);
-MODULE_PARM_DESC(pcm_unmute, "DSP mode: unmute the DSP output at every playback start and stop, as Windows (1 = yes, default; 0 = no)");
-
 void creative_ae9_fx_unmute(struct creative_chip *chip)
 {
-	if (!pcm_unmute || chip->fx.direct || !fx_ready(chip) ||
+	if (chip->fx.direct || !fx_ready(chip) ||
 	    chip->fx.dead || chip->dsp_halted)
 		return;
 	__fx_send(chip, FX_MID_OUT, 0x3a, 0, false, true);

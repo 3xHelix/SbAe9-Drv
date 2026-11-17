@@ -9,23 +9,25 @@ How the driver is built and where its knowledge comes from. Back to the
 The driver replays what Creative's Windows driver does, recorded from a
 Windows VM with the card passed through (VFIO). The capture data, analysis
 and decode tools live in the development repository; the
-`creative_ae9_*_verbs.h` tables here hold everything the driver uses from
-them. Creative's Windows driver files are not included, and none of its code
-is. Each source file names what it adapted, with the original copyright
-notices.
+`creative_ae9_seq.c` and `creative_ae9_seq_run.c` here hold everything the
+driver uses from them, as code. Creative's Windows driver files are
+not included, and none of its code is. Each source file names what it
+adapted, with the original copyright notices.
 
 ## Source layout
 
 | File | Purpose |
 |---|---|
-| `creative_ae9_core.c` | PCI probe, bus reset, HDA reset, codec detection, Windows replays (pre-download, post-boot), head-unit poll/display/knob and ALSA volume controls, debugfs, module options |
+| `creative_ae9_core.c` | PCI probe, bus reset, HDA reset, codec detection, the bring-up (probe, retries, resume) and the start-up tail's replay, router and DSP-mode routing, head-unit poll/display/knob and ALSA volume controls, debugfs, module options |
 | `creative_ae9_dsp.c` | DSP firmware download, MASTERCONTROL boot handshake, overlay transfer, SCP messaging, CA0113 (head-unit DAC) commands, Voice Clarity / Voice Morphing / Mic EQ and mic monitoring |
 | `creative_ae9_i2c.c` | Head-unit frames over the card's UART (the SPI/I2C names in it are historical) |
 | `creative_ae9_corb.c` | CORB/RIRB DMA ring + verb I/O, the "card stopped answering" stop |
 | `creative_ae9_pcm.c` | ALSA PCM playback, mic capture, optical out (device 4, or a mirror of playback), optical in (device 1), What U Hear (device 2), rear RCA in (device 3) |
 | `creative_ae9_fx.c` | SBX effects, EQ, Direct Mode and SBX controls, speaker setup, headphone profiles and headphone virtualization |
 | `creative_ae9.h`, `ca0132_regs.h` | Registers, chip struct, MMIO accessors; definitions ported from the in-tree ca0132 driver |
-| `creative_ae9_*_verbs.h`, `creative_ae9_switch_ops.h` | Sequences recorded from the Windows driver (init, cold boot, warm reset, recording, output switch, shutdown), auto-generated |
+| `creative_ae9_seq.c` | Sequences recorded from the Windows driver, written as code, the start-up's (sent verb by verb): the start-up before the firmware download (with the boot checks) and the verbs at the top of every download, the warm-DSP reset (recovery cycle), the start-up tail (Windows' set-up after the DSP's boot handshake) |
+| `creative_ae9_seq_run.c` | The rest of them, sent as blocks or to the head unit: recording start, level and stop, playback start and stop, DSP mode's blocks (Direct Mode off and on, a stream's start in DSP mode, a stream's release), the speaker/headphone switch, Windows' shutdown, the head unit's and DACs' set-up after the DSP's start, Windows' head-unit poll (shared with the heartbeat) and its set-up resend, and Windows' BAR2 init at every start-up |
+| `creative_ae9_seq.h` | The names those two files share |
 | `extract_firmware.py`, `extract_overlay.py` | Extract the DSP firmware and overlay from Creative's `CtxHda.sys` |
 | `extract_hpeq.py` | Extracts the headphone profiles from Creative's installer (`AE9HPEQ/*.reg`) |
 | `dkms.conf`, `scripts/dkms-install.sh` | DKMS build and the source install |

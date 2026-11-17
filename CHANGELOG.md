@@ -3,6 +3,85 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.12 (2026-11-17)
+Same card, same commands, readable driver. 🧹
+
+Works with SbAe9-SBC v0.21.3 and SbAe9-AudioMon v0.4.8. SBC now goes by
+the driver version instead of reading feature options; AudioMon gets a
+"Driver health" line.
+
+Nothing changes in how the card sounds or behaves. This release is two
+small fixes, a big clean-up inside the driver, and 42 fewer module options.
+
+- **Fixed: a card answer that arrived late could still cost a stall.** When
+  an answer took longer than 200 µs to reach memory, the driver gave up on
+  it; if a command was waiting for that answer, the command timed out (a
+  100 ms pause, a command-ring reset, a timeout in the log) although the
+  answer turned up a moment later. The driver now keeps watching and takes
+  the answer when it lands. On our card answers arrive within 5 µs, so this
+  didn't happen in normal use; in a forced test, 609 answers held back:
+  609 caught, 0 timeouts. The debug state shows it (`RIRB given-up slots`).
+- **Router chip safeguard:** a router-chip setting's value is now sent only
+  by the task that selected that setting, under one lock, so it can never
+  land on a setting another task just selected. Every setting the driver
+  sends already came from one task; a crossed one would be refused and
+  counted (`router chip values refused` in the debug state, 0 on our card).
+- **Inside: every command list in the driver is now readable C.** Up to
+  0.12.11, much of what the driver sends the card was tables captured from
+  Creative's Windows driver, replayed by an engine: the start-up before the
+  firmware download, the set-up after the DSP starts and the start-up tail,
+  playback and recording start and stop, the speakers/headphones switch,
+  the power-down, the warm restart, DSP mode on and off, the stream drain,
+  the format check, the BAR2 init, the head unit's poll and re-attach. Each
+  is now C that says what it does, step by step. The replay engine and the
+  fallback tables that never ran are gone; `creative_ae9_seq.c` is split
+  into `creative_ae9_seq.c` and `creative_ae9_seq_run.c` (with
+  `creative_ae9_seq.h`).
+- **The card gets exactly the same commands as 0.12.11.** Proven offline
+  (a test harness runs the new code and the old tables side by side and
+  compares every command, wait and log line in thousands of situations; it
+  caught all 363 errors planted on purpose) and on the card (every command
+  and every register write recorded through load, playback at each rate,
+  DSP mode, the output switch, the mic and What U Hear: 0.12.11 and 0.12.12
+  identical), then a power-off cold start, two suspend/resumes and
+  listening. What you may notice: some block lines in the kernel log show
+  smaller counts (e.g. "32 verbs" where 0.12.11 said 104): they now count
+  the commands sent, not the table entries.
+- Known, harmless, also in older versions: right after a power-on, the log
+  may say "SBX: the DSP's input path is not active in the router: no audio
+  in DSP mode" once. It's a false alarm (the check reads the router before
+  the router chip has finished; DSP mode plays). A later release checks
+  again before warning.
+- Removed module options (bring-up diagnostics, no longer needed):
+  `stream_rings_off`, `fw_rings_off`, `fw_posbuf`, `fw_verify`,
+  `corb_rings`, `ring_irq`, `enable_pcm`, `load_fw`, `bit9_test`,
+  `debug_block_log`, `pcm_posbuf`, `pcm_nowakeup`, `hu_debug` (`debug=2`
+  still logs the raw head-unit button state), `vc_quiet_ms`, `bridge_log`
+  (the bridge status lines are always logged, as by default before); an
+  old line in /etc/modprobe.d naming one only logs 'unknown parameter'
+  and is ignored.
+- Removed 'as before' fallback switches, now always on (each was the
+  default, so nothing changes): `win_reset2`, `warm_reset`, `board_d0`,
+  `codec1_failfast`, `pcicfg40_fix`, `overlay`, `scp_event`,
+  `scp_full_resend`, `unmute_check`, `pcm_unmute`, `pcm_stop_block`,
+  `rt_chain_walk`, `rt_dac_clean`, `stream_drain`, `fmt_check`,
+  `src_reclock`, `hu_sbx_mode`, `hu_reattach`; also `dsp_soft_tries`
+  (always 3, as Windows), `sentinel_clear` (the DSP's SCP queue area is
+  never zeroed, as by default before) and `in05_host` (stream 0x05 is
+  never switched on from the host, as by default before). An old
+  modprobe.d line naming one is ignored, as above.
+- Timing tunables are now fixed at their defaults (constants in the
+  driver): `hu_fast_ms` (40 ms knob poll), `hu_cmd_settle_us` (4 ms),
+  `codec_probe_delay_ms` (200 ms), `resume_tries` (3), `resume_delay_ms`
+  (2 s), `dsp_switch_ms` (3 s). An old modprobe.d line naming one is
+  ignored, as above.
+- 38 options are left. The six Sound Blaster Command reads (`surround_96k`,
+  `surround_192k`, `dsp_96k`, `pcm_176k4`, `dac_441`, `hp_live_upload`)
+  stay in 0.12.12; SBC v0.21.3 checks the driver version instead, so they
+  go in a later release. docs/OPTIONS.md is reorganised: settings you may
+  want, the ones Sound Blaster Command reads, the fallbacks kept for one
+  more release, and debugging, with the full list of removed options.
+
 ## 0.12.11 (2026-11-15)
 Full volume in DSP mode, and switch freely. 🎚️
 

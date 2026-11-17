@@ -114,7 +114,7 @@ Two stages, as in Windows.
   Smart Volume ("Loud" especially) lifts quiet audio a lot: by design.
 - Works on speakers and headphones, across sleep and reboots. With Direct
   Mode off, a new stream after boot, wake or a switch made while stopped
-  plays direct for 3 s (`dsp_switch_ms`), then moves to the DSP. Turning
+  plays direct for 3 s, then moves to the DSP. Turning
   Direct Mode on restarts a stream that was going through the DSP by itself;
   one still waiting to move there keeps playing.
 
@@ -383,8 +383,7 @@ fixed value, or the card's own "Mic Monitor Playback Switch", which doesn't
 go through PipeWire.
 
 A very small quantum (64) can drop out under heavy CPU load (`pw-top` ERR
-column); 128 or more is fine. `pcm_posbuf=1` logs the read-ahead every 2 s
-while playing, to check it on your card.
+column); 128 or more is fine.
 
 ## Sleep, reboots and reloads
 
@@ -394,8 +393,7 @@ while playing, to check it on your card.
 - **Unload, reboot and power-off** run Windows' own shutdown sequence, so the
   card restarts cleanly (reloads and warm reboots tested).
 - **If the DSP misses its boot handshake** (at load or on resume), the driver
-  runs that shutdown and tries again: `resume_tries` (3) attempts,
-  `resume_delay_ms` (2000) apart.
+  runs that shutdown and tries again: 3 attempts, 2 s apart.
 - **"Driver Health"** (read-only, any user): `amixer -c AE9 cget
   name='Driver Health'` gives 8 numbers: command timeouts, command-ring
   answers that never landed, answers from the wrong codec, unreadable ring
