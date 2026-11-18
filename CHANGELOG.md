@@ -3,6 +3,52 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.13 (2026-11-18)
+Same sound, tougher driver. 🛡️
+
+Works with SbAe9-SBC v0.21.4 and SbAe9-AudioMon v0.4.9. Both now let go of
+the card while `ae9-reload` runs and come back by themselves.
+
+Nothing changes in how the card sounds. This release adds checks Windows
+makes that we didn't, a safety net for the head unit's amp, and a reload that
+no longer trips over the apps.
+
+- **Head unit: checks before every byte, as Windows.** Before each byte to
+  the head unit, the driver now checks that the UART has room to take it
+  (normally from a status read it already made, so it costs nothing). If the
+  UART stays full for 2 ms, that frame is dropped as unanswered with a
+  warning; the next poll sends it again. Before changing the UART's line
+  settings at head-unit set-up, the driver waits for the UART to go idle,
+  reading out any bytes still arriving (as Linux's own UART driver does),
+  and stops at once if the card is gone. On our card neither check has ever
+  had to wait.
+- **Headphone amp safety net.** If the head unit's amp disagrees with the
+  output you chose (headphones or speakers) for over a second, the driver
+  sends the jack frame again. Only while the head unit is attached and two
+  full polls agree it is; at most 3 tries, then one warning and nothing more
+  until it agrees again. Switching outputs, Line Out Virtualization, a
+  re-attach or a frame sent by hand through debugfs restart or pause it.
+- **Direct Mode slot walk waits for the router chip** to finish its own
+  work first, one less way for the two to cross.
+- **`ae9-reload` leaves a notice** (`/run/user/<your uid>/ae9-reload`, gone
+  when it finishes) so Sound Blaster Command and AudioMon let go of the card
+  instead of holding the reload up, then reopen it. Tested with both open.
+- **32-bit DMA.** The card can now use memory anywhere below 4 GB instead of
+  below 1 GB, as Creative's Windows driver does. The log says whether the
+  card's DMA goes through the IOMMU or passthrough. Tested after a reboot
+  (the card's rings and buffers just under 4 GB) and with `iommu=pt`.
+- Tested: every command and register write on the card compared with
+  0.12.12 (only the planned status reads added), output switches, the amp
+  net forced, suspend/resume, a power-off cold start, and a 21-hour soak with
+  Direct and DSP mode, SBX, Voice Clarity and Voice Morphing, 48 and 96 kHz,
+  recording and voice calls: Driver Health 0 throughout.
+- Known, harmless: under heavy load the log can say "head unit: 1/15 poll
+  frames unanswered" now and then (three times in that soak). The next poll
+  half a second later repeats every frame. 0.12.12 does the same; a later
+  release counts these to pin down why.
+- `wuh_96k` and the six options Sound Blaster Command reads are still here;
+  they go in a later release (SBC v0.21.4 no longer needs them).
+
 ## 0.12.12 (2026-11-17)
 Same card, same commands, readable driver. 🧹
 

@@ -7,7 +7,7 @@ An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 `snd_hda_intel` + `snd_hda_codec_ca0132` drivers don't support this card;
 this one does, by doing what Creative's Windows driver does, step by step.
 
-**Latest: v0.12.12** (2026-11-17) · [Changelog](CHANGELOG.md) ·
+**Latest: v0.12.13** (2026-11-18) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
 Pre-releases, tested on two cards.
 
@@ -41,7 +41,7 @@ Pre-releases, tested on two cards.
 - **[SbAe9-AudioMon](https://github.com/3xHelix/SbAe9-AudioMon)**: level
   meters for every AE-9 input and output, with a debug log.
 
-Driver v0.12.12 works with SbAe9-SBC v0.21.3 and SbAe9-AudioMon v0.4.8. Older
+Driver v0.12.13 works with SbAe9-SBC v0.21.4 and SbAe9-AudioMon v0.4.9. Older
 app versions still work, with fewer controls. Earlier pairings are in the
 [changelog](CHANGELOG.md).
 
@@ -107,7 +107,7 @@ Download `creative-ae9-dkms_<version>-1_all.deb` from the
 [latest release](https://github.com/3xHelix/SbAe9-Drv/releases), then:
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.12-1_all.deb innoextract
+sudo apt install ./creative-ae9-dkms_0.12.13-1_all.deb innoextract
 ```
 
 Secure Boot: `sudo mokutil --import /var/lib/dkms/mok.pub` once, then

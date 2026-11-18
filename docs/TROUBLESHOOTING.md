@@ -14,7 +14,10 @@ issues. Back to the [README](../README.md).
    stops PipeWire, WirePlumber, the AE-9 helper services and alsa-state,
    reloads the driver, waits for the card and starts everything again. It
    lists anything else still holding the card (`ae9-reload --check` only
-   shows that), and it says when the card didn't start.
+   shows that), and it says when the card didn't start. Since 0.12.13 it
+   also leaves a notice (`/run/user/<your uid>/ae9-reload`) so Sound Blaster
+   Command (v0.21.4+) and AudioMon (v0.4.9+) let go of the card while it
+   runs and come back by themselves.
 2. **Power off fully:** when a reload can't bring the card back ("the card
    didn't start"), or the card is dark (lights off, no head unit, no sound):
    shut down, switch the PSU off (or unplug) for 15-30 s, then boot. A warm

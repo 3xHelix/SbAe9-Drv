@@ -402,5 +402,6 @@ column); 128 or more is fine.
   the router's free slots (information). Apps can follow it with `amixer
   events` (SbAe9-AudioMon does). Since 0.12.11.
 - **Reloading the driver:** `ae9-reload` stops what holds the card,
-  reloads the driver and starts everything again (see
+  reloads the driver and starts everything again; Sound Blaster Command
+  and AudioMon let go of the card while it runs (see
   [Troubleshooting](TROUBLESHOOTING.md)).

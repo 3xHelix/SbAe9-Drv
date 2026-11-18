@@ -12,8 +12,15 @@
 #   ae9-reload --force    reload even if something else still holds it
 #
 # SbAe9-SBC and SbAe9-AudioMon let go of the card by themselves once the
-# driver says it stopped answering (driver 0.12.9+); anything else that
-# holds it is listed and the reload stops, unless --force.
+# driver says it stopped answering (driver 0.12.9+), and, in versions that
+# know it, while the reload notice below exists; anything else that holds
+# it is listed and the reload stops, unless --force.
+#
+# The reload notice (0.12.13): /run/user/<uid>/ae9-reload, the desktop
+# user's, holding this script's PID, from just before the unload until the
+# end (removed on any exit). An app that holds the card closes it while the
+# file exists and that PID is alive, and opens it again once the file is
+# gone (or its PID is: a reload killed half-way).
 # A reload doesn't fix everything: when the card's DSP won't start again,
 # only a full power-off does (PSU switch or unplug for 15-30 s).
 set -u
@@ -29,7 +36,7 @@ for a in "$@"; do
 	case $a in
 	--check) CHECK=1 ;;
 	--force) FORCE=1 ;;
-	-h|--help) sed -n '4,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help) sed -n '4,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
 	esac
 done
@@ -97,6 +104,27 @@ echo "stopping: ${ran_user[*]:-} ${ran_sys[*]:-}"
 [ ${#ran_user[@]} = 0 ] || ucmd stop "${ran_user[@]}"
 [ ${#ran_sys[@]} = 0 ] || $SU systemctl stop "${ran_sys[@]}"
 sleep 2
+
+# the reload notice (see the top): the apps that know it let go now
+NOTICE=""
+notice_off() { [ -z "$NOTICE" ] || rm -f "$NOTICE"; }
+if [ -n "$DUSER" ] && [ "$DUSER" != root ]; then
+	ndir=/run/user/$(id -u "$DUSER")
+	if [ -d "$ndir" ]; then
+		NOTICE=$ndir/ae9-reload
+		trap notice_off EXIT
+		if [ "$(id -un)" = "$DUSER" ]; then
+			echo $$ > "$NOTICE"
+		else
+			echo $$ | sudo -u "$DUSER" tee "$NOTICE" >/dev/null
+		fi
+		# up to 5 s for them to close the card
+		for ((i = 0; i < 10; i++)); do
+			[ -z "$(holders)" ] && break
+			sleep 0.5
+		done
+	fi
+fi
 
 h=$(holders)
 if [ -n "$h" ] && [ $FORCE = 0 ]; then

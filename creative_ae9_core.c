@@ -22,6 +22,7 @@
 #include <linux/seq_file.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/tlv.h>
@@ -1042,6 +1043,7 @@ MODULE_PARM_DESC(rt_dsp_walk, "DSP mode: route the DSP outputs in the router chi
 
 static int ae9_8051_xram_byte_locked(struct creative_chip *chip, u16 addr);
 static void ae9_8051_wait_idle(struct creative_chip *chip, const char *why);
+static void creative_ae9_hu_amp_hold(struct creative_chip *chip);
 
 /*
  * Walk stream 0x18's slot list (caller holds replay_mutex). Each slot is
@@ -1519,8 +1521,11 @@ static int ae9_8051_queue_depth(struct creative_chip *chip)
 	return resp & 0xff;
 }
 
-/* Wait (up to ~100 ms) until the 8051 has worked through its queue. */
-static void ae9_8051_wait_idle(struct creative_chip *chip, const char *why)
+/*
+ * Wait (up to ~100 ms) until the 8051 has worked through its queue. quiet:
+ * a short wait goes to the debug log only (a giving up is always logged).
+ */
+static void ae9_8051_wait_idle_q(struct creative_chip *chip, const char *why, bool quiet)
 {
 	int d = 0, i;
 
@@ -1534,9 +1539,16 @@ static void ae9_8051_wait_idle(struct creative_chip *chip, const char *why)
 		mutex_lock(&chip->replay_mutex);
 	}
 	mutex_unlock(&chip->replay_mutex);
-	if (i)
+	if (i && quiet && d <= 0)
+		ae9_dbg(chip, "router chip: queue idle after %d ms (%s)\n", i, why);
+	else if (i)
 		dev_info(chip->dev, "router chip: queue idle after %d ms (%s)%s\n", i, why,
 			d > 0 ? ", gave up" : "");
+}
+
+static void ae9_8051_wait_idle(struct creative_chip *chip, const char *why)
+{
+	ae9_8051_wait_idle_q(chip, why, false);
 }
 
 /* One byte of the 8051's XRAM (0x70d/0x70e address, 0xf07 read); reads
@@ -1897,6 +1909,14 @@ void creative_ae9_rt_direct_walk(struct creative_chip *chip, unsigned int nslots
 
 	nslots = min_t(unsigned int, nslots, AE9_WALK_MAX);
 	bitmap_zero(seen, AE9_RT_ENTRIES);
+	/*
+	 * the list is the 8051's, built by the bind just sent: let it finish
+	 * connecting first, as the DSP mode walk does (one 0xf04 read when it
+	 * already has; a short wait goes to the debug log). Windows reads the
+	 * head straight away, its list always complete in the captures: the
+	 * wait is ours. Since 0.12.13.
+	 */
+	ae9_8051_wait_idle_q(chip, "before the stream slot walk", true);
 	mutex_lock(&chip->replay_mutex);
 	head = s = ae9_8051_xram_byte_locked(chip, AE9_XRAM_LINK5_HEAD);
 	for (k = 0; k < nslots; k++) {
@@ -2338,6 +2358,9 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 			return -EINVAL;
 		for (i = 0; i < n - 2; i++)
 			data[i] = d[i] & 0xff;
+		/* a jack frame by hand: see huframe */
+		if ((reg & 0xff) == 0x03 && n > 2 && data[0] == 0x02)
+			creative_ae9_hu_amp_hold(g_dbg_chip);
 		creative_i2c_raw_tx(g_dbg_chip, reg & 0xff,
 				    (n > 2) ? data : NULL, n - 2);
 		scnprintf(g_dbg_result, sizeof(g_dbg_result),
@@ -2754,6 +2777,8 @@ module_param(hu_auto_switch, bool, 0444);
 MODULE_PARM_DESC(hu_auto_switch, "Start with \"Head Unit Auto Switch\" on: plugging into the head unit's 3.5 mm headphone jack switches to headphones, unplugging back to speakers (default off: plugs only log)");
 
 #define HU_PLUG_SETTLE_MS	1500	/* plug must hold still this long */
+#define HU_AMP_SETTLE_MS	1000	/* amp bit must disagree this long (2+ full polls) */
+#define HU_AMP_TRIES		3	/* jack frame resends before giving up */
 
 unsigned int ae9_debug;
 module_param_named(debug, ae9_debug, uint, 0644);
@@ -2800,6 +2825,76 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 	}
 	ae9_dbg(chip, "head unit: volume att 0x%02x (%s)\n", att,
 		 chip->hu_mute ? "muted" : "on");
+}
+
+/*
+ * Headphone amp safety net (0.12.13). Status bit 6 reads back the head
+ * unit's register 2 bit 6, which our jack frame f0 03 03 02 <40/00> 40 f7
+ * sets: on for headphones on the head unit's jack, off for speakers and for
+ * Line Out Virtualization. In the Windows captures it never disagreed with
+ * the last frame (91423 status reads, plugs and phantom power included);
+ * it did once with us, from a set-up built from stale state (uv56: status
+ * 0x95, headphones without their amp). If it disagrees for over 1 s of
+ * status reads and two full polls since whose attach-marker checks both
+ * read attached, the heartbeat sends the jack frame again
+ * (creative_ae9_hu_update).
+ * Not while the head unit is unattached (its status then isn't ours: the
+ * full poll's marker check and the re-attach decide), not on the first read
+ * after a (re-)set-up; 3 resends without it agreeing, then left alone until
+ * it agrees again.
+ */
+static void creative_ae9_hu_amp_track(struct creative_chip *chip, u8 st)
+{
+	bool want = chip->hu_output && !chip->lo_virt_phys;
+
+	if (!chip->hu_status_valid || chip->hu_unattached || chip->hu_reattach_try ||
+	    !!(st & 0x40) == want) {
+		chip->hu_amp_since = 0;
+		if (chip->hu_status_valid && !!(st & 0x40) == want)
+			chip->hu_amp_try = 0;
+		return;
+	}
+	if (!chip->hu_amp_since) {
+		chip->hu_amp_since = jiffies | 1;	/* 0 = agrees */
+		chip->hu_amp_tick = chip->hu_ticks;
+		return;
+	}
+	/* 1 s, and two full polls since whose marker checks read attached */
+	if (time_before(jiffies, chip->hu_amp_since + msecs_to_jiffies(HU_AMP_SETTLE_MS)) ||
+	    (int)(chip->hu_att_tick - chip->hu_amp_tick) < 2)
+		return;
+	chip->hu_amp_since = 0;			/* a new 1 s after a resend */
+	if (chip->hu_amp_try < HU_AMP_TRIES) {
+		chip->hu_amp_fix = true;
+	} else if (chip->hu_amp_try == HU_AMP_TRIES) {
+		chip->hu_amp_try++;		/* said once */
+		dev_warn(chip->dev, "head unit: headphone amp still reads %s after %u jack frame resends; leaving it until it agrees again\n",
+			 want ? "off" : "on", HU_AMP_TRIES);
+	}
+}
+
+/* a jack frame sent by hand (debugfs): no resends until the amp agrees again */
+static void creative_ae9_hu_amp_hold(struct creative_chip *chip)
+{
+	chip->hu_amp_since = 0;
+	chip->hu_amp_fix = false;
+	chip->hu_amp_try = HU_AMP_TRIES + 1;	/* as after the warning, without it */
+}
+
+/* the jack frame again for the current output (see creative_ae9_hu_amp_track) */
+static void creative_ae9_hu_amp_fix(struct creative_chip *chip)
+{
+	bool want = chip->hu_output && !chip->lo_virt_phys;
+	u8 f[7] = { 0xf0, 0x03, 0x03, 0x02, want ? 0x40 : 0x00, 0x40, 0xf7 }, resp[24];
+
+	chip->hu_amp_fix = false;
+	chip->hu_amp_try++;
+	creative_spi_frame_win(chip, f, sizeof(f), resp, sizeof(resp));
+	dev_info(chip->dev, "head unit: headphone amp read %s for over %u ms on %s: jack frame sent again (%u of %u)\n",
+		 want ? "off" : "on", HU_AMP_SETTLE_MS,
+		 want ? "headphones" : chip->hu_output ?
+		 "headphones on the card's RCA out" : "speakers",
+		 chip->hu_amp_try, HU_AMP_TRIES);
 }
 
 /* Knob turn: c2 reply f0 c2 04 <dir> <steps> .., dir 0 = clockwise, ~2
@@ -2865,6 +2960,7 @@ static int creative_ae9_hu_parse(struct creative_chip *chip, const u8 *r,
 		 * as Windows: a 5 s hold switches the display instead */
 		if (chip->hu_status_valid && (chg & 0x08) && (st & 0x08))
 			ae9_dbg(chip, "head unit: SBX button down\n");
+		creative_ae9_hu_amp_track(chip, st);
 		chip->hu_status = st;
 		chip->hu_status_valid = true;
 
@@ -3011,6 +3107,8 @@ static bool ae9_lo_virt_on(struct creative_chip *chip)
 
 static void creative_ae9_hu_route(struct creative_chip *chip, bool hp)
 {
+	chip->hu_amp_since = 0;		/* a fresh jack frame: the amp check starts over */
+	chip->hu_amp_fix = false;
 	chip->lo_virt_phys = hp && ae9_lo_virt_on(chip);
 	creative_ae9_out_switch(chip, hp, chip->lo_virt_phys);
 }
@@ -3021,6 +3119,8 @@ static void creative_ae9_hu_route(struct creative_chip *chip, bool hp)
  */
 static void creative_ae9_hu_jack(struct creative_chip *chip, bool lo)
 {
+	chip->hu_amp_since = 0;		/* a fresh jack frame: the amp check starts over */
+	chip->hu_amp_fix = false;
 	chip->lo_virt_phys = lo;
 	creative_ae9_out_jack(chip, lo);
 }
@@ -3172,6 +3272,9 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				 "headphone jack");
 		}
 	}
+	/* the headphone amp disagreed with our jack frame (hu_amp_track) */
+	if (chip->hu_amp_fix)
+		creative_ae9_hu_amp_fix(chip);
 	/* a knob turn or button press ends "AE-9" at once (Windows keeps
 	 * it; showing the change feels better) */
 	if (steps || press_ms >= 0)
@@ -3265,6 +3368,8 @@ static void creative_ae9_hu_reattach(struct creative_chip *chip)
 	chip->hu_light_sent = chip->hu_light;
 	chip->hu_phantom_req = -1;
 	chip->hu_status_valid = false;	/* the next status read is the new base */
+	chip->hu_amp_since = 0;		/* and the set-up sent the jack frame */
+	chip->hu_amp_fix = false;
 	chip->hu_reattaches++;
 	dev_info(chip->dev, "head unit: powered up again (marker 0xaaaaaaaa): setup sent again (%s, volume att 0x%02x%s, phantom power off%s)\n",
 		 chip->hu_output ? (chip->lo_virt_phys ? "headphones on the RCA out" : "headphones") : "speakers",
@@ -3302,8 +3407,10 @@ static void creative_ae9_hb_windows(struct creative_chip *chip)
 		if (f->d[1] == 0xd5) {
 			int aa = creative_ae9_hu_marker(resp, n);
 
-			if (aa == 0)
+			if (aa == 0) {
 				chip->hu_reattach_try = 0;	/* attached */
+				chip->hu_att_tick = chip->hu_ticks + 1;
+			}
 			/* given up: read the status as usual */
 			if (aa >= 0)
 				chip->hu_unattached = aa &&
@@ -4070,6 +4177,10 @@ static void creative_ae9_hb_work(struct work_struct *work)
 			/* the frames back to back, each after the previous reply */
 			for (p = 0; p < k; p += f) {
 				f = tx[p + 2] + 4;	/* checked when queued */
+				/* a jack frame by hand (the uv33-36 method): the amp
+				 * safety net leaves it until the amp agrees again */
+				if (tx[p + 1] == 0x03 && f >= 5 && tx[p + 3] == 0x02)
+					creative_ae9_hu_amp_hold(chip);
 				n = creative_spi_frame_win(chip, tx + p, f, rx, sizeof(rx));
 				hex[0] = '\0';
 				for (j = 0, o = 0; j < min(n, 16); j++)
@@ -4214,6 +4325,10 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	chip->corb_to_run = 0;
 	chip->hu_unattached = false;
 	chip->hu_reattach_try = 0;
+	chip->hu_amp_since = 0;		/* the set-up sends the jack frame */
+	chip->hu_amp_fix = false;
+	chip->hu_amp_try = 0;
+	chip->hu_att_tick = 0;		/* a marker check after it says */
 	creative_ae9_bridge_log(chip, "before bring-up");
 
 	if (do_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {
@@ -4531,17 +4646,29 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 			 vlog_buf ? "on" : "allocation failed", verb_log);
 	}
 
-	/* 30-bit DMA mask — the CA0132 DSP may have only a 30-bit
-	 * address bus (1 GB limit) for DMA.  The CORB/RIRB buffers
-	 * must reside in the lowest 1 GB of system memory.
+	/*
+	 * 32-bit DMA mask, as stock CTHDA (AZX_DCAPS_NO_64BIT): GCAP 0x6400
+	 * has 64OK clear, and Windows ran every CORB, RIRB and BDL (DSP
+	 * loads included) at ~0x7e99xxxx with a zero upper word (30
+	 * captures, 8664 address writes). Card-tested 2026-11-17 at bus
+	 * addresses 0xfffff000 (IOMMU) and in passthrough. Until 0.12.13
+	 * this was 30-bit, from an unproven "may" comment; without IOMMU
+	 * translation that confined every buffer to the lowest 1 GB, with
+	 * the 16 MB DMA zone as the fallback.
 	 */
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(30));
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret < 0) {
 		dev_err(&pdev->dev, "No suitable DMA mask available\n");
 		return ret;
 	}
-	dev_info(&pdev->dev, "DMA: 30-bit mask, %s\n",
-		 device_iommu_mapped(&pdev->dev) ? "through the IOMMU" : "no IOMMU translation");
+	{
+		struct iommu_domain *dom = iommu_get_domain_for_dev(&pdev->dev);
+
+		dev_info(&pdev->dev, "DMA: 32-bit mask, %s\n",
+			 !dom ? "no IOMMU translation" :
+			 dom->type == IOMMU_DOMAIN_IDENTITY ?
+			 "IOMMU in passthrough (physical addresses)" : "through the IOMMU");
+	}
 
 	ret = pcim_iomap_regions(pdev, BIT(layout->hda_bar) | BIT(layout->ext_bar),
 				 CREATIVE_AE9_DRV_NAME);

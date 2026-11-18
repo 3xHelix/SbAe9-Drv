@@ -25,7 +25,11 @@
 //   0xC14 = line status (LSR): 0x40 = transmitter empty, bit 0 = byte
 //           received. The "0x40 ACK / 0x41 byte ready" handshake below is
 //           these two bits.                          our DSP_REG_RESP
-//   0xC7C = not a UART register; polled by Windows as a busy/ready status
+//   0xC7C = UART status (DW_apb_uart USR): bit 0 = busy, bit 1 = transmit
+//           FIFO not full, bit 2 = transmit FIFO empty, bit 3 = a byte
+//           received; 0x6 = idle. Windows reads it before every byte it
+//           sends (room in the FIFO?), and before a line setting (busy?).
+//                                                    our DSP_REG_STS
 //   0x320 = card GPIO (not part of the UART)
 //
 // Reference: ae9_mmio_capture.txt lines 68-108, 63986-64059+;
@@ -54,6 +58,10 @@
 #define DSP_REG_RESP		0xC14
 #define DSP_REG_STS		0xC7C
 #define DSP_REG_STREAM_PARAM	0x320
+
+#define AE9_UART_USR_BUSY	0x01	/* DSP_REG_STS bit 0: busy (sending, or bytes received) */
+#define AE9_UART_USR_TFNF	0x02	/* DSP_REG_STS bit 1: transmit FIFO not full */
+#define AE9_UART_LSR_DR		0x01	/* DSP_REG_RESP bit 0: a received byte waits */
 
 /* Sysex frame start / end bytes (historical names) */
 #define I2C_START	0xf0
@@ -361,6 +369,78 @@ int creative_i2c_dsp_init(struct creative_chip *chip)
  */
 
 /*
+ * Before the baud setting: wait until the UART isn't busy (USR bit 0), as
+ * Windows' set-baud does before its divisor-latch write (CtxHdb
+ * FUN_00014154 -> FUN_00013fe8: up to 1000 polls a character time apart;
+ * then it writes nothing). Its status read there always read idle (0x6,
+ * 36 post-DSP set-ups in 32 Windows traces), so normally this is that one
+ * read. A busy DW UART ignores LCR writes. Busy also means received bytes
+ * waiting (a reply's last byte reads 0xf until popped): with the divisor
+ * latch off (rx_ok) they are read out first (Windows doesn't; Linux's
+ * dw8250_force_idle does). Up to 2 ms, then the write goes ahead as it
+ * always has. A card off the bus (all ones) is left to the callers' checks.
+ * Since 0.12.13.
+ */
+void creative_uart_wait_idle(struct creative_chip *chip, bool rx_ok)
+{
+	ktime_t deadline = ktime_add_us(ktime_get(), 2000);
+	unsigned int drained = 0;
+	u32 usr = creative_ext_readl(chip, DSP_REG_STS);
+
+	if (usr == 0xffffffff)
+		return;
+	while (usr & AE9_UART_USR_BUSY) {
+		while (rx_ok && drained < 64) {
+			u32 lsr = creative_ext_readl(chip, DSP_REG_RESP);
+
+			if (lsr == 0xffffffff)
+				return;		/* the card left the bus */
+			if (!(lsr & AE9_UART_LSR_DR))
+				break;
+			creative_ext_readl(chip, DSP_REG_CMD);
+			drained++;
+		}
+		if (ktime_after(ktime_get(), deadline)) {
+			dev_warn(chip->dev, "head unit: UART still busy (status 0x%02x) before a line setting; writing it anyway\n",
+				 usr & 0xff);
+			break;
+		}
+		udelay(10);
+		usr = creative_ext_readl(chip, DSP_REG_STS);
+		if (usr == 0xffffffff)
+			return;		/* the card left the bus */
+	}
+	if (drained)
+		dev_info(chip->dev, "head unit: %u stray received byte%s read out before a line setting\n",
+			 drained, drained == 1 ? "" : "s");
+}
+
+/*
+ * Wait (up to 2 ms) until the transmit FIFO has room again: USR bit 1.
+ * Leaves the last status read in *usr. 0, or -ETIMEDOUT.
+ */
+static int creative_uart_wait_tfnf(struct creative_chip *chip, u32 *usr)
+{
+	ktime_t deadline = ktime_add_us(ktime_get(), 2000);
+
+	unsigned int polls = 0;
+
+	for (;;) {
+		/* a byte leaves every ~87 us: poll tightly, then sleep (process
+		 * context: the reply wait below sleeps too) */
+		if (++polls <= 10)
+			udelay(10);
+		else
+			usleep_range(20, 40);
+		*usr = creative_ext_readl(chip, DSP_REG_STS);
+		if (*usr & AE9_UART_USR_TFNF)
+			return 0;
+		if (ktime_after(ktime_get(), deadline))
+			return -ETIMEDOUT;
+	}
+}
+
+/*
  * Send one head-unit SPI frame exactly as Windows does (cold capture):
  * check C14/C7C idle, then per byte write C00, read C00, read C7C; after
  * the f7 terminator poll C14 and pop a reply byte from C00 whenever it
@@ -373,14 +453,34 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 	ktime_t deadline;
 	unsigned int idle = 0;
 	int i, n = 0, total = 0;
+	u32 usr;
 
 	creative_ext_readl(chip, DSP_REG_RESP);
 	creative_ext_readl(chip, DSP_REG_STS);
-	creative_ext_readl(chip, DSP_REG_STS);
+	usr = creative_ext_readl(chip, DSP_REG_STS);
 	for (i = 0; i < tx_len; i++) {
+		/*
+		 * USR bit 1 (TFNF): room in the transmit FIFO. Windows reads
+		 * it before every byte (CtxHda FUN_00031128 via CtxHdb's
+		 * 0x140e4; never clear in 53.5M reads of 32 traces): the
+		 * status read before the first byte here and the one after
+		 * each byte are those reads, so a full FIFO (32 deep, frames
+		 * up to 13 bytes) costs extra reads only when it happens:
+		 * wait up to 2 ms (a byte leaves every ~87 us at 115384
+		 * baud), else drop the frame as unanswered rather than
+		 * overrun the FIFO (Windows gives up after 1000 polls).
+		 * Since 0.12.13.
+		 */
+		if (!(usr & AE9_UART_USR_TFNF) &&
+		    creative_uart_wait_tfnf(chip, &usr) < 0) {
+			dev_warn_ratelimited(chip->dev,
+					     "head unit: UART transmit FIFO stayed full (status 0x%02x): frame %02x dropped after %d of %d bytes\n",
+					     usr & 0xff, tx_len > 1 ? tx[1] : 0, i, tx_len);
+			return -ETIMEDOUT;
+		}
 		creative_ext_writel(chip, DSP_REG_CMD, tx[i]);
 		creative_ext_readl(chip, DSP_REG_CMD);
-		creative_ext_readl(chip, DSP_REG_STS);
+		usr = creative_ext_readl(chip, DSP_REG_STS);
 	}
 	/*
 	 * Wait up to 20 ms for the reply. Poll tightly for the first ~100 us

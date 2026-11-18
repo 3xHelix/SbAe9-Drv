@@ -59,7 +59,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.12"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.13"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -474,6 +474,15 @@ struct creative_chip {
 	bool			hu_unattached;	/* 0x2000 marker read 0xaaaaaaaa */
 	unsigned int		hu_reattach_try; /* setup resends in a row */
 	unsigned int		hu_reattaches;	/* setup resends since load */
+	/* status bit 6 (headphone amp) against our jack frame: since when it
+	 * has disagreed (jiffies, 0 = agrees) and the full poll then (hu_ticks),
+	 * the full poll after the last marker check that read attached, a
+	 * resend due, resends in a row without it agreeing again (0.12.13) */
+	unsigned long		hu_amp_since;
+	unsigned int		hu_amp_tick;
+	unsigned int		hu_att_tick;
+	bool			hu_amp_fix;
+	unsigned int		hu_amp_try;
 	u8			hu_status;
 	struct snd_kcontrol	*hu_plug_ctl[3];	/* phones, mic, phantom (read-only) */
 	/* opt-in auto switch on the 3.5 mm headphone plug: a plug change waits
@@ -555,6 +564,7 @@ int creative_ae9_corb_send_verb_dbg(struct creative_chip *chip,
 int creative_i2c_dsp_init(struct creative_chip *chip);
 int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			   int tx_len, u8 *resp, int resp_len);
+void creative_uart_wait_idle(struct creative_chip *chip, bool rx_ok);
 int creative_i2c_raw_tx(struct creative_chip *chip, u8 reg,
 			const u8 *data, u8 len);
 

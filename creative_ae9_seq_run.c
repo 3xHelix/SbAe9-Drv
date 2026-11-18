@@ -1856,6 +1856,9 @@ static void post_dac_setup(struct ae9_post *p)
  */
 static void post_uart(struct ae9_post *p)
 {
+	/* not busy before the latch goes on, as Windows' set-baud (i2c.c; 0.12.13) */
+	if (!p->gone)
+		creative_uart_wait_idle(p->chip, true);
 	post_write32(p, AE9_BAR2_UART_LCR, 0x83);
 	post_write32(p, AE9_BAR2_UART_DATA, 0x0d);
 	post_write32(p, AE9_BAR2_UART_IER, 0x00);

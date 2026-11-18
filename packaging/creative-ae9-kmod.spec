@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.12
+Version:        0.12.13
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,14 @@ done
 %{?akmod_install}
 
 %changelog
+* Wed Nov 18 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.13-1
+- Driver 0.12.13: robustness release. Head-unit UART checks before each byte
+  and before a line-control change (as Windows); a headphone-amp safety net
+  that resends the jack frame if the head unit's amp disagrees; the Direct
+  Mode slot walk waits for the router chip; ae9-reload leaves a notice so
+  Sound Blaster Command and AudioMon let go of the card; 32-bit DMA (as
+  Windows).
+
 * Tue Nov 17 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.12-1
 - Driver 0.12.12: every command list the driver sends the card is now
   readable C instead of replayed tables (the card gets exactly the same
