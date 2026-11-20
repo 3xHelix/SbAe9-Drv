@@ -6,25 +6,47 @@
 # registers, card (BAR2) registers, codec converter state, ChipIO (router,
 # I2S clocks, DSP DMA, DBGCNTL) and the driver's recent log.
 #
-#   sudo scripts/ae9-full-dump.sh     -> ./ae9-dump-<time>.txt
-#   AE9_DUMP_DIR=dir sudo -E scripts/ae9-full-dump.sh   -> dir/ae9-dump-<time>.txt
+#   ae9-full-dump              -> ~/ae9-dumps/ae9-dump-<time>.txt (asks for sudo)
+#   AE9_DUMP_DIR=dir ae9-full-dump   -> dir/ae9-dump-<time>.txt
+#   ae9-full-dump --report     -> ~/ae9-dumps/ae9-report-<time>/ (the dump,
+#       system.txt: versions and install, kernel-log.txt: the driver's lines
+#       from this boot) and ae9-report-<time>.tar.gz of it, to attach to an
+#       issue
+# From a development checkout (scripts/ae9-full-dump.sh with a .tmp folder
+# next to it) the default is .tmp/logs instead. ~ is the home of the user who
+# ran sudo, and the folder and file belong to that user.
 #
-# Only reads (the same registers the driver itself reads). Take one in a bad
+# Only reads (the same registers the driver itself reads, plus sysfs, lspci,
+# pactl and udevadm for the system and PCI part). Take one in a bad
 # state and one in a good state, then compare. For a bug report, attach the
 # file. It holds no personal data beyond which apps are playing (PipeWire
-# stream names) and your kernel version: look it over before posting.
+# stream names), your kernel, sound hardware and the names of your audio
+# config files: look it over before posting.
 # Needs the driver loaded (debugfs mounted, as on most distributions).
 # Each run also leaves an "ae9-full-dump: saved <file>" line in the kernel log.
 set -u
-[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+REPORT=0
+case "${1:-}" in
+"") ;;
+--report) REPORT=1 ;;
+*) echo "usage: ae9-full-dump [--report]" >&2; exit 2 ;;
+esac
+[ "$(id -u)" = 0 ] || exec sudo ${AE9_DUMP_DIR:+AE9_DUMP_DIR="$AE9_DUMP_DIR"} "$0" "$@"
 U=${SUDO_USER:-$USER}
 H=$(getent passwd "$U" | cut -d: -f6)
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 if [ -n "${AE9_DUMP_DIR:-}" ]; then LOGS=$AE9_DUMP_DIR
 elif [ -d "$REPO/.tmp" ]; then LOGS=$REPO/.tmp/logs	# a development checkout
-else LOGS=$PWD; fi
+else LOGS=$H/ae9-dumps; fi
 mkdir -p "$LOGS" && chown "$U": "$LOGS"
-OUT=$LOGS/ae9-dump-$(date +%Y%m%d-%H%M%S).txt
+STAMP=$(date +%Y%m%d-%H%M%S)
+if [ $REPORT = 1 ]; then
+	RDIR=$LOGS/ae9-report-$STAMP
+	mkdir -p "$RDIR" || exit 1
+	OUT=$RDIR/ae9-dump-$STAMP.txt
+else
+	OUT=$LOGS/ae9-dump-$STAMP.txt
+fi
 CMD=/sys/kernel/debug/creative_ae9/cmd
 P=/sys/module/snd_hda_codec_creative_ae9/parameters
 [ -w "$CMD" ] || { echo "driver not loaded or no debugfs ($CMD)" >&2; exit 1; }
@@ -32,6 +54,11 @@ P=/sys/module/snd_hda_codec_creative_ae9/parameters
 dbg() { echo "$1" > $CMD; cat $CMD; }
 asuser() { sudo -u "$U" XDG_RUNTIME_DIR=/run/user/$(id -u "$U") "$@"; }
 sec() { printf '\n===== %s =====\n' "$1"; }
+# the card's sysfs: sound card (cardN), its PCI device, and the PCI name
+# PipeWire uses (alsa_output.pci-0000_06_00.0.*)
+SCARD=$(readlink /proc/asound/AE9 2>/dev/null)
+DEV=$(readlink -f /sys/class/sound/$SCARD/device 2>/dev/null)
+ae9pci=$(basename "$DEV" | tr : _)
 
 {
 echo "# AE-9 full dump $(date -Is), kernel $(uname -r)"
@@ -55,9 +82,58 @@ cat /sys/kernel/debug/creative_ae9/state 2>/dev/null || echo "(no state file: dr
 
 sec "PipeWire"
 asuser pactl list sinks short
-asuser pactl list sink-inputs 2>/dev/null | grep -E "Sink Input|Sink:|Corked|application.name|format\."
+# LC_ALL=C: pactl translates its labels ("Volume :" in French), which the
+# grep would miss. Volume and Channel Map show a stream with one channel
+# turned down or mapped away.
+asuser LC_ALL=C pactl list sink-inputs 2>/dev/null |
+	grep -E "Sink Input|Sink:|Corked|application.name|format\.|Volume:|Channel Map:"
+# what feeds each AE-9 output port: a channel with no link plays nothing
+echo "--- links into the AE-9 outputs (pw-link)"
+[ -n "$ae9pci" ] && asuser pw-link -l 2>/dev/null |
+	awk -v t="alsa_output.pci-$ae9pci." 'index($0, t) == 1 && /:playback_/ {p = 1; print; next}
+		/^ / && p {print; next} {p = 0}'
 asuser pw-metadata -n settings 0 2>/dev/null | grep -E "rate|quantum"
-timeout 4 sudo -u "$U" XDG_RUNTIME_DIR=/run/user/$(id -u "$U") pw-top -b -n 2 2>/dev/null | tail -8
+# every running node from pw-top's second sample: a driver (a clock) first,
+# its followers under it ("+", "="); ERR = that node's xruns since it started
+echo "--- pw-top (running nodes; ERR = PipeWire xruns per node)"
+timeout 4 sudo -u "$U" XDG_RUNTIME_DIR=/run/user/$(id -u "$U") pw-top -b -n 2 2>/dev/null |
+	awk '/^S +ID +QUANT/ {n++; if (n == 2) print; next} n == 2 && $1 == "R"'
+# without our profile set (89-ae9-pipewire.rules -> ACP_PROFILE_SET)
+# PipeWire offers only "stereo-fallback": no optical in, What U Hear, rear RCA
+echo "--- card profile"
+udevadm info "/sys/class/sound/$SCARD" 2>/dev/null | grep -E "ACP_|PULSE_" | sed 's/^E: //'
+asuser LC_ALL=C pactl list cards 2>/dev/null |
+	awk -v t="alsa_card.pci-$ae9pci" '/^Card #/ {p = 0} $1 == "Name:" {p = ($2 == t)} p && /Active Profile:/ {sub(/^\t/, ""); print}'
+echo "--- PipeWire / WirePlumber config files (names only)"
+find "$H/.config/pipewire" "$H/.config/wireplumber" /etc/pipewire /etc/wireplumber -type f 2>/dev/null |
+	sed "s|^$H|~|"
+
+sec "System and PCI (read only; the card isn't touched)"
+echo "up $(cut -d. -f1 /proc/uptime) s, load $(cut -d' ' -f1-3 /proc/loadavg), suspends since boot $(cat /sys/power/suspend_stats/success 2>/dev/null)"
+# without root=, resume= and the like (disk ids)
+echo "cmdline: $(tr ' ' '\n' < /proc/cmdline | grep -vE '^(BOOT_IMAGE|root|resume|rd\.luks|rd\.lvm|cryptdevice|initrd)=' |
+	grep -vi uuid | tr '\n' ' ')"
+echo "--- driver options set in modprobe.d"
+grep -rsH -iE "ae9|creative" /etc/modprobe.d /usr/lib/modprobe.d /run/modprobe.d | grep -v ':#' | cut -c1-200 ||
+	echo "(none)"
+echo "--- sound cards"
+cat /proc/asound/cards
+echo "--- card interrupt (count per CPU, type)"
+grep -E "creative-ae9" /proc/interrupts | tr -s ' '
+g=$(readlink "$DEV/iommu_group" 2>/dev/null)
+if [ -n "$g" ]; then echo "--- IOMMU: on, card in group ${g##*/}"
+else echo "--- IOMMU: off (no group for the card)"; fi
+# the card and every bridge up to the root port: the PCIe link (speed,
+# width, ASPM) lives on the bridges; AER counts link errors
+echo "--- PCI path (card first, then each bridge up to the root port)"
+for d in $(echo "$DEV" | tr / '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' | tac); do
+	s=/sys/bus/pci/devices/$d
+	lspci -vvv -s "$d" 2>/dev/null | grep -E "^[0-9a-f]|LnkCap:|LnkCtl:|LnkSta:|DevSta:|MSI: Enable|Status: D[0-3]|Kernel driver"
+	echo "	power: runtime $(cat $s/power/runtime_status 2>/dev/null), control $(cat $s/power/control 2>/dev/null)"
+	for a in correctable nonfatal fatal; do
+		[ -r "$s/aer_dev_$a" ] && printf '\tAER %s: %s\n' $a "$(grep -E '^TOTAL' "$s/aer_dev_$a" | cut -d' ' -f2)"
+	done
+done
 
 sec "HDA controller and playback stream SD4 (BAR0)"
 for o in 0x08 0x0c 0x0e 0x20 0x24 0x40 0x4c 0x58 0x5c 0x100 0x104 0x108 0x10c 0x110 0x118 0x11c; do
@@ -154,4 +230,46 @@ chown "$U": "$OUT"
 # a line in the kernel log (dmesg / journalctl -k), so a later log shows
 # that a dump was taken, when, and where it went
 echo "<5>ae9-full-dump: saved $OUT (driver $(cat /sys/module/snd_hda_codec_creative_ae9/version 2>/dev/null) $(cat /sys/module/snd_hda_codec_creative_ae9/srcversion 2>/dev/null))" > /dev/kmsg 2>/dev/null
-echo "saved $OUT"
+[ $REPORT = 1 ] || { echo "saved $OUT"; exit 0; }
+
+# --report: what the issue checklist asks for, beside the dump
+{
+echo "# AE-9 report $(date -Is)"
+echo "--- system"
+uname -r
+grep -E "^(PRETTY_NAME|VERSION_ID)=" /etc/os-release 2>/dev/null
+echo "--- driver"
+for f in version srcversion; do
+	printf '%-11s %s\n' $f "$(cat /sys/module/snd_hda_codec_creative_ae9/$f 2>/dev/null)"
+done
+printf '%-11s %s\n' file "$(modinfo -n snd-hda-codec-creative-ae9 2>/dev/null)"
+echo "--- install"
+command -v dkms >/dev/null && dkms status 2>/dev/null | grep -i ae9
+command -v rpm >/dev/null && rpm -qa 2>/dev/null | grep -i creative-ae9
+command -v dpkg-query >/dev/null && dpkg-query -W 2>/dev/null | grep -i creative-ae9
+command -v pacman >/dev/null && pacman -Q 2>/dev/null | grep -i creative-ae9
+echo "--- firmware"
+fw=$(command -v ae9-get-firmware || echo "$REPO/scripts/ae9-get-firmware.sh")
+[ -x "$fw" ] && "$fw" --check 2>&1 || echo "(ae9-get-firmware not found)"
+echo "--- audio stack"
+asuser pipewire --version 2>/dev/null | tail -1
+asuser wireplumber --version 2>/dev/null | tail -1
+amixer -c AE9 cget name='Driver Health' 2>/dev/null | tail -1 | sed 's/^ *: /Driver Health /'
+echo "--- card (lspci)"
+lspci -nnk -d 1102: 2>/dev/null
+} > "$RDIR/system.txt" 2>&1
+# this boot's driver lines and IOMMU faults (no host name)
+{
+journalctl -k -b -o short-monotonic --no-hostname --no-pager 2>/dev/null |
+	grep -iE "creative.ae9|ae9-full-dump|AMD-Vi|DMAR|IO_PAGE_FAULT" | grep -vE "dbg verb|hu_debug"
+# how the last boot left the card (a dark card after a warm reboot)
+echo "--- previous boot: the driver's last 40 lines"
+journalctl -k -b -1 -o short-monotonic --no-hostname --no-pager 2>/dev/null |
+	grep -iE "creative.ae9" | grep -vE "dbg verb|hu_debug" | tail -40
+} > "$RDIR/kernel-log.txt"
+TGZ=$LOGS/ae9-report-$STAMP.tar.gz
+chown -R "$U": "$RDIR"
+tar -C "$LOGS" -czf "$TGZ" "ae9-report-$STAMP"
+chown "$U": "$TGZ"
+echo "saved $RDIR/ (to read)"
+echo "and   $TGZ (attach this one to your issue)"

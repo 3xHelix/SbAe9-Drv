@@ -725,11 +725,8 @@ static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *re
  * a refusal; after 0x712/0x713 wait for its job too (Windows reads the
  * port result only after that). A value write is never sent after a lost
  * select (it would land on the previous parameter): counted and refused
- * (-EBUSY). router_poll=0: as before.
+ * (-EBUSY). (router_poll=0, until 0.12.14, sent them blind, as before.)
  */
-static bool router_poll = true;
-module_param(router_poll, bool, 0644);
-MODULE_PARM_DESC(router_poll, "Wait for the router chip's busy status before each of its parameter verbs and resend a refused one, as Windows (1 = yes, default; 0 = send blind, as before 0.12.11)");
 
 #define AE9_R51_STATUS		0x115f0100	/* F01: router chip busy (1) or idle (0) */
 #define AE9_R51_IDLE_TRIES	200		/* ~10 ms of status reads */
@@ -784,7 +781,7 @@ static int ae9_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *resp, b
 	u32 r = 0;
 	int ret;
 
-	if (!router_poll || !ae9_r51_param_verb(verb))
+	if (!ae9_r51_param_verb(verb))
 		return ae9_corb_send_verb_sync(chip, verb, resp);
 	mutex_lock(&chip->r51_mutex);
 	ret = ae9_r51_send(chip, verb, id, &r, any_task);

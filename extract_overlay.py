@@ -53,9 +53,9 @@ def main():
     if [(a, c) for a, c in segs[:2]] != want:
         sys.exit(f"second image doesn't look like the overlay: {segs}")
     import hashlib
-    md5 = hashlib.md5(blob).hexdigest()
-    if md5 != '0e222c941f708a2caf93d50d2aba5ef8' and '--force' not in sys.argv:
-        sys.exit(f"MD5 {md5} is not the tested overlay image; use --force to write it anyway")
+    sha = hashlib.sha256(blob).hexdigest()  # MD5 0e222c94...
+    if sha != 'ecc0740bde7ead2be16526edb9d6089ca6413c672679ceeb33b0f13b712dfe1c' and '--force' not in sys.argv:
+        sys.exit(f"SHA-256 {sha} is not the tested overlay image; use --force to write it anyway")
     open(out, 'wb').write(blob)
     print(f"wrote {out}: {len(blob)} bytes from offset 0x{off:x}, segments {segs[:2]}")
 

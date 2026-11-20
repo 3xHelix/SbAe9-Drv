@@ -9,7 +9,7 @@
 %global modname snd-hda-codec-creative-ae9
 
 Name:           creative-ae9-dkms
-Version:        0.12.13
+Version:        0.12.14
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -120,6 +120,15 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.14-1
+- Driver 0.12.14: native DSD64 (experimental, opt-in with pcm_dsd=1): DSD
+  straight to the DAC's DSD decoder, as Creative's Windows DSD driver does
+  it. Optical in no longer restarts falsely; optical-in and head-unit
+  counters in debugfs; the head unit logs "not answering" once; 8 options
+  removed (always on); firmware checked by SHA-256; ae9-reload keeps a
+  forced PipeWire rate/quantum; ae9-full-dump --report packs a .tar.gz with
+  versions, the driver log and the PCI path.
+
 * Wed Nov 18 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.13-1
 - Driver 0.12.13: robustness release. Head-unit UART checks before each byte
   and before a line-control change (as Windows); a headphone-amp safety net

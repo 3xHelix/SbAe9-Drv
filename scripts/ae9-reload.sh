@@ -21,6 +21,9 @@
 # end (removed on any exit). An app that holds the card closes it while the
 # file exists and that PID is alive, and opens it again once the file is
 # gone (or its PID is: a reload killed half-way).
+# PipeWire's live clock.force-rate and clock.force-quantum (pw-metadata -n
+# settings) don't survive its restart: when set (not 0) they're saved before
+# the stop and set again after.
 # A reload doesn't fix everything: when the card's DSP won't start again,
 # only a full power-off does (PSU switch or unplug for 15-30 s).
 set -u
@@ -56,6 +59,39 @@ ucmd() {	# systemctl --user for the desktop user
 		sudo -u "$DUSER" XDG_RUNTIME_DIR=/run/user/$uid \
 			DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus systemctl --user "$@"
 	fi
+}
+
+urun() {	# a command as the desktop user, in their session (for pw-metadata)
+	[ -n "$DUSER" ] && [ "$DUSER" != root ] || return 1
+	if [ "$(id -un)" = "$DUSER" ]; then
+		"$@"
+	else
+		sudo -u "$DUSER" XDG_RUNTIME_DIR=/run/user/"$(id -u "$DUSER")" "$@"
+	fi
+}
+pw_saved=()
+pw_save() {	# "key value" for clock.force-rate / clock.force-quantum when not 0
+	local k v line
+	command -v pw-metadata >/dev/null || return 0
+	line=$(urun pw-metadata -n settings 0 2>/dev/null) || return 0
+	for k in clock.force-rate clock.force-quantum; do
+		v=$(printf '%s\n' "$line" | sed -n "s/.*key:'$k' value:'\([0-9]*\)'.*/\1/p" | head -1)
+		[ -n "$v" ] && [ "$v" != 0 ] && pw_saved+=("$k $v")
+	done
+	return 0
+}
+pw_restore() {	# once PipeWire answers again (up to 10 s)
+	local kv i
+	[ ${#pw_saved[@]} = 0 ] && return 0
+	for ((i = 0; i < 20; i++)); do
+		urun pw-metadata -n settings 0 >/dev/null 2>&1 && break
+		sleep 0.5
+	done
+	for kv in "${pw_saved[@]}"; do
+		# shellcheck disable=SC2086
+		urun pw-metadata -n settings 0 $kv >/dev/null 2>&1
+	done
+	echo "PipeWire settings set again: ${pw_saved[*]}"
 }
 
 card_nodes() {	# the AE-9's device files, while its card exists
@@ -98,8 +134,10 @@ restart() {
 	for s in "${PW[@]}" "${OURS[@]}"; do
 		[[ " ${ran_user[*]} " == *" $s "* ]] && ucmd start "$s"
 	done
+	[[ " ${ran_user[*]} " == *" pipewire.service "* ]] && pw_restore
 	return 0
 }
+pw_save
 echo "stopping: ${ran_user[*]:-} ${ran_sys[*]:-}"
 [ ${#ran_user[@]} = 0 ] || ucmd stop "${ran_user[@]}"
 [ ${#ran_sys[@]} = 0 ] || $SU systemctl stop "${ran_sys[@]}"

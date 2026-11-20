@@ -1592,7 +1592,7 @@ static void pre_codec1_jacks(struct ae9_cold *c)
  * FUN_0012d914, the DSP image's rate 96 kHz from its registry default):
  * PLL/PMU register 0 = 0xff (all its bits on: the first write of mainline's
  * chipio_enable_clocks()), the 96 kHz flags for the DSP, the DACs, ADCs B
- * and C and the sample-rate converter, connection points 0x0a (What U Hear)
+ * and C and the S/PDIF transmitter, connection points 0x0a (What U Hear)
  * and 0x0b at 48 kHz again, then a ChipIO status read (the download's first
  * verb, the ChipIO stream format, follows: dsp.c). Entries 795-814 (tap
  * seq 1590-1629).
@@ -1714,7 +1714,7 @@ void creative_ae9_predownload(struct creative_chip *chip)
 /*
  * ChipIO verb 0x725: an ASI rate-class request (class = bits 2:0, bit 7 =
  * enable; Windows reads it back with 0xf25): 0x81 for 44.1-192 kHz, 0x80 for
- * 384 kHz and the sample-rate converter (notes 08); not in mainline
+ * 384 kHz and the S/PDIF transmitter (notes 08); not in mainline
  */
 #define AE9_VERB_CHIPIO_ASI_RATE 0x725
 #define AE9_STREAM_DSP_PROC	0x0c	/* DSP-processed audio to the DACs (mainline AE-5/7) */

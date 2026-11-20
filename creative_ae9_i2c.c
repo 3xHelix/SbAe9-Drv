@@ -451,9 +451,10 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			   int tx_len, u8 *resp, int resp_len)
 {
 	ktime_t deadline;
-	unsigned int idle = 0;
+	unsigned int idle = 0, nskip = 0;
 	int i, n = 0, total = 0;
-	u32 usr;
+	u32 usr, echo = 0, lsr, odd = 0;
+	u8 skip0 = 0, cmd = tx_len > 1 ? tx[1] : 0;
 
 	creative_ext_readl(chip, DSP_REG_RESP);
 	creative_ext_readl(chip, DSP_REG_STS);
@@ -476,10 +477,14 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			dev_warn_ratelimited(chip->dev,
 					     "head unit: UART transmit FIFO stayed full (status 0x%02x): frame %02x dropped after %d of %d bytes\n",
 					     usr & 0xff, tx_len > 1 ? tx[1] : 0, i, tx_len);
+			creative_ae9_hu_frame_note(chip, -ETIMEDOUT, cmd, AE9_HU_MISS_TXFULL,
+						   i, usr & 0xff);
 			return -ETIMEDOUT;
 		}
 		creative_ext_writel(chip, DSP_REG_CMD, tx[i]);
-		creative_ext_readl(chip, DSP_REG_CMD);
+		/* Windows' echo read; after the f7 it can take the reply's
+		 * own f0 if we were held up (kept for the miss record) */
+		echo = creative_ext_readl(chip, DSP_REG_CMD);
 		usr = creative_ext_readl(chip, DSP_REG_STS);
 	}
 	/*
@@ -490,14 +495,23 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 	 */
 	deadline = ktime_add_us(ktime_get(), 20000);
 	for (;;) {
-		if ((creative_ext_readl(chip, DSP_REG_RESP) & 0xff) == 0x41) {
+		lsr = creative_ext_readl(chip, DSP_REG_RESP) & 0xff;
+		/* a line error bit (overrun, parity, framing, break, FIFO
+		 * error): none in 52M of Windows' reads; kept for the record */
+		if (!odd && (lsr & 0x9e))
+			odd = lsr | 0x100;
+		if (lsr == 0x41) {
 			u8 b = creative_ext_readl(chip, DSP_REG_CMD) & 0xff;
 
 			idle = 0;
 			/* a reply starts at f0: anything before it is a byte an
-			 * earlier, cut-short reply left behind */
-			if (!n && b != I2C_START)
+			 * earlier, cut-short reply left behind (or the reply's
+			 * own, after the echo read took its f0) */
+			if (!n && b != I2C_START) {
+				if (!nskip++)
+					skip0 = b;
 				continue;
+			}
 			if (resp && n < resp_len)
 				resp[n] = b;
 			n++;
@@ -514,12 +528,23 @@ int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			 * f7 data byte. A reply shorter than its length (never
 			 * seen) times out; a longer one ends at the first f7 past its length.
 			 */
-			if (b == I2C_STOP && n > 1 && (!total || n >= total))
+			if (b == I2C_STOP && n > 1 && (!total || n >= total)) {
+				creative_ae9_hu_frame_note(chip, n, cmd, 0, 0, 0);
 				return n;
+			}
 			continue;
 		}
-		if (ktime_after(ktime_get(), deadline))
+		if (ktime_after(ktime_get(), deadline)) {
+			/* a: n | skipped bytes << 8 | the first << 16 | the echo
+			 * after the f7 << 24; b: USR after the f7 | odd LSR << 8 */
+			creative_ae9_hu_frame_note(chip, -ETIMEDOUT, cmd,
+						   n ? AE9_HU_MISS_SHORT :
+						   nskip ? AE9_HU_MISS_NOF0 : AE9_HU_MISS_NONE,
+						   min_t(u32, n, 255) | min_t(u32, nskip, 255) << 8 |
+						   (u32)skip0 << 16 | (echo & 0xff) << 24,
+						   (usr & 0xff) | odd << 8);
 			return -ETIMEDOUT;
+		}
 		creative_ext_readl(chip, DSP_REG_STS);
 		if (++idle < 100)
 			udelay(1);

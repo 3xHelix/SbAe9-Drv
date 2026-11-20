@@ -262,7 +262,10 @@ void creative_ae9_capture_seq(struct creative_chip *chip, bool start)
 #define AE9_I2S_CLK_48K		0x0001f100
 #define AE9_I2S_RATE_48K	0x00008005
 
-/* the card's sample-rate converter (CtxHda FUN_00039868) */
+/* the card's S/PDIF transmitter for the 44.1 kHz family (CtxHda FUN_00039868;
+ * called a sample-rate converter until 0.12.14: it sends the stream as S/PDIF
+ * on CA0132 pin 0 to the ES9038's DATA2, which re-times it; the DAC measured
+ * 176399.8 Hz on its S/PDIF input at 176.4 kHz, card test 2026-11-19) */
 #define AE9_SRC_CTL		0x18a020	/* (rate multiple k << 6) | 2, then | 3 */
 #define AE9_SRC_CFG		0x18a024
 #define AE9_SRC_DIV		0x18a028
@@ -280,7 +283,7 @@ void creative_ae9_capture_seq(struct creative_chip *chip, bool start)
  * and sets DAC 48/0a = 0x12.
  *
  * 44.1 kHz family (44.1/88.2/176.4): no re-clock. DSP stream 0x05 goes to
- * connection point 0x91 (the card's sample-rate converter) at the stream's
+ * connection point 0x91 (the card's S/PDIF transmitter) at the stream's
  * rate code, the converter is set up (0x18a020/24/28 and its PLL/PMU
  * clock), and the block's router section is left out, as in Windows.
  *
@@ -316,10 +319,6 @@ static const struct ae9_pcm_rate {
 	{ 384000, AE9_ROUTE_DIRECT, 0x0e, 0x0001f103, 0x00031002, 16, 0x12 },
 };
 
-/* 44.1/88.2 kHz: send Windows' extra DAC commands (see ae9_pb_dac_start()). */
-static bool dac_441 = true;
-module_param(dac_441, bool, 0644);
-MODULE_PARM_DESC(dac_441, "44.1/88.2 kHz: send Windows' DAC commands 48/01 = 0xc1, 48/0b = 0x20 (1 = yes, default; 0 = as before)");
 
 /*
  * Windows reprograms the ES9038 DAC at every stream start (12 commands,
@@ -416,7 +415,7 @@ static void blk_out_level(struct ae9_blk *b, u8 nid, bool right, u8 fine, u8 amp
  *   FUN_00034250): its Active byte read; it was off in the capture, so
  *   nothing more.
  * - Stream 0x05 (host audio, connection point 0x43) to the front DAC output
- *   0xd0, or to the sample-rate converter 0x91 for the 44.1 kHz family; its
+ *   0xd0, or to the S/PDIF transmitter 0x91 for the 44.1 kHz family; its
  *   channels; that connection point's rate (FUN_00027648, FUN_000278b4).
  * - Stream 0x14 (the direct path) from 0x43 to connection point 0, that
  *   point at 96 kHz, its channels (FUN_00027594, FUN_000278b4, FUN_00027504).
@@ -480,7 +479,7 @@ static void pb_i2s_clocks(struct ae9_blk *b, u32 clk, u32 rate)
 }
 
 /*
- * The 44.1 kHz family's sample-rate converter, in place of the block's
+ * The 44.1 kHz family's S/PDIF transmitter, in place of the block's
  * router section (Windows' captures 2026-11-03/05 at 44.1 and 88.2 kHz;
  * its converter table, FUN_00039868, for 176.4): enabled at the stream's
  * rate multiple, the converter clock (PLL/PMU 0x01 = 0x17, 0x40 = 0x06,
@@ -595,8 +594,8 @@ static void ae9_pb_start_block(struct creative_chip *chip, const struct ae9_pcm_
 }
 
 /*
- * The head unit's front DAC, an ESS ES9038Q2M, behind the CA0113: group
- * 0x48. Its registers (ESS datasheet; docs/DECODED-SEQUENCES.md):
+ * The card's front DAC, an ESS ES9038Q2M, behind the CA0113: group 0x48
+ * (the card's RCA out and the head unit's headphones). Its registers (ESS datasheet; docs/DECODED-SEQUENCES.md):
  */
 #define AE9_DAC_FRONT		0x48
 #define ES9038_INPUT_SELECT	0x01	/* 0xc0 32-bit I2S, 0xc1 S/PDIF (on DATA2) */
@@ -627,8 +626,7 @@ static void pb_dac(u8 (*cmds)[3], unsigned int *n, u8 reg, u8 val)
  * hp: the head unit's output is the headphones; sync: 48/0a for the rate
  * (0x12 at 384 kHz: 128 fs).
  *
- * fam441: the 44.1 kHz family through the sample-rate converter (with
- * dac_441). Windows sends 48/01 = 0xc1 (S/PDIF input; 0xc0 for the 48 kHz
+ * fam441: the 44.1 kHz family through the S/PDIF transmitter. Windows sends 48/01 = 0xc1 (S/PDIF input; 0xc0 for the 48 kHz
  * family) and 48/0b = 0x20 before 48/0a, at every such start (all
  * captures; 2026-11-05 01:59:56 and 02:00:18). Without them our 44.1 kHz
  * played garbled or silent. Windows READS 48/0b first (0x20c = 0x800003);
@@ -735,7 +733,7 @@ static void ae9_pb_start(struct creative_chip *chip, unsigned int rate, u16 form
 		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
 			row->rate);
 	} else {
-		ae9_pb_dac_start(chip, hp, row->route == AE9_ROUTE_SRC && dac_441, row->dac0a);
+		ae9_pb_dac_start(chip, hp, row->route == AE9_ROUTE_SRC, row->dac0a);
 		chip->dac_start_key = (r + 1) | hp << 8;
 	}
 	six = (format & 0xf) == 5 && row->ports <= 8 && chip->fx.direct;
@@ -746,7 +744,7 @@ static void ae9_pb_start(struct creative_chip *chip, unsigned int rate, u16 form
 	if (row->rate != 48000)
 		dev_info(chip->dev, "pcm_rates: playback at %u Hz, format 0x%04x (%s, rate code 0x%02x)\n",
 			 row->rate, format,
-			 row->route == AE9_ROUTE_SRC ? "via the sample-rate converter" : "direct",
+			 row->route == AE9_ROUTE_SRC ? "via the S/PDIF transmitter" : "direct",
 			 row->cp_code);
 	ae9_pb_start_block(chip, row, format, six, hp);
 	chip->dsp_primed = true;
@@ -2113,4 +2111,108 @@ void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 	 */
 	dev_info(chip->dev, "bar2_first: Windows BAR2 init done, BAR2+0x4=0x%08x (Windows: 0x7172000a), 0x1c=0x%08x (Windows: 0x00880480)\n",
 		 creative_ext_readl(chip, AE9_BAR2_ID), creative_ext_readl(chip, AE9_BAR2_CTL));
+}
+
+/* ------------------------------------------------------------------ */
+/* Native DSD64 (experimental; pcm.c, pcm_dsd): the verb parts of	  */
+/* Windows' DSD start and stop						  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Creative's DSD ASIO driver (CtxDsd64.dll) plays DSD64 natively through
+ * CtxHda.sys's DSD stream class (FUN_0012fa08; notes
+ * .tmp/notes/dsd-windows.md): the HDA stream carries 6 x 16 bit at 88.2 kHz
+ * (format 0x4815) and the CA0113's own I2S block in BAR2 (channels 2 and 3,
+ * data on GPIO pins 6/7) takes it straight from the stream, with the ES9038
+ * in DSD input (48/01 = 0xc3) and GPIO pin 1 high. pcm.c sends the DAC
+ * commands, the GPIO and the BAR2 writes in Windows' order around these
+ * blocks.
+ */
+
+/* One GPIO pin, as hu_gpio() (Windows' CtxHdb FUN_00013d10: BAR2 0x320 = pin | level << 8) */
+void creative_ae9_gpio_set(struct creative_chip *chip, u8 pin, bool on)
+{
+	hu_gpio(chip, pin, on);
+}
+
+/* the 88.2 kHz row: DSD64 runs the link at 88.2 kHz */
+static const struct ae9_pcm_rate *ae9_dsd_row(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ae9_pcm_rates); i++)
+		if (ae9_pcm_rates[i].rate == 88200)
+			return &ae9_pcm_rates[i];
+	return &ae9_pcm_rates[0];	/* not reached: the table has it */
+}
+
+/*
+ * The DSD start's router, format, bind and clocks, one block. Windows' board
+ * stage 2 (FUN_0003354c) is the 88.2 kHz Direct start's with 6 channels
+ * (stream 0x05: 0x43 -> converter 0x91 at rate code 0x0a; stream 0x14: 0x43
+ * -> connection point 0 at 96 kHz; both 6 channels), then converter 0x02's
+ * format (FUN_000206ec: 0x4815) and bind (FUN_000203a4), then stage 3's 88.2
+ * kHz clocks (FUN_000339ec -> FUN_00033d50: the converter and the 44.1 kHz
+ * family PLL). Here: our 88.2 kHz start's pb_stream_setup() with 6 channels,
+ * pb_i2s_clocks() at the 48 kHz values (ours, not Windows': our 44.1 kHz
+ * family start re-clocks the I2S because after a 384 kHz stream the
+ * converter's enable didn't take without it) and pb_src_setup(). hp: the
+ * output is the headphones (the port map).
+ */
+void creative_ae9_dsd_start_block(struct creative_chip *chip, u16 format, bool hp)
+{
+	const struct ae9_pcm_rate *row = ae9_dsd_row();
+	struct ae9_blk b;
+
+	blk_begin(&b, chip);
+	pb_stream_setup(&b, row, format, true, hp);
+	pb_i2s_clocks(&b, AE9_I2S_CLK_48K, AE9_I2S_RATE_48K);
+	pb_src_setup(&b, row);
+	blk_end(&b, "DSD64: start block (88.2 kHz Direct, 6 channels)");
+}
+
+/*
+ * Stage 3's converter re-enable (FUN_000336d8, 44.1 kHz family): 0x18a020
+ * read and written back. A read that fails writes what pb_src_setup() left.
+ */
+void creative_ae9_dsd_rearm_block(struct creative_chip *chip)
+{
+	unsigned int v = ae9_dsd_row()->src[4];
+	struct ae9_blk b;
+
+	blk_begin(&b, chip);
+	creative_dsp_chipio_addr_invalidate();
+	if (creative_dsp_chipio_read(chip, AE9_SRC_CTL, &v) < 0)
+		v = ae9_dsd_row()->src[4];
+	blk_chipio_write(&b, AE9_SRC_CTL, v);
+	blk_end(&b, "DSD64: converter re-enabled");
+}
+
+/*
+ * Stage 3's end (FUN_000336d8): in DSD Windows skips stream 0x14's enable
+ * (FUN_000341e4) and only sets ASI 0x0f
+ */
+void creative_ae9_dsd_asi_block(struct creative_chip *chip)
+{
+	struct ae9_blk b;
+
+	blk_begin(&b, chip);
+	blk_ctl_param(&b, CONTROL_PARAM_ASI, 0x0f);
+	blk_end(&b, "DSD64: ASI 0x0f");
+}
+
+/*
+ * The DSD stop's verb (FUN_0012ff98 STOP -> FUN_000203a4 with tag 0):
+ * converter 0x02 unbound. Stream 0x14 was never enabled: no stream stop.
+ * Then 50 ms, as our playback stop block gives the 8051 to tear the
+ * stream's routes down (Windows: 2 ms after an unbind).
+ */
+void creative_ae9_dsd_stop_block(struct creative_chip *chip)
+{
+	struct ae9_blk b;
+
+	blk_begin(&b, chip);
+	blk_send(&b, AE9_NID_DAC, AC_VERB_SET_CHANNEL_STREAMID, 0);
+	msleep(50);
+	blk_end(&b, "DSD64: stop block (converter 0x02 unbound)");
 }

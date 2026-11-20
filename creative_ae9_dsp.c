@@ -1612,9 +1612,9 @@ out:
  * Copying Windows' 0x40000002 armed channel 2, one of the playback's,
  * while ours was 4: all audio stalled until a power-off (2026-11-07).
  * The caller turns "use speaker EQ" on after.
- * Caller holds replay_mutex. The caller waits for the streams to stop
- * first (hp_live_upload=0, fx.c); with it on, a playback may be running
- * (its DSP DMA channels keep going, so only our channel's bit is waited on).
+ * Caller holds replay_mutex. A playback may be running (uploads are live,
+ * fx.c): its DSP DMA channels keep going, so only our channel's bit is
+ * waited on.
  *
  * Returns 0 when the image is in Y memory (read back), -EREMOTEIO when it
  * failed after GET 0x3a/0x3b armed (or may have armed) the DSP's DMA: the
@@ -3022,15 +3022,12 @@ void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
 }
 
 /*
- * Head-unit DAC routing, replayed byte-exact from the 0x0071 capture's
- * AUDIO-PLAYBACK window (ae9_mmio_capture.txt ~195s). These program the
- * head-unit audio router/DAC (targets 0x48 control + 0x49 DAC channels).
- * The channel regs on target 0x49 set to 0x1e are what actually route the
- * 6 channels into the head-unit DAC — the rear card RCA is fed from it.
- * Our AE-7 standup never touched target 0x49, so RCA stayed silent.
- *
- * Handshake here is the playback variant: 0x800005 (set) / 0x800004 (commit),
- * distinct from the standup's 0x800001/0x800002.
+ * One CA0113 register write to the card's DACs (group 0x48 = the front
+ * ES9038Q2M, 0x49 = the rear SABRE9006A), byte-exact as Windows sends it:
+ * unlock (0x210 = 0x7e, 0x5a), 0x20c = 0x800005 around the group (0x804)
+ * and the register + value (0x204), a settle, three status reads, then
+ * 0x20c = 0x800004 and lock (0x210 = 0). A read puts 0x800003 before 0x204
+ * instead (ca0113_read_once, below; docs/DECODED-SEQUENCES.md).
  */
 static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
 		       unsigned int settle_us)
@@ -3058,8 +3055,15 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
  * (capture 6, notes 33/33v): mode 0x800003 before 0x204 (register only),
  * then 0x20c = 0x800003, 0x208 = 0xffff and two 0x208 reads: the first
  * returns the previous result, the second (Windows: 13-30 ms later) this
- * one in the low byte. Ends with 0x20c = 0x800002. Debug use (debugfs
- * "dacr").
+ * one in the low byte. Ends with 0x20c = 0x800002. Used by debugfs "dacr"
+ * and the ES9038 chip-ID check at codec start-up (log only).
+ *
+ * The first 0x20c write only sets bit 0 on what 0x20c holds (CtxHdb
+ * FUN_000144a0; the end, FUN_00014ad8, clears it again), so Windows sends
+ * 0x800001, 0x800003 or 0x800005 there depending on the last transaction;
+ * our fixed 0x800005 is what it sends after a write. Bits 2:1 are the byte
+ * count: 1 (0x...3) for a read, 2 (0x...5) for a write. 28 coldboot
+ * captures, 329 reads (.tmp/ca0113-readstart).
  */
 static u32 ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *first)
 {

@@ -5,7 +5,8 @@
  *
  * PCI BAR layout:
  *   BAR0 = standard HDA registers (16 KB)
- *   BAR2 = Creative extension registers (16 KB, via IDT Tsi381 bridge)
+ *   BAR2 = Creative extension registers (16 KB, via the Tundra Tsi381 or
+ *   ASMedia bridge)
  *
  * Reference: docs/history/Creative.md, ae9_mmio_capture.txt
  */
@@ -59,7 +60,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.13"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.14"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -256,6 +257,13 @@ struct creative_chip {
 		ktime_t		sil_period;
 		struct delayed_work sense_work;
 		u32		last_lpib;
+		unsigned int	irqs;		/* period interrupts (IRQ handler) */
+		unsigned int	last_irqs;
+		/* optical in, since load (debugfs state) */
+		unsigned int	n_nosig;	/* prepared without a signal (silence) */
+		unsigned int	n_came;		/* a signal came in: restarted on it */
+		unsigned int	n_lost;		/* the signal went: restarted as silence */
+		unsigned int	n_stopped;	/* stream stopped moving with a signal */
 	} xcap[3];
 	unsigned int		mic_boost;	/* node 0x12 input amp, 10 dB steps */
 	unsigned int		mic_level;	/* 0..99 = mute, -89..+9 dB (default 99) */
@@ -285,7 +293,6 @@ struct creative_chip {
 		bool		hp_on;		/* "use speaker EQ" (0x1f) last sent on */
 		bool		hp_blocked;	/* an upload failed after the DSP's DMA was
 						 * armed: no more until the next bring-up */
-		bool		hp_waiting;	/* upload waits for the streams to stop */
 		bool		scout;
 		bool		dead;		/* DSP stopped answering */
 		unsigned int	fails;
@@ -409,6 +416,20 @@ struct creative_chip {
 	unsigned int		pcm_start_sent;	/* pcm_windows start block sent since open */
 	unsigned int		pcm_start_rate;	/* stream rate that block was sent for */
 	u16			pcm_start_fmt;	/* and its stream format */
+	bool			pcm_start_dsd;	/* and it was the native DSD start (pcm.c) */
+	/*
+	 * Native DSD64 (pcm.c, pcm_dsd; experimental): DSD on in the hardware
+	 * (DAC 48/01 = 0xc3, GPIO pin 1 high, BAR2 I2S channels 2/3 fed by the
+	 * playback stream), its stream running, DAC 48/07 bit 0 (mute) and
+	 * BAR2 0x100/0x104 as they were before DSD came on, the lock for DSD
+	 * on/off and the DAC mute after a trigger (process context)
+	 */
+	bool			dsd_active;
+	bool			dsd_running;
+	bool			dsd_dac_muted;
+	u32			dsd_bar2_100, dsd_bar2_104;
+	struct mutex		dsd_mutex;
+	struct delayed_work	dsd_mute_work;
 	u32			dac_start_key;	/* rate row + output the DAC start commands
 						 * were last sent for; 0 = unknown (any DAC
 						 * command or a resume clears it) */
@@ -472,8 +493,20 @@ struct creative_chip {
 	bool			hu_ae9_hold;	/* "AE-9" on the display: no text until */
 	unsigned long		hu_ae9_until;	/* (jiffies), as Windows' AE-9 hold */
 	bool			hu_unattached;	/* 0x2000 marker read 0xaaaaaaaa */
+	bool			hu_quiet;	/* went quiet: status untrusted until a marker answers */
+	unsigned int		hu_dark_polls;	/* polls in a row with most frames unanswered (log once) */
 	unsigned int		hu_reattach_try; /* setup resends in a row */
 	unsigned int		hu_reattaches;	/* setup resends since load */
+	/* every head-unit frame since load (creative_ae9_hu_frame_note());
+	 * debugfs state shows them */
+	u64			hu_frames;
+	unsigned int		hu_misses[4];	/* by why: AE9_HU_MISS_* */
+	struct {
+		unsigned long	at;		/* jiffies, 0 = empty */
+		u8		cmd, why;
+		u32		a, b;		/* creative_spi_frame_win()'s packing */
+	}			hu_miss_ring[16];
+	unsigned int		hu_miss_pos;
 	/* status bit 6 (headphone amp) against our jack frame: since when it
 	 * has disagreed (jiffies, 0 = agrees) and the full poll then (hu_ticks),
 	 * the full poll after the last marker check that read attached, a
@@ -565,11 +598,22 @@ int creative_i2c_dsp_init(struct creative_chip *chip);
 int creative_spi_frame_win(struct creative_chip *chip, const u8 *tx,
 			   int tx_len, u8 *resp, int resp_len);
 void creative_uart_wait_idle(struct creative_chip *chip, bool rx_ok);
+/* why a head-unit frame went unanswered (creative_spi_frame_win) */
+#define AE9_HU_MISS_TXFULL	0	/* transmit FIFO stayed full: dropped */
+#define AE9_HU_MISS_NONE	1	/* no reply byte in 20 ms */
+#define AE9_HU_MISS_NOF0	2	/* bytes, but none was f0 */
+#define AE9_HU_MISS_SHORT	3	/* f0, but no f7 at its length */
+void creative_ae9_hu_frame_note(struct creative_chip *chip, int ret, u8 cmd, u8 why,
+				u32 a, u32 b);
 int creative_i2c_raw_tx(struct creative_chip *chip, u8 reg,
 			const u8 *data, u8 len);
 
 /* creative_ae9_pcm.c */
 int creative_ae9_pcm_init(struct creative_chip *chip);
+/* native DSD64 (pcm_dsd): stop a DSD stream and take DSD down (Direct Mode
+ * off, output switch, suspend, unload); the DAC mute after a trigger */
+void creative_ae9_dsd_abort(struct creative_chip *chip, const char *why);
+void creative_ae9_dsd_mute_work(struct work_struct *w);
 
 /* creative_ae9_core.c */
 /* IRQ handler is static in core.c — not exported */
@@ -633,6 +677,11 @@ int creative_ae9_hu_setup_again(struct creative_chip *chip, bool light, bool jac
 void creative_ae9_bar2_init_windows(struct creative_chip *chip);
 void creative_ae9_tail(struct creative_chip *chip, struct ae9_tail *t);
 void creative_ae9_tail_resend(struct creative_chip *chip, struct ae9_tail *t);
+void creative_ae9_gpio_set(struct creative_chip *chip, u8 pin, bool on);
+void creative_ae9_dsd_start_block(struct creative_chip *chip, u16 format, bool hp);
+void creative_ae9_dsd_rearm_block(struct creative_chip *chip);
+void creative_ae9_dsd_asi_block(struct creative_chip *chip);
+void creative_ae9_dsd_stop_block(struct creative_chip *chip);
 
 /* creative_ae9_dsp.c */
 int creative_dsp_chipio_write(struct creative_chip *chip,
@@ -661,7 +710,6 @@ int creative_dsp_boot_handshake(struct creative_chip *chip);
  */
 extern unsigned int ae9_debug;
 extern unsigned int ae9_surround;	/* 5.1 (default on) */
-extern bool ae9_dsp_96k;		/* 96 kHz with Direct Mode off (default on) */
 #define ae9_dbg(chip, fmt, ...) do {					\
 		if (ae9_debug)						\
 			dev_info((chip)->dev, fmt, ##__VA_ARGS__);	\

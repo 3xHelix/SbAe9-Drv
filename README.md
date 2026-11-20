@@ -7,15 +7,37 @@ An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 `snd_hda_intel` + `snd_hda_codec_ca0132` drivers don't support this card;
 this one does, by doing what Creative's Windows driver does, step by step.
 
-**Latest: v0.12.13** (2026-11-18) · [Changelog](CHANGELOG.md) ·
+**Latest: v0.12.14** (2026-11-20) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
 Pre-releases, tested on two cards.
+
+## 💣 New in v0.12.14: native DSD64
+
+Yep. **Native DSD. On Linux. On a PCIe sound card.** As far as we can tell,
+nobody's done that before.
+
+Your `.dsf` files go bit-for-bit, a 1-bit stream at 2.8224 MHz, straight
+into the AE-9's ES9038 DSD decoder. No PCM conversion, no DoP, no
+resampling. It's the same lane Creative's own Windows DSD driver uses: we
+dug it out of their driver, found the hidden path past the DSP, and lit it
+up. The DAC itself signs off on it: DSD decoder on, locked, 2.8224 MHz.
+
+It's opt-in for now while it racks up hours: `pcm_dsd=1`, or flip the switch
+in [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) v0.22.0. Then point MPD
+(Cantata, ncmpcpp, ...) at `hw:AE9,0` with `dop "no"` and hit play.
+How-to: [docs/USING.md](docs/USING.md#native-dsd64-experimental-01214).
+
+DSD128? The card can't clock it, we tried every setting there is. That's why
+Creative stops at DSD64 too. Those files still play, as PCM.
 
 ## What works
 
 - **Playback** on the card's RCA outputs (speakers) and the head unit's
   headphone jacks: 44.1 to 384 kHz, 24- or 32-bit, hardware volume synced
   with the knob and the desktop slider.
+- **Native DSD64** (experimental, opt-in): `.dsf`/`.dff` straight to the
+  DAC's DSD decoder through MPD, the way Creative's Windows DSD driver does
+  it ([USING.md](docs/USING.md#native-dsd64-experimental-01214)).
 - **5.1 surround** on the card's RCA, Rear and C/Sub jacks.
 - **The DSP:** SBX (Surround, Dialog Plus, Smart Volume, Crystalizer, Bass),
   the EQ with Windows' 20 presets, Scout Mode, speaker setup (bass redirect,
@@ -30,7 +52,7 @@ Pre-releases, tested on two cards.
   mute, speakers/headphones switch, knob light, SBX button, 48 V phantom
   power, headphone/mic plug detection.
 - **The rest:** sleep and resume, reboots and driver reloads, both versions
-  of the card (IDT or ASMedia bridge), no module options needed.
+  of the card (Tundra Tsi381 or ASMedia bridge), no module options needed.
 
 ## Apps
 
@@ -41,7 +63,7 @@ Pre-releases, tested on two cards.
 - **[SbAe9-AudioMon](https://github.com/3xHelix/SbAe9-AudioMon)**: level
   meters for every AE-9 input and output, with a debug log.
 
-Driver v0.12.13 works with SbAe9-SBC v0.21.4 and SbAe9-AudioMon v0.4.9. Older
+Driver v0.12.14 works with SbAe9-SBC v0.22.0 and SbAe9-AudioMon v0.4.9. Older
 app versions still work, with fewer controls. Earlier pairings are in the
 [changelog](CHANGELOG.md).
 
@@ -107,7 +129,7 @@ Download `creative-ae9-dkms_<version>-1_all.deb` from the
 [latest release](https://github.com/3xHelix/SbAe9-Drv/releases), then:
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.13-1_all.deb innoextract
+sudo apt install ./creative-ae9-dkms_0.12.14-1_all.deb innoextract
 ```
 
 Secure Boot: `sudo mokutil --import /var/lib/dkms/mok.pub` once, then
@@ -149,8 +171,8 @@ run; it needs `innoextract`.
 sudo ae9-get-firmware ~/Downloads/AECMDMasterInstaller_3.4.92.00.exe
 ```
 
-It installs the DSP image and the AE-9 overlay (checked against the MD5 of
-the firmware this driver is tested with: `85c8f2b4…` and `0e222c94…`) plus Sound Blaster Command's 32
+It installs the DSP image and the AE-9 overlay (checked against the size and
+SHA-256 of the firmware this driver is tested with: `90ba1de2…` and `ecc0740b…`) plus Sound Blaster Command's 32
 headphone profiles. It also takes an unpacked installer folder, the AE-Series
 driver installer on its own, or just `CtxHda.sys` from a Windows install.
 `ae9-get-firmware --check` shows what's installed. (The `ctefx-desktop.bin`
@@ -185,7 +207,8 @@ Clarity, optical, low latency): **[docs/USING.md](docs/USING.md)**.
   the driver and starts everything again.
 - **Power off fully** if it says the card didn't start, or the card is dark:
   PSU off (or unplug) for 15-30 s. A warm reboot isn't enough.
-- **Report it:** `sudo ae9-full-dump` saves a read-only report to attach to
+- **Report it:** `ae9-full-dump --report` saves a read-only report
+  (in `~/ae9-dumps/`) and one `.tar.gz` of it to attach to
   an [issue](https://github.com/3xHelix/SbAe9-Drv/issues). Stop the audio
   first.
 

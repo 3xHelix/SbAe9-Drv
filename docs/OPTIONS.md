@@ -16,10 +16,9 @@ runs, for example:
 The others are read at load only. `modinfo -p snd-hda-codec-creative-ae9`
 lists every option with a one-line description.
 
-The options fall into four groups: settings you may want, a few that Sound
-Blaster Command reads as feature flags, fallbacks kept for one more release,
-and debugging. (Sound Blaster Command also reads `pcm_rates`, `pcm_bits`,
-`wuh_96k`, `hp_custom` and `hp_live_upload`, listed in their groups.)
+The options fall into three groups: settings you may want, overrides for the
+card's PCIe bridge, and debugging. (Sound Blaster Command reads `pcm_rates`,
+`pcm_bits` and `hp_custom`, listed in their groups.)
 
 ## Settings you may want
 
@@ -45,6 +44,17 @@ and debugging. (Sound Blaster Command also reads `pcm_rates`, `pcm_bits`,
   L/R outputs in DSP mode (stereo streams too since 0.12.11: Bass Redirect's
   sub, the rears of 4.0/4.1); each must be a DAC pair's first port
   (0x40-0x7f with bits 3:1 clear), else the default is used.
+- `pcm_dsd` (0, writable at runtime, applied at the next stream open):
+  EXPERIMENTAL (card-tested with aplay and MPD): native DSD64 on playback device 0, the
+  way Creative's Windows DSD ASIO driver plays it (the CA0113's own I2S to
+  the front DAC in DSD mode). 1 = the device also offers `DSD_U32_BE`, 2
+  channels at rate 88200 (ALSA's DSD64 rate for 32-bit words), in Direct
+  Mode only (with `pcm_rates=2`) and read/write access only (no mmap: each
+  frame is repacked for the card). Plays on the card's RCA out and the head
+  unit's headphones. Direct Mode off, an output switch, suspend and unload
+  stop a DSD stream (the player restarts it, or gets an error in DSP mode).
+  `tools/dsd/dsf2raw.py` turns a `.dsf` file into raw data for `aplay`. How
+  to use it: [USING.md](USING.md#native-dsd64-experimental-01214).
 
 ### Direct Mode, SBX and headphone profiles
 
@@ -69,8 +79,6 @@ and debugging. (Sound Blaster Command also reads `pcm_rates`, `pcm_bits`,
 - `mic_boost_30` (0): 1 = Mic Gain also goes to +30 dB, the mic preamp's top
   step (Windows stops at +20 dB). It adds a clean 10 dB, but normal speech
   into a typical mic clips there: it's for quiet mics.
-- `wuh_96k` (1, writable at runtime): What U Hear at 48 or 96 kHz; 0 = 48 kHz
-  only. Sound Blaster Command offers 96 kHz only while it's on.
 - `spdif_out` (1, set at load; at runtime use the "Optical Out Playback
   Switch" control, which this option mirrors): optical out on; 0 keeps it
   silent.
@@ -90,50 +98,13 @@ head-unit poll, volume display and knob.
   the head unit's 3.5 mm headphone jack switches to headphones, unplugging
   back to speakers. Off, plugs only log.
 
-## Read by Sound Blaster Command (leave as they are)
+## For the card's PCIe bridge
 
-Sound Blaster Command (SbAe9-SBC) reads these to tell which driver features
-are there (rate lists, 176.4 kHz, the rate-enable button), so they stay as
-options for now. Leave them at their defaults: turning one off also takes the
-feature out of Sound Blaster Command (`dac_441=0` doesn't: Sound Blaster
-Command still offers 44.1/88.2 kHz, which then play garbled or silent).
-Sound Blaster Command checks the driver version instead from v0.21.3 on, so
-these five and `hp_live_upload` go in a later driver release.
+Automatic choices that depend on the PCIe bridge in front of the card (an
+ASMedia ASM1083 on some boards). Leave them at auto; they're here so a card
+that misbehaves behind some other bridge can be tried the other way. If you
+need one, please report it.
 
-- `surround_96k` (1, writable at runtime): 5.1 at 96 kHz; 0 limits 5.1 to
-  48 kHz (Direct Mode and DSP mode).
-- `surround_192k` (1, writable at runtime): 5.1 at 192 kHz in Direct Mode;
-  0 limits 5.1 to 96 kHz (needs `surround_96k=1`).
-- `dsp_96k` (1, writable at runtime): 96 kHz with Direct Mode off, through
-  the DSP; 0 limits DSP mode to 48 kHz. Applies to streams opened afterwards.
-- `pcm_176k4` (1, writable at runtime): offers 176.4 kHz with `pcm_rates=2`.
-- `dac_441` (1, writable at runtime): sends Windows' DAC commands for
-  44.1/88.2 kHz (48/01 = 0xc1, 48/0b = 0x20); without them those rates play
-  garbled or silent.
-
-## Fallbacks kept for one more release
-
-Each brings back the behaviour before a recent fix, or overrides an automatic
-choice for the card's PCIe bridge, in case it misbehaves on some card. They're slated for removal: if you need one, please
-report it.
-
-- `router_poll` (1, writable at runtime): waits for the router chip's busy
-  status before each of its setup commands and resends a refused one, as
-  Windows (0.12.11). 0 = send blind, as before 0.12.11 (at the first load
-  after a power-on that could leave the router chip half set up).
-- `rt_dsp_walk` (2, writable at runtime, applied at the next DSP-mode
-  stream start): how DSP mode connects the DSP's outputs to the DACs.
-  2 = all twelve 96 kHz lanes, in the router chip's own slots for them
-  (stream 0x18), as its own layout and Windows; 1 = the front lanes only
-  for stereo streams (no Bass Redirect sub, no rears; 5.1 still gets all
-  lanes); 0 = the fixed slots before 0.12.11 (DSP
-  mode 6 dB quieter, only half the samples). Since 0.12.11.
-- `hp_live_upload` (1, writable at runtime): load a newly picked headphone
-  profile while audio plays, as Windows does (0.12.10); 0 = wait until every
-  playback and recording stops, as before. Sound Blaster Command also reads
-  it to tell whether a new profile loads at once, so it goes only after Sound
-  Blaster Command checks the driver version instead (as the feature flags
-  above).
 - `posted_flush` (-1 = auto): reads back after every register write, as
   Windows does; an ASMedia bridge wedges after a burst of writes with no
   read between them. -1 = on behind an ASMedia bridge only, 0 = never,
@@ -167,9 +138,9 @@ report it.
 - `dma_trace` (0, writable at runtime): log each stream's buffer and BDL
   addresses when it's prepared, for matching an `IO_PAGE_FAULT` address to a
   stream.
-- `acm_heartbeat_ms` (500): the head-unit heartbeat (keeps the head unit and
-  DAC alive, as Windows, and drives the knob, the volume display and every
-  volume/mute change); 0 = off, which also stops the knob and leaves volume
+- `acm_heartbeat_ms` (500): the head-unit heartbeat (Windows' cadence; it
+  reads the knob, buttons, plugs and status, and drives the volume display
+  and every volume/mute change); 0 = off, which also stops the knob and leaves volume
   and mute changes unsent: only for `tools/verbdiff`, which loads with 0 so
   its verb logs stay deterministic. Leave it at 500 otherwise.
 
@@ -190,6 +161,28 @@ normal start) and is writable at runtime.
 - `rirb_inject_us` (300): how long `rirb_inject` hides a reply, in µs; over
   100000 its command times out. A hidden reply is dropped, as never landed,
   once the reply ring has moved 128 entries past it.
+
+## Removed in 0.12.14
+
+Always on now, as they were by default. Sound Blaster Command v0.21.3 and
+later tells the rate features by the driver version; `router_poll` and
+`rt_dsp_walk` were fallbacks to the behaviour before 0.12.11's fixes. An old line naming one is
+ignored, with an "unknown parameter" line in the kernel log.
+
+- `surround_96k`, `surround_192k`: 5.1 at 96 and 192 kHz in Direct Mode.
+- `dsp_96k`: 96 kHz with Direct Mode off, through the DSP.
+- `pcm_176k4`: 176.4 kHz with `pcm_rates=2`.
+- `dac_441`: Windows' DAC commands for 44.1/88.2 kHz (48/01 = 0xc1,
+  48/0b = 0x20).
+- `hp_live_upload`: headphone profiles load while audio plays, as Windows
+  (0.12.10); the old wait for every stream to stop is gone.
+- `router_poll`: the router chip's busy status is waited for before each of
+  its setup commands, and a refused one is sent again, as Windows (0.12.11).
+- `wuh_96k`: What U Hear records at 48 or 96 kHz (0.9.5). Sound Blaster
+  Command v0.21.4 and later tells it by the driver version.
+- `rt_dsp_walk`: DSP mode routes all twelve 96 kHz lanes in the router
+  chip's own slots for them (stream 0x18), as Windows (0.12.11); the fixed
+  slots stay only as the fallback when that list can't be used.
 
 ## Removed in 0.12.12
 

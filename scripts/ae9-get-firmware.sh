@@ -20,8 +20,11 @@
 # firmware root is also the AE-5/AE-7 file from linux-firmware.
 set -u
 FILES="ctefx-desktop.bin ctefx-ae9-overlay.bin"
-MD5_DESKTOP=85c8f2b47180cd6623a2b0e8b8911fe0
-MD5_OVERLAY=0e222c941f708a2caf93d50d2aba5ef8
+# The tested images: SHA-256 and size (MD5 until 0.12.14: 85c8f2b4..., 0e222c94...)
+SHA_DESKTOP=90ba1de2e2d088c2a42bd111c970f8ee3d986a3057a83bf5b3b5f187c7287e86
+SHA_OVERLAY=ecc0740bde7ead2be16526edb9d6089ca6413c672679ceeb33b0f13b712dfe1c
+SIZE_DESKTOP=655436
+SIZE_OVERLAY=432
 
 # The extractors: next to this script in a git checkout, or where the
 # creative-ae9 package puts them.
@@ -35,7 +38,11 @@ if [ -e /run/ostree-booted ]; then DEST=/etc/firmware; ATOMIC=1; else DEST=/lib/
 # AE9_FW_DEST=<dir>: install there instead, no root needed (tests, image builds)
 [ -n "${AE9_FW_DEST:-}" ] && { DEST=$AE9_FW_DEST; ATOMIC=0; }
 
-want_md5() { case $1 in ctefx-desktop.bin) echo $MD5_DESKTOP ;; *) echo $MD5_OVERLAY ;; esac; }
+want_sha() { case $1 in ctefx-desktop.bin) echo $SHA_DESKTOP ;; *) echo $SHA_OVERLAY ;; esac; }
+want_size() { case $1 in ctefx-desktop.bin) echo $SIZE_DESKTOP ;; *) echo $SIZE_OVERLAY ;; esac; }
+# 0 when <file> is the tested image <name>: size first, then SHA-256
+tested() { [ "$(stat -c %s "$1")" = "$(want_size "$2")" ] &&
+	[ "$(sha256sum "$1" | cut -d' ' -f1)" = "$(want_sha "$2")" ]; }
 
 check() {
 	local f p m ok=0
@@ -49,9 +56,8 @@ check() {
 			[ -f "$d/$f" ] && { p=$d/$f; break; }
 		done
 		if [ -z "$p" ]; then echo "  $f: missing"; ok=1; continue; fi
-		m=$(md5sum "$p" | cut -d' ' -f1)
-		if [ "$m" = "$(want_md5 $f)" ]; then echo "  $f: ok ($p)"
-		else echo "  $f: $p is not the tested image (md5 $m)"; ok=1; fi
+		if tested "$p" $f; then echo "  $f: ok ($p)"
+		else echo "  $f: $p is not the tested image ($(stat -c %s "$p") bytes, sha256 $(sha256sum "$p" | cut -c1-16)...)"; ok=1; fi
 	done
 	n=0
 	for d in ${AE9_FW_DEST:-} /etc/firmware /lib/firmware/updates /usr/lib/firmware/updates /lib/firmware /usr/lib/firmware; do
@@ -109,7 +115,7 @@ python3 -I "$EX/extract_firmware.py" "$SYS" "$T/ctefx-desktop.bin" || { echo "ma
 python3 -I "$EX/extract_overlay.py" "$SYS" "$T/ctefx-ae9-overlay.bin" || { echo "overlay: extraction refused" >&2; exit 1; }
 mkdir -p "$DEST/creative-ae9"
 for f in $FILES; do
-	[ "$(md5sum "$T/$f" | cut -d' ' -f1)" = "$(want_md5 $f)" ] || { echo "$f: unexpected image, not installed" >&2; exit 1; }
+	tested "$T/$f" $f || { echo "$f: unexpected image (size or SHA-256 differs), not installed" >&2; exit 1; }
 	install -m 644 "$T/$f" "$DEST/creative-ae9/$f"
 done
 command -v restorecon >/dev/null && restorecon -RF "$DEST/creative-ae9" 2>/dev/null

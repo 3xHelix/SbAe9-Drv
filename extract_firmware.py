@@ -17,7 +17,7 @@ The main DSP OS image is 655436 bytes (matches mainline ctefx.bin size).
 Usage:
     python3 extract_firmware.py /path/to/CtxHda.sys  [out.bin] [--force]
 
-The extracted image is checked against the MD5 of the firmware this driver
+The extracted image is checked against the SHA-256 of the firmware this driver
 was developed and tested with. A different image (another driver version)
 or the "largest image" fallback is refused unless --force is given.
 
@@ -28,7 +28,8 @@ Source of CtxHda.sys (in the Windows install):
 import hashlib, struct, sys
 
 MAGIC = 0x4c46584d  # "MXFL"
-KNOWN_MD5 = {"85c8f2b47180cd6623a2b0e8b8911fe0": "AE-9 DSP image the driver is tested with"}
+KNOWN_SHA256 = {"90ba1de2e2d088c2a42bd111c970f8ee3d986a3057a83bf5b3b5f187c7287e86":
+                "AE-9 DSP image the driver is tested with"}  # MD5 85c8f2b4...
 
 
 def walk_image(data, start):
@@ -83,12 +84,12 @@ def main():
 
     off, size = best
     img = data[off:off + size]
-    md5 = hashlib.md5(img).hexdigest()
-    if md5 in KNOWN_MD5:
-        print("MD5 %s: %s" % (md5, KNOWN_MD5[md5]))
+    sha = hashlib.sha256(img).hexdigest()
+    if sha in KNOWN_SHA256:
+        print("SHA-256 %s: %s" % (sha, KNOWN_SHA256[sha]))
     else:
         why = "largest-image fallback" if fallback else "unknown image"
-        print("MD5 %s: %s, not the image this driver was tested with" % (md5, why))
+        print("SHA-256 %s: %s, not the image this driver was tested with" % (sha, why))
         if not force:
             print("Refusing to write it. Use --force to write it anyway (untested).")
             sys.exit(2)

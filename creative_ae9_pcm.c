@@ -9,9 +9,11 @@
 // Reference: ae9_mmio_capture.txt lines 11030+, docs/history/Creative.md §5
 //
 
+#include <linux/bitfield.h>
 #include <linux/dma-mapping.h>
 #include <linux/hrtimer.h>
 #include <linux/math64.h>
+#include <linux/uio.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -35,8 +37,8 @@
 #define CREATIVE_PCM_BDL_MAX		32	/* one entry per period */
 #define CREATIVE_PCM_BDL_SIZE		(CREATIVE_PCM_BDL_MAX * 16)
 
-/* playback buffer limit (preallocated per substream; capture keeps its own
- * 64 KB limit in its hw constraints) */
+/* playback buffer limit (preallocated per substream); also optical out and
+ * the extra captures. The mic capture keeps its own 128 KB limit (its open). */
 #define CREATIVE_PCM_BUF_MAX	(256 * 1024)
 
 /*
@@ -411,9 +413,9 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
  * pcm_rates: 0 = playback at 48 kHz only, as Windows' captured start
  * block. 1 = playback at 48, 96, 192 and 384 kHz, each set up the way
  * Windows does it (creative_ae9_playback_seq). 2 (default) = also 44.1
- * and 88.2 kHz, stereo, through the card's sample-rate converter. These
+ * and 88.2 kHz, stereo, through the card's S/PDIF transmitter. These
  * played silent or garbled until the DAC got Windows' 44.1 kHz-family
- * commands (dac_441, 2026-11-06). PipeWire resamples 44.1 kHz files when
+ * commands (2026-11-06). PipeWire resamples 44.1 kHz files when
  * those rates are left out. Recording: 48 or 96 kHz (capture side).
  * pcm_bits: 24 (default, as Windows' default format) or 32: the samples'
  * full 32 bits go to the card (format 0x41..., which Windows also uses).
@@ -426,11 +428,8 @@ static unsigned int pcm_rates = 2;
 module_param(pcm_rates, uint, 0644);
 MODULE_PARM_DESC(pcm_rates, "Playback sample rates: 0 = 48 kHz only, 1 = 48/96/192/384 kHz, 2 = also 44.1/88.2/176.4 kHz stereo (default)");
 
-/* 176.4 kHz (stereo, through the converter like 44.1/88.2), with
- * pcm_rates=2. Windows' converter table has it; tested 2026-11-06. */
-static bool pcm_176k4 = true;
-module_param(pcm_176k4, bool, 0644);
-MODULE_PARM_DESC(pcm_176k4, "Offer 176.4 kHz playback with pcm_rates=2 (1 = yes, default; 0 = no)");
+/* 176.4 kHz goes through the converter like 44.1/88.2 (stereo): Windows'
+ * converter table has it; tested 2026-11-06 (pcm_176k4 until 0.12.14). */
 
 /*
  * 5.1: 6-channel playback in both modes (Windows' order FL FR FC LFE RL RR
@@ -458,39 +457,25 @@ static const struct snd_pcm_chmap_elem ae9_chmaps[] = {
 };
 
 /*
- * 6 channels up to 192 kHz (96 kHz with surround_192k=0, 48 kHz with
- * surround_96k=0), and at 384 kHz only 2: Creative's 5.1 maximum is
- * 192 kHz and Windows never offers 5.1 at 384 kHz. Direct Mode off (DSP
- * mode) opens at 48 or 96 kHz (dsp_96k).
- */
-#define AE9_SURROUND_RATE_MAX	(!surround_96k ? 48000 : \
-				 surround_192k ? 192000 : 96000)
-
-/* 5.1 at 96 kHz used to stutter more and more as it played: the start
+ * 6 channels up to 192 kHz, and at 384 kHz only 2: Creative's 5.1 maximum
+ * is 192 kHz and Windows never offers 5.1 at 384 kHz. Direct Mode off (DSP
+ * mode) opens at 48 or 96 kHz.
+ *
+ * 5.1 at 96 kHz used to stutter more and more as it played: the start
  * block gave it the stereo router setup (front slots only) and the 64 KB
  * buffer was barely one quantum. Both fixed 2026-11-05: all six speakers
- * right, no errors over 2 min; on by default since. The 96 kHz slot
- * layout matches Windows' exactly (capture 2026-11-05, 02:01:48); 0 goes
- * back to 5.1 at 48 kHz only. */
-static unsigned int surround_96k = 1;
-module_param(surround_96k, uint, 0644);
-MODULE_PARM_DESC(surround_96k, "Allow 5.1 at 96 kHz in Direct Mode (1 = yes, default; 0 = 5.1 at 48 kHz only)");
-
-/* 5.1 at 192 kHz: Windows' router layout is our 96 kHz one with twice the
- * slots (capture 2026-11-05, 02:02:20). 0 = 5.1 up to 96 kHz. */
-static unsigned int surround_192k = 1;
-module_param(surround_192k, uint, 0644);
-MODULE_PARM_DESC(surround_192k, "Allow 5.1 at 192 kHz in Direct Mode (1 = yes, default; 0 = 5.1 up to 96 kHz; needs surround_96k=1)");
-
-/* 96 kHz through the DSP (Direct Mode off), as Windows offers: stereo and
- * 5.1 with SBX, live Direct Mode switches, no echo (2026-11-06). */
-bool ae9_dsp_96k = true;
-module_param_named(dsp_96k, ae9_dsp_96k, bool, 0644);
-MODULE_PARM_DESC(dsp_96k, "Allow 96 kHz with Direct Mode off, through the DSP (1 = yes, default; 0 = 48 kHz only); applies to streams opened afterwards");
+ * right, no errors over 2 min. The 96 kHz slot layout matches Windows'
+ * exactly (capture 2026-11-05, 02:01:48); at 192 kHz Windows' layout is
+ * our 96 kHz one with twice the slots (02:02:20). 96 kHz through the DSP,
+ * as Windows offers: stereo and 5.1 with SBX, live Direct Mode switches,
+ * no echo (2026-11-06). Options until 0.12.14 (surround_96k,
+ * surround_192k, dsp_96k), always on.
+ */
+#define AE9_SURROUND_RATE_MAX	192000
 
 /*
  * 5.1 rates: the 48 kHz family up to AE9_SURROUND_RATE_MAX. 44.1/88.2 kHz
- * go through the sample-rate converter, which carries one stereo pair
+ * go through the S/PDIF transmitter, which carries one stereo pair
  * (Windows offers them in stereo only, capture 2026-11-05 format probes).
  */
 static unsigned int ae9_surround_rates(unsigned int *list)
@@ -768,10 +753,589 @@ static const struct snd_kcontrol_new spdif_out_control = {
 	.put = spdif_out_put,
 };
 
+/* ------------------------------------------------------------------ */
+/* Native DSD64 (experimental, pcm_dsd=1)				  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * How Creative's Windows driver plays DSD64 (its DSD ASIO driver
+ * CtxDsd64.dll with CtxHda.sys 6.0.105.0065's DSD stream class, decompiled;
+ * .tmp/notes/dsd-windows.md): natively, not as DoP, and never through the
+ * DSP or the CA0132's I2S. The HDA playback stream runs at 88.2 kHz with
+ * six 16-bit channels (format 0x4815) and the CA0113's own I2S block in
+ * BAR2 takes it from the stream: its channel 2 the stream's channels 0-1
+ * (left), channel 3 channels 2-3 (right), each channel's data on a GPIO pin
+ * (6, 7) switched to its I2S function, 16-bit words at rate code 88.2 kHz:
+ * 32 DSD bits per channel and 88.2 kHz frame, 2.8224 Mbit/s = DSD64. The
+ * ES9038 takes DSD input (48/01 = 0xc3) and GPIO pin 1 goes high (it
+ * switches the ES9038's data lines over [inferred]; uv44: pin 1 high
+ * silenced PCM on the card's RCA out and the headphones). Only the ES9038's
+ * outputs (the card's RCA out, the head unit's headphone jack) can play it.
+ *
+ * Here: playback device 0 also offers SNDRV_PCM_FORMAT_DSD_U32_BE, 2
+ * channels at 88200 (ALSA's DSD64 rate for 32-bit words), in Direct Mode,
+ * without mmap (each 8-byte ALSA frame becomes a 12-byte link frame: the
+ * copy op below). Enter and leave follow Windows' order (ae9_dsd_enter(),
+ * ae9_dsd_exit()). Off by default until card-tested; read at stream open.
+ */
+static bool pcm_dsd;
+module_param(pcm_dsd, bool, 0644);
+MODULE_PARM_DESC(pcm_dsd, "EXPERIMENTAL: native DSD64 on playback device 0 (DSD_U32_BE, 2 ch, rate 88200, no mmap; Direct Mode only, card RCA out and headphones); 0 = off (default). Read at stream open");
+
+#define AE9_DSD_RATE		88200	/* ALSA's DSD64 rate for 32-bit DSD words */
+#define AE9_DSD_FMT		0x4815	/* SDnFMT: 44.1 kHz x 2, 16 bit, 6 channels */
+#define AE9_DSD_ALSA_FRAME	8	/* bytes: DSD_U32_BE, 2 channels */
+#define AE9_DSD_HW_FRAME	12	/* bytes: the link frame, 6 x 16 bit */
+/* a period: whole steps of 32 frames, 384 bytes on the link (3 x 128: every
+ * BDL entry starts on the 128-byte boundary the HD-Audio spec requires) */
+#define AE9_DSD_PERIOD_STEP	32
+#define AE9_DSD_SILENCE		0x69	/* ALSA's DSD silence byte (pcm_misc.c) */
+#define AE9_DSD_FILL		0x96	/* Windows' fill slots 4 and 5: 0x9696 */
+/* after RUN and the I2S on: the DAC locks onto the DSD clock before the
+ * unmute (ours; Windows unmutes without a wait) */
+#define AE9_DSD_UNMUTE_MS	150
+
+/* the front DAC, an ES9038Q2M (creative_ae9_seq_run.c has its other registers) */
+#define AE9_DSD_DAC		0x48
+#define ES9038_REG_INPUT	0x01	/* 0xc0 32-bit I2S, 0xc1 S/PDIF, 0xc3 DSD */
+#define ES9038_REG_MUTE		0x07	/* bit 0 mute (bits 7:5 the filter: dsp.c keeps the user's) */
+#define ES9038_REG_SYNC		0x0a
+#define ES9038_REG_SPDIF	0x0b	/* S/PDIF input: 0x20 = DATA2 */
+
+/*
+ * BAR2 0x100/0x104: Creative's wrapper around the CA0113's I2S block
+ * (Synopsys DW_apb_i2s at BAR2 0x400; Windows' CtxHdb "HdIs" and "HdGp"
+ * interfaces, notes §4). 0x100: bits 3:0 GPIO pins 4-7 to their I2S
+ * function (FUN_000138c0), bits 7:4 and 15:12 I2S channels 0-3 on (FUN_00014f24,
+ * FUN_00014ea0), bit 8 the I2S output (CtxHda FUN_00035680; set at
+ * CtxHdb's init, 0x700 while PCM plays), bit 28 24-bit words (FUN_0001506c),
+ * bits 31:29 the rate (FUN_000150b8: 48k 0, 44.1k 1, 96k 2, 88.2k 3, 192k
+ * 4). 0x104: byte n = the HDA stream tag << 4 | the stream's first channel
+ * for I2S channel n (FUN_00015140).
+ */
+#define AE9_I2S_CTL		0x100
+#define AE9_I2S_CTL_PINFN(pin)	BIT((pin) - 4)
+#define AE9_I2S_CTL_CH_A(ch)	BIT(4 + (ch))
+#define AE9_I2S_CTL_OUT		BIT(8)
+#define AE9_I2S_CTL_CH_B(ch)	BIT(12 + (ch))
+#define AE9_I2S_CTL_24BIT	BIT(28)
+#define AE9_I2S_CTL_RATE	GENMASK(31, 29)
+#define AE9_I2S_RATE_88K2	3
+#define AE9_I2S_MAP		0x104
+#define AE9_I2S_TFF(ch)		(0x454 + 0x40 * (ch))	/* DW_apb_i2s TFFn: transmit FIFO flush */
+#define AE9_DSD_CH_L		2	/* CBoard +0x79, +0x7a: the I2S channels DSD uses */
+#define AE9_DSD_CH_R		3
+#define AE9_DSD_PIN(ch)		((ch) + 4)	/* their data pins: GPIO 6, 7 */
+
+/*
+ * The link frame (CtxDsd64.dll FUN_0040daa8, the DSD copy routine): six
+ * little-endian 16-bit slots per 88.2 kHz frame: L bits t0-15, L t16-31, R
+ * t0-15, R t16-31, then 0x9696 twice (BAR2 0x104 maps only slots 0-1 and
+ * 2-3, so 4 and 5 are never played). In each slot t0, the oldest bit, is bit
+ * 15: the DLL gets ASIO's DSDInt8LSB1 bytes (oldest bit = a byte's LSB) and
+ * bit-reverses every 16-bit word (FUN_00411724: new = rev8(b1) | rev8(b0) <<
+ * 8), which puts the first byte's oldest bit at bit 15 and the second byte's
+ * newest at bit 0.
+ * ALSA's DSD_U32_BE word is, per channel, b0 b1 b2 b3 in memory: b0 the
+ * oldest byte, each byte MSB first in time (MPD, usb-audio). So slot a = b0
+ * << 8 | b1 and slot b = b2 << 8 | b3, little-endian in memory: b1 b0 b3 b2.
+ * ALSA's DSD silence (0x69 bytes) gives 0x6969 in the data slots, the same
+ * as the DLL's 0x96 prefill after its bit reverse.
+ */
+static void ae9_dsd_pack(u8 *dst, const u8 *src, unsigned long frames)
+{
+	for (; frames; frames--, src += AE9_DSD_ALSA_FRAME, dst += AE9_DSD_HW_FRAME) {
+		dst[0] = src[1];	/* L slot a: b0 << 8 | b1 */
+		dst[1] = src[0];
+		dst[2] = src[3];	/* L slot b: b2 << 8 | b3 */
+		dst[3] = src[2];
+		dst[4] = src[5];	/* R slot a */
+		dst[5] = src[4];
+		dst[6] = src[7];	/* R slot b */
+		dst[7] = src[6];
+		memset(dst + 8, AE9_DSD_FILL, 4);
+	}
+}
+
+static void ae9_dsd_silence(u8 *dst, unsigned long frames)
+{
+	for (; frames; frames--, dst += AE9_DSD_HW_FRAME) {
+		memset(dst, AE9_DSD_SILENCE, 8);
+		memset(dst + 8, AE9_DSD_FILL, 4);
+	}
+}
+
+static bool ae9_pcm_is_dsd(const struct snd_pcm_runtime *runtime)
+{
+	return runtime->format == SNDRV_PCM_FORMAT_DSD_U32_BE;
+}
+
+/*
+ * The copy and silence ops (the DSD ops table only, so only streams opened
+ * with pcm_dsd=1 use them): DSD repacked into the link frame at 12/8 the
+ * offset; anything else as ALSA's own default_write_copy() and silence.
+ */
+static int creative_ae9_pcm_copy(struct snd_pcm_substream *substream, int channel,
+				 unsigned long pos, struct iov_iter *iter, unsigned long bytes)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	u8 buf[32 * AE9_DSD_ALSA_FRAME];
+	u8 *dst;
+
+	if (!ae9_pcm_is_dsd(runtime))
+		return copy_from_iter(runtime->dma_area + pos, bytes, iter) == bytes ? 0 : -EFAULT;
+	if (pos % AE9_DSD_ALSA_FRAME || bytes % AE9_DSD_ALSA_FRAME)
+		return -EINVAL;
+	dst = runtime->dma_area + pos / AE9_DSD_ALSA_FRAME * AE9_DSD_HW_FRAME;
+	while (bytes) {
+		unsigned long n = min_t(unsigned long, bytes, sizeof(buf));
+
+		if (copy_from_iter(buf, n, iter) != n)
+			return -EFAULT;
+		ae9_dsd_pack(dst, buf, n / AE9_DSD_ALSA_FRAME);
+		dst += n / AE9_DSD_ALSA_FRAME * AE9_DSD_HW_FRAME;
+		bytes -= n;
+	}
+	return 0;
+}
+
+static int creative_ae9_pcm_fill_silence(struct snd_pcm_substream *substream, int channel,
+					 unsigned long pos, unsigned long bytes)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	if (!ae9_pcm_is_dsd(runtime))
+		return snd_pcm_format_set_silence(runtime->format, runtime->dma_area + pos,
+						  bytes_to_samples(runtime, bytes));
+	ae9_dsd_silence(runtime->dma_area + pos / AE9_DSD_ALSA_FRAME * AE9_DSD_HW_FRAME,
+			bytes / AE9_DSD_ALSA_FRAME);
+	return 0;
+}
+
+/* the format mask holds DSD and not PCM: the DSD rules apply */
+static bool ae9_dsd_only(const struct snd_pcm_hw_params *params)
+{
+	const struct snd_mask *f = hw_param_mask_c(params, SNDRV_PCM_HW_PARAM_FORMAT);
+
+	return snd_mask_test_format(f, SNDRV_PCM_FORMAT_DSD_U32_BE) &&
+	       !snd_mask_test_format(f, SNDRV_PCM_FORMAT_S32_LE);
+}
+
+/* DSD: no other rate or channel count (rule->private: 88200 or 2) */
+static int ae9_rule_dsd_fix(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval t = { .integer = 1 };
+
+	if (!ae9_dsd_only(params))
+		return 0;
+	t.min = t.max = (unsigned long)rule->private;
+	return snd_interval_refine(hw_param_interval(params, rule->var), &t);
+}
+
+/* DSD: periods in whole AE9_DSD_PERIOD_STEPs */
+static int ae9_rule_dsd_period(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *p = hw_param_interval(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+	struct snd_interval t;
+	unsigned int lo, hi;
+
+	if (!ae9_dsd_only(params))
+		return 0;
+	lo = p->min + (p->openmin ? 1 : 0);
+	hi = p->max - (p->openmax && p->max ? 1 : 0);
+	if (lo > UINT_MAX - AE9_DSD_PERIOD_STEP)
+		return -EINVAL;
+	snd_interval_any(&t);
+	t.min = roundup(lo, AE9_DSD_PERIOD_STEP);
+	t.max = rounddown(hi, AE9_DSD_PERIOD_STEP);
+	t.integer = 1;
+	return snd_interval_refine(p, &t);
+}
+
+/*
+ * DSD: a buffer of 12-byte link frames that fits the preallocated one, in
+ * whole AE9_DSD_PERIOD_STEPs at both ends: the buffer is a whole number of
+ * periods, so any other size can't be met, and an end that can't be met
+ * (21845 frames, from the size cap alone) made mpd's
+ * snd_pcm_hw_params_set_buffer_time_near() fail with EINVAL when it asked
+ * for more than the maximum (card test 2026-11-19).
+ */
+static int ae9_rule_dsd_buffer(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *b = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+	struct snd_interval t;
+	unsigned int lo, hi;
+
+	if (!ae9_dsd_only(params))
+		return 0;
+	lo = b->min + (b->openmin ? 1 : 0);
+	hi = min_t(unsigned int, b->max - (b->openmax && b->max ? 1 : 0),
+		   CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME);
+	if (lo > UINT_MAX - AE9_DSD_PERIOD_STEP)
+		return -EINVAL;
+	snd_interval_any(&t);
+	t.min = roundup(lo, AE9_DSD_PERIOD_STEP);
+	/* the cap itself in 8 x 32 frames, so the largest buffer splits into
+	 * 2, 4 or 8 whole periods: 21824 (32 x 682) only made 2, and mpd, asking
+	 * for 4 (buffer_time / 4), got 2 of 124 ms, fed a quarter buffer per
+	 * wakeup and ran it to 30 frames from empty: a click every period (card
+	 * test 2026-11-19). 21760 = 8 x 2720. */
+	if (hi >= CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME)
+		hi = rounddown(CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME, AE9_DSD_PERIOD_STEP * 8);
+	t.max = rounddown(hi, AE9_DSD_PERIOD_STEP);
+	t.integer = 1;
+	return snd_interval_refine(b, &t);
+}
+
+/* DSD: read/write access only (the copy op repacks every frame; no mmap) */
+static int ae9_rule_dsd_access(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_mask m;
+
+	if (!ae9_dsd_only(params))
+		return 0;
+	snd_mask_none(&m);
+	snd_mask_set(&m, (__force unsigned int)SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+	return snd_mask_refine(hw_param_mask(params, SNDRV_PCM_HW_PARAM_ACCESS), &m);
+}
+
+/* no DSD where it can't be: another rate, more than 2 channels, mmap */
+static int ae9_rule_dsd_format(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_mask *f = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+	const struct snd_interval *rate = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_RATE);
+	const struct snd_interval *ch = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_CHANNELS);
+	const struct snd_mask *acc = hw_param_mask_c(params, SNDRV_PCM_HW_PARAM_ACCESS);
+	struct snd_mask m;
+
+	if (!snd_mask_test_format(f, SNDRV_PCM_FORMAT_DSD_U32_BE))
+		return 0;
+	if (snd_interval_test(rate, AE9_DSD_RATE) && snd_interval_test(ch, 2) &&
+	    snd_mask_test(acc, (__force unsigned int)SNDRV_PCM_ACCESS_RW_INTERLEAVED))
+		return 0;
+	m = *f;
+	snd_mask_reset(&m, (__force unsigned int)SNDRV_PCM_FORMAT_DSD_U32_BE);
+	return snd_mask_refine(f, &m);
+}
+
+static int ae9_dsd_rules(struct snd_pcm_runtime *runtime)
+{
+	int err;
+
+	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT, ae9_rule_dsd_format, NULL,
+				  SNDRV_PCM_HW_PARAM_RATE, SNDRV_PCM_HW_PARAM_CHANNELS,
+				  SNDRV_PCM_HW_PARAM_ACCESS, -1);
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE, ae9_rule_dsd_fix,
+					  (void *)(unsigned long)AE9_DSD_RATE,
+					  SNDRV_PCM_HW_PARAM_FORMAT, -1);
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS, ae9_rule_dsd_fix,
+					  (void *)2UL, SNDRV_PCM_HW_PARAM_FORMAT, -1);
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_ACCESS, ae9_rule_dsd_access,
+					  NULL, SNDRV_PCM_HW_PARAM_FORMAT, -1);
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+					  ae9_rule_dsd_period, NULL, SNDRV_PCM_HW_PARAM_FORMAT,
+					  SNDRV_PCM_HW_PARAM_PERIOD_SIZE, -1);
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+					  ae9_rule_dsd_buffer, NULL, SNDRV_PCM_HW_PARAM_FORMAT,
+					  SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
+	return err;
+}
+
+/*
+ * One BAR2 read-modify-write of the I2S wrapper, under chip->lock: the
+ * trigger (atomic) turns the I2S output (0x100 bit 8) on and off, process
+ * context the rest
+ */
+static u32 ae9_i2s_rmw(struct creative_chip *chip, unsigned int reg, u32 clear, u32 set)
+{
+	unsigned long flags;
+	u32 v;
+
+	spin_lock_irqsave(&chip->lock, flags);
+	v = (creative_ext_readl(chip, reg) & ~clear) | set;
+	creative_ext_writel(chip, reg, v);
+	spin_unlock_irqrestore(&chip->lock, flags);
+	return v;
+}
+
+/*
+ * CtxHdb FUN_00014fa8 (ch, 1): I2S channel ch's transmit FIFO flushed with
+ * its stream tag in 0x104 cleared around it (0x104 saved, the tag nibble
+ * cleared, TFFn = 1, 0x104 back)
+ */
+static void ae9_i2s_flush(struct creative_chip *chip, unsigned int ch)
+{
+	unsigned long flags;
+	u32 map;
+
+	spin_lock_irqsave(&chip->lock, flags);
+	map = creative_ext_readl(chip, AE9_I2S_MAP);
+	creative_ext_writel(chip, AE9_I2S_MAP, map & ~(0xf0U << (8 * ch)));
+	creative_ext_writel(chip, AE9_I2S_TFF(ch),
+			    creative_ext_readl(chip, AE9_I2S_TFF(ch)) | 1);
+	creative_ext_writel(chip, AE9_I2S_MAP, map);
+	spin_unlock_irqrestore(&chip->lock, flags);
+}
+
+/* CtxHdb FUN_00015140: I2S channel ch takes the stream with tag from its channel slot */
+static void ae9_i2s_map(struct creative_chip *chip, unsigned int ch, u8 tag, u8 slot)
+{
+	ae9_i2s_rmw(chip, AE9_I2S_MAP, 0xffU << (8 * ch), (u32)(tag << 4 | slot) << (8 * ch));
+}
+
+/* one front-DAC command (dsp.c's list: ca0113_mutex, settle; clears dac_start_key) */
+static void ae9_dsd_dac(struct creative_chip *chip, u8 reg, u8 val, const char *what)
+{
+	const u8 cmd[1][3] = { { AE9_DSD_DAC, reg, val } };
+
+	creative_dsp_ca0113_list(chip, cmd, 1, what);
+}
+
+/* DAC 48/07 bit 0 (the filter bits stay: dsp.c puts the user's in) */
+static void ae9_dsd_dac_mute(struct creative_chip *chip, bool mute)
+{
+	if (!!(chip->dac48_07 & 1) == mute)
+		return;
+	ae9_dsd_dac(chip, ES9038_REG_MUTE, (chip->dac48_07 & ~1) | mute,
+		    mute ? "DSD64: DAC muted" : "DSD64: DAC unmuted");
+}
+
+/*
+ * The I2S output (BAR2 0x100 bit 8): on right after the stream's RUN, off
+ * before its DMA stops (Windows' DSD SetState FUN_0012ff98: RUN ... then
+ * FUN_0002d878 -> FUN_00035680(1); STOP: FUN_00035680(0) first). From the
+ * trigger (atomic); the DAC's unmute (after the lock-in wait) or mute
+ * follows from the work below.
+ */
+static void ae9_dsd_run(struct creative_chip *chip, bool on)
+{
+	WRITE_ONCE(chip->dsd_running, on);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, on ? 0 : AE9_I2S_CTL_OUT, on ? AE9_I2S_CTL_OUT : 0);
+	mod_delayed_work(chip->wq, &chip->dsd_mute_work,
+			 on ? msecs_to_jiffies(AE9_DSD_UNMUTE_MS) : 0);
+}
+
+void creative_ae9_dsd_mute_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(to_delayed_work(w), struct creative_chip,
+						  dsd_mute_work);
+
+	mutex_lock(&chip->dsd_mutex);
+	if (chip->dsd_active && !creative_ae9_dead(chip) && !chip->suspended)
+		ae9_dsd_dac_mute(chip, !READ_ONCE(chip->dsd_running) || chip->dsd_dac_muted);
+	mutex_unlock(&chip->dsd_mutex);
+}
+
+/*
+ * DSD on (prepare, under dsd_mutex), in Windows' order: its DSD SetState RUN
+ * (CtxHda FUN_0012ff98) -> run prep FUN_0002d694 with isDSD = 1: board
+ * SetFormat FUN_00032f3c, stage 2 FUN_0003354c; the converter's format and
+ * bind (FUN_000206ec, FUN_000203a4), which runs stage 3 FUN_000336d8. RUN
+ * itself and the I2S output come at the trigger (ae9_dsd_run()).
+ */
+static void ae9_dsd_enter(struct creative_chip *chip)
+{
+	bool hp = chip->hu_output;
+	u8 tag = chip->playback_stream_tag;
+	unsigned long flags;
+
+	/* a PCM start on this open (hw_params again without hw_free): its
+	 * stop block first; on Windows a DSD stream is a stream of its own */
+	if (chip->pcm_start_sent && !chip->pcm_start_dsd)
+		creative_ae9_playback_seq(chip, false, 0, 0);
+	chip->pcm_start_sent = 0;
+	/* the first Direct Mode start since the load: no DSP route may feed a
+	 * DAC port (as ae9_pb_start() does it) */
+	if (!chip->rt_direct_swept) {
+		creative_ae9_rt_dsp_dac_off_all(chip, "first Direct Mode start");
+		chip->rt_direct_swept = true;
+	}
+
+	spin_lock_irqsave(&chip->lock, flags);
+	chip->dsd_bar2_100 = creative_ext_readl(chip, AE9_I2S_CTL);
+	chip->dsd_bar2_104 = creative_ext_readl(chip, AE9_I2S_MAP);
+	spin_unlock_irqrestore(&chip->lock, flags);
+	/*
+	 * Ours: the DAC muted across the switch (Windows only unmutes, at its
+	 * stage 4, a DAC it finds muted), and the I2S output off until the
+	 * stream runs. Windows' DSD stop leaves bit 8 off, so its second and
+	 * later DSD starts all run this way; only its first after boot has it
+	 * on from CtxHdb's init.
+	 */
+	chip->dsd_dac_muted = chip->dac48_07 & 1;
+	ae9_dsd_dac_mute(chip, true);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_OUT, 0);
+
+	/* SetFormat, isDSD = 1: the ES9038 to DSD input (FUN_00032460 ->
+	 * FUN_000325c8(1, 0xc3)), GPIO pin 1 high (CtxHdb FUN_00013d10) */
+	ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
+	creative_ae9_gpio_set(chip, 1, true);
+
+	/* stage 2, the format and bind, stage 3's clocks */
+	creative_ae9_dsd_start_block(chip, AE9_DSD_FMT, hp);
+
+	/* stage 3, FUN_000339ec at 88.2 kHz in DSD: no 48/01 = 0xc1 and no
+	 * 48/0b; 48/0a = 0x02 (FUN_00032260); the I2S block at 16-bit words
+	 * (FUN_0001506c) and rate code 88.2 kHz (FUN_000150b8). (Windows skips
+	 * these two when its last stream was 88.2 kHz PCM; here always.) */
+	ae9_dsd_dac(chip, ES9038_REG_SYNC, 0x02, "DSD64: DAC sync");
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_24BIT, 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_RATE,
+		    FIELD_PREP(AE9_I2S_CTL_RATE, AE9_I2S_RATE_88K2));
+	/* stage 3: the converter re-enabled (0x18a020 read, written back) */
+	creative_ae9_dsd_rearm_block(chip);
+
+	/* stage 3, "enter DSD routing" (FUN_00033848): pins 6/7 to their I2S
+	 * function (CtxHdb FUN_000138c0; Windows writes the byte, here the
+	 * word), both channels' FIFOs flushed, 0x104: channel 2 <- stream
+	 * channels 0-1, channel 3 <- 2-3, the channels on (0x100 bits 6/7,
+	 * then 14/15), the DAC's DSD input again */
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_PINFN(AE9_DSD_PIN(AE9_DSD_CH_L)));
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_PINFN(AE9_DSD_PIN(AE9_DSD_CH_R)));
+	ae9_i2s_flush(chip, AE9_DSD_CH_L);
+	ae9_i2s_flush(chip, AE9_DSD_CH_R);
+	ae9_i2s_map(chip, AE9_DSD_CH_L, tag, 0);
+	ae9_i2s_map(chip, AE9_DSD_CH_R, tag, 2);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_A(AE9_DSD_CH_L));
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_A(AE9_DSD_CH_R));
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_B(AE9_DSD_CH_L));
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_B(AE9_DSD_CH_R));
+	ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
+
+	/* stage 3's end: no stream 0x14 enable in DSD, ASI 0x0f */
+	creative_ae9_dsd_asi_block(chip);
+
+	chip->dsd_active = true;
+	chip->dsd_running = false;
+	chip->pcm_start_sent = 1;
+	chip->pcm_start_dsd = true;
+	chip->pcm_start_rate = AE9_DSD_RATE;
+	chip->pcm_start_fmt = AE9_DSD_FMT;
+	dev_info(chip->dev, "DSD64: native DSD on (DSD_U32_BE 2 ch at %u Hz = 2.8224 MHz, link format 0x%04x, %s); BAR2 0x100=0x%08x 0x104=0x%08x\n",
+		 AE9_DSD_RATE, AE9_DSD_FMT, hp ? "headphones" : "speakers",
+		 creative_ext_readl(chip, AE9_I2S_CTL), creative_ext_readl(chip, AE9_I2S_MAP));
+}
+
+/*
+ * DSD off (under dsd_mutex; the stream stopped): Windows' DSD STOP (I2S
+ * output off, converter unbound -> stage 0: "leave DSD routing",
+ * FUN_0003c62c), then what its next PCM stream's SetFormat (isDSD = 0) does
+ * (the DAC's input, GPIO pin 1 low), and ours around it: the DAC muted
+ * across, BAR2's I2S output bit, word size and rate and 0x104's channel 2/3
+ * map back to what they were before DSD (Windows leaves them; PCM has only
+ * ever run with them so), the DAC's mute back.
+ */
+static void ae9_dsd_exit(struct creative_chip *chip, const char *why)
+{
+	const u32 keep = AE9_I2S_CTL_OUT | AE9_I2S_CTL_24BIT | AE9_I2S_CTL_RATE;
+	/* the input after DSD: the clocks and pins DSD leaves are 88.2 kHz
+	 * PCM's (CA0132 pin 0 = the converter's S/PDIF output), so S/PDIF on
+	 * DATA2 as after an 88.2 kHz stream; 0xc0 there would read that bit
+	 * stream as I2S data. The next PCM start sends its own (these clear
+	 * dac_start_key). */
+	static const u8 dac_pcm[][3] = {
+		{ AE9_DSD_DAC, ES9038_REG_INPUT, 0xc1 },
+		{ AE9_DSD_DAC, ES9038_REG_SPDIF, 0x20 },
+	};
+
+	chip->dsd_active = false;
+	WRITE_ONCE(chip->dsd_running, false);
+	chip->pcm_start_sent = 0;
+	chip->pcm_start_dsd = false;
+	if (creative_ae9_dead(chip) || chip->suspended || !chip->corb_buf) {
+		dev_info(chip->dev, "DSD64: native DSD off (%s; card not reachable, nothing sent)\n", why);
+		return;
+	}
+	ae9_dsd_dac_mute(chip, true);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_OUT, 0);	/* FUN_00035680(0) */
+	creative_ae9_dsd_stop_block(chip);
+
+	/* FUN_0003c62c: both FIFOs flushed, the channels off (bits 6/7, 14/15),
+	 * pins 6/7 back to GPIO (CtxHdb FUN_000138c0) and low (FUN_00013d10) */
+	ae9_i2s_flush(chip, AE9_DSD_CH_L);
+	ae9_i2s_flush(chip, AE9_DSD_CH_R);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_CH_A(AE9_DSD_CH_L), 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_CH_A(AE9_DSD_CH_R), 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_CH_B(AE9_DSD_CH_L), 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_CH_B(AE9_DSD_CH_R), 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_PINFN(AE9_DSD_PIN(AE9_DSD_CH_L)), 0);
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_PINFN(AE9_DSD_PIN(AE9_DSD_CH_R)), 0);
+	creative_ae9_gpio_set(chip, AE9_DSD_PIN(AE9_DSD_CH_L), false);
+	creative_ae9_gpio_set(chip, AE9_DSD_PIN(AE9_DSD_CH_R), false);
+
+	/* ours: BAR2 as before DSD */
+	ae9_i2s_rmw(chip, AE9_I2S_CTL, keep, chip->dsd_bar2_100 & keep);
+	ae9_i2s_rmw(chip, AE9_I2S_MAP, 0xffff0000, chip->dsd_bar2_104 & 0xffff0000);
+
+	/* the next PCM SetFormat's (FUN_00032f3c, isDSD = 0): the DAC's
+	 * input (FUN_00032460 -> FUN_000321dc), then GPIO pin 1 low */
+	creative_dsp_ca0113_list(chip, dac_pcm, ARRAY_SIZE(dac_pcm), "DSD64: DAC input back to S/PDIF");
+	creative_ae9_gpio_set(chip, 1, false);
+	ae9_dsd_dac_mute(chip, chip->dsd_dac_muted);
+	dev_info(chip->dev, "DSD64: native DSD off (%s); BAR2 0x100=0x%08x 0x104=0x%08x\n",
+		 why, creative_ext_readl(chip, AE9_I2S_CTL), creative_ext_readl(chip, AE9_I2S_MAP));
+}
+
+static void ae9_dsd_leave(struct creative_chip *chip, const char *why)
+{
+	mutex_lock(&chip->dsd_mutex);
+	if (chip->dsd_active)
+		ae9_dsd_exit(chip, why);
+	mutex_unlock(&chip->dsd_mutex);
+}
+
+/*
+ * Something DSD can't stay on through (Direct Mode off, the output switch,
+ * suspend, unload, reboot): a running DSD stream stopped as an xrun (the app
+ * prepares it again: DSD again, or refused with Direct Mode off), then DSD
+ * taken down. Process context; sleeps.
+ */
+void creative_ae9_dsd_abort(struct creative_chip *chip, const char *why)
+{
+	struct snd_pcm_substream *ss;
+
+	if (!READ_ONCE(chip->dsd_active) || !chip->pcm)
+		return;
+	mutex_lock(&chip->pcm->open_mutex);
+	ss = chip->playback_substream;
+	if (ss && ss->runtime && ae9_pcm_is_dsd(ss->runtime))
+		snd_pcm_stop_xrun(ss);
+	ae9_dsd_leave(chip, why);
+	mutex_unlock(&chip->pcm->open_mutex);
+}
+
+/* DSD prepare, after the stream descriptor: the buffer DSD silence, DSD on
+ * once per open (as the PCM start block), no optical mirror */
+static int ae9_dsd_prepare(struct creative_chip *chip, struct snd_pcm_runtime *runtime)
+{
+	ae9_dsd_silence(runtime->dma_area, runtime->buffer_size);
+	wmb();
+	mutex_lock(&chip->dsd_mutex);
+	/* on, but the start marked unsent since (a bring-up, a mode switch):
+	 * off first, so the enter saves the state from before DSD again */
+	if (chip->dsd_active && !(chip->pcm_start_sent && chip->pcm_start_dsd))
+		ae9_dsd_exit(chip, "start again");
+	if (!chip->dsd_active)
+		ae9_dsd_enter(chip);
+	mutex_unlock(&chip->dsd_mutex);
+	chip->pb_format = 0;
+	ae9_spdif_out_apply(chip);	/* a mirror of the previous PCM stream off */
+	return 0;
+}
+
+static const struct snd_pcm_ops creative_ae9_pcm_ops, creative_ae9_pcm_dsd_ops;
+
 static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	/* DSD64: pcm_dsd, Direct Mode, and 88.2 kHz offered */
+	bool dsd = pcm_dsd && chip->fx.direct && pcm_rates == 2;
 
 	chip->substream = substream;
 	chip->playback_substream = substream;
@@ -789,9 +1353,8 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	if (pcm_rates == 2) {
 		runtime->hw.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
 				    SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 |
+				    SNDRV_PCM_RATE_176400 |
 				    SNDRV_PCM_RATE_192000 | SNDRV_PCM_RATE_384000;
-		if (pcm_176k4)
-			runtime->hw.rates |= SNDRV_PCM_RATE_176400;
 		runtime->hw.rate_min = 44100;
 		runtime->hw.rate_max = 384000;
 	} else if (pcm_rates) {
@@ -805,7 +1368,7 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 		runtime->hw.rate_max = 48000;
 	}
 	/*
-	 * Direct Mode off = through the DSP: 48 kHz, and 96 kHz with dsp_96k.
+	 * Direct Mode off = through the DSP: 48 and 96 kHz.
 	 * Windows offers up to 96 kHz there. Our first 96 kHz try played the
 	 * stream twice, direct and through the DSP a little later (an echo;
 	 * 2026-11-04): most likely stale direct bypass entries (HDA 02/03 ->
@@ -815,12 +1378,9 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	 * 2026-11-05, 01:55:36). PipeWire resamples other rates.
 	 */
 	if (!chip->fx.direct) {
-		unsigned int top = ae9_dsp_96k ? 96000 : 48000;
-
-		runtime->hw.rates &= SNDRV_PCM_RATE_48000 |
-				     (ae9_dsp_96k ? SNDRV_PCM_RATE_96000 : 0);
+		runtime->hw.rates &= SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_96000;
 		runtime->hw.rate_min = max(runtime->hw.rate_min, 48000U);
-		runtime->hw.rate_max = min(runtime->hw.rate_max, top);
+		runtime->hw.rate_max = min(runtime->hw.rate_max, 96000U);
 	}
 	/*
 	 * 5.1 (surround=1), both modes: Windows plays 6 channels in DSP mode
@@ -858,6 +1418,27 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, chip->pcm_bits);
 	chip->pcm_start_sent = 0;
 
+	/*
+	 * DSD64 (pcm_dsd): the format and its rules, and the ops with the copy
+	 * and silence ops; mmap stays offered for PCM (the access rule keeps
+	 * DSD read/write). Without pcm_dsd the stream keeps the plain ops.
+	 */
+	if (dsd) {
+		int err;
+
+		substream->ops = &creative_ae9_pcm_dsd_ops;
+		runtime->hw.formats |= SNDRV_PCM_FMTBIT_DSD_U32_BE;
+		err = ae9_dsd_rules(runtime);
+		if (err < 0) {
+			chip->substream = NULL;
+			chip->playback_substream = NULL;
+			return err;
+		}
+		ae9_dbg(chip, "DSD64: playback open offers DSD_U32_BE (pcm_dsd=1)\n");
+	} else {
+		substream->ops = &creative_ae9_pcm_ops;
+	}
+
 	return 0;
 }
 
@@ -892,10 +1473,23 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 		chip->playback_bdl = NULL;
 	}
 
-	ret = snd_pcm_lib_malloc_pages(substream,
-				       params_buffer_bytes(hw_params));
+	/* DSD: the buffer holds 12-byte link frames, not ALSA's 8-byte ones */
+	if (params_format(hw_params) == SNDRV_PCM_FORMAT_DSD_U32_BE)
+		ret = snd_pcm_lib_malloc_pages(substream,
+					       params_buffer_size(hw_params) * AE9_DSD_HW_FRAME);
+	else
+		ret = snd_pcm_lib_malloc_pages(substream,
+					       params_buffer_bytes(hw_params));
 	if (ret < 0)
 		return ret;
+	/* with a copy op ALSA doesn't clear the buffer after hw_params: here
+	 * (DSD silence for DSD; prepare fills it again) */
+	if (substream->ops->copy) {
+		if (params_format(hw_params) == SNDRV_PCM_FORMAT_DSD_U32_BE)
+			ae9_dsd_silence(substream->runtime->dma_area, params_buffer_size(hw_params));
+		else
+			memset(substream->runtime->dma_area, 0, substream->runtime->dma_bytes);
+	}
 
 	alloc_size = ae9_dma_size(chip, CREATIVE_PCM_BDL_SIZE + 128);
 	chip->playback_bdl_raw = dma_alloc_coherent(chip->dev, alloc_size,
@@ -931,6 +1525,9 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	 * re-prepare would otherwise leave node 0x02 unbound) */
 	chip->pb_format = 0;
 	ae9_spdif_out_apply(chip);	/* mirror off (unless optical has its own) */
+	/* DSD64: its own stop (clears pcm_start_sent: no PCM stop block) */
+	if (chip->dsd_active)
+		ae9_dsd_leave(chip, "stream released");
 	if (chip->pcm_start_sent) {
 		creative_ae9_playback_seq(chip, false, 0, 0);
 		chip->pcm_start_sent = 0;
@@ -971,15 +1568,27 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	unsigned int base = chip->playback_stream_base;
 	unsigned int buf_size = snd_pcm_lib_buffer_bytes(substream);
 	unsigned int period_size = snd_pcm_lib_period_bytes(substream);
+	bool dsd = ae9_pcm_is_dsd(runtime);
 	u16 format;
 	dma_addr_t addr;
 	int i;
 
 	if (creative_ae9_dead(chip))	/* the card stopped answering */
 		return -ENODEV;
+	/* DSD64: Direct Mode only (it was on at open; it went off since) */
+	if (dsd && !chip->fx.direct) {
+		dev_info_ratelimited(chip->dev, "DSD64: refused, Direct Mode is off (native DSD plays in Direct Mode only)\n");
+		return -EBUSY;
+	}
 
 	ae9_wait_hp_upload(chip);
 	creative_ae9_stream_reset(chip, base);
+
+	/* DSD64: the link carries 12-byte frames (6 x 16 bit) */
+	if (dsd) {
+		buf_size = runtime->buffer_size * AE9_DSD_HW_FRAME;
+		period_size = runtime->period_size * AE9_DSD_HW_FRAME;
+	}
 
 	/* Build BDL entries (keep as fallback) */
 	memset(chip->playback_bdl, 0, CREATIVE_PCM_BDL_SIZE);
@@ -1021,9 +1630,13 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, buf_size);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, runtime->periods - 1);
 
-	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41) */
-	format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
-					    runtime->rate);
+	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41); DSD64
+	 * as Windows sends it: 6 x 16 bit at 88.2 kHz (0x4815) */
+	if (dsd)
+		format = AE9_DSD_FMT;
+	else
+		format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
+						    runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
 
 	/* Write BDL pointer as fallback */
@@ -1033,18 +1646,25 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 			    upper_32_bits(chip->playback_bdl_dma));
 	ae9_dma_trace_prep(chip, "playback", base, substream, chip->playback_bdl_dma);
 
+	if (dsd)
+		return ae9_dsd_prepare(chip, runtime);
+	/* DSD64 on from this open's last stream: off before any PCM start */
+	if (chip->dsd_active)
+		ae9_dsd_leave(chip, "PCM stream");
+
 	/* Windows' playback-start block sets format 0x31 and binds node
 	 * 0x02 to tag 1 itself. Once per open: xrun recovery re-prepares,
 	 * and replaying the block (12 SCP messages) each time flooded the
-	 * DSP. */
+	 * DSP. A DSD start (88.2 kHz too) is never this block. */
 	if (!chip->pcm_start_sent || chip->pcm_start_rate != runtime->rate ||
-	    chip->pcm_start_fmt != format) {
+	    chip->pcm_start_fmt != format || chip->pcm_start_dsd) {
 		creative_ae9_playback_seq(chip, true, runtime->rate, format);
 		if (chip->mic_level != 99)
 			creative_ae9_mic_level_apply(chip);
 		chip->pcm_start_sent = 1;
 		chip->pcm_start_rate = runtime->rate;
 		chip->pcm_start_fmt = format;
+		chip->pcm_start_dsd = false;
 		ae9_dbg(chip, "PCM prepare: SD_FMT=0x%04x, Windows start block sent\n",
 			 format);
 		/* Speaker Config follows the stream, but only one that's still
@@ -1069,6 +1689,8 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int base = chip->playback_stream_base;
+	/* DSD64: the I2S output follows the stream (ae9_dsd_run()) */
+	bool dsd = ae9_pcm_is_dsd(substream->runtime) && chip->dsd_active;
 
 	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
 		return -ENODEV;
@@ -1079,11 +1701,15 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 	case SNDRV_PCM_TRIGGER_RESUME:
 		/* stream only; the start block went out at prepare */
 		creative_ae9_stream_start(chip, base);
+		if (dsd)
+			ae9_dsd_run(chip, true);
 		creative_ae9_dsp_switch_kick(chip);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		if (dsd)
+			ae9_dsd_run(chip, false);
 		creative_ae9_stream_stop(chip, base);	/* stop block at hw_free */
 		break;
 	default:
@@ -1116,6 +1742,12 @@ creative_ae9_pcm_pointer(struct snd_pcm_substream *substream)
 
 	pos = readl(chip->hda_regs + base + AZX_REG_SD_LPIB);
 	wmb();
+	/* DSD64: LPIB counts 12-byte link frames */
+	if (ae9_pcm_is_dsd(substream->runtime)) {
+		if (pos >= substream->runtime->buffer_size * AE9_DSD_HW_FRAME)
+			pos = 0;
+		return pos / AE9_DSD_HW_FRAME;
+	}
 	/* Mask to buffer size to prevent pos == buffer_size (invalid to ALSA) */
 	if (pos >= snd_pcm_lib_buffer_bytes(substream))
 		pos = 0;
@@ -1134,6 +1766,19 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 	.prepare	= creative_ae9_pcm_prepare,
 	.trigger	= creative_ae9_pcm_trigger,
 	.pointer	= creative_ae9_pcm_pointer,
+};
+
+/* the same with the DSD copy and silence ops: streams opened with pcm_dsd=1 */
+static const struct snd_pcm_ops creative_ae9_pcm_dsd_ops = {
+	.open		= creative_ae9_pcm_open,
+	.close		= creative_ae9_pcm_close,
+	.hw_params	= creative_ae9_pcm_hw_params,
+	.hw_free	= creative_ae9_pcm_hw_free,
+	.prepare	= creative_ae9_pcm_prepare,
+	.trigger	= creative_ae9_pcm_trigger,
+	.pointer	= creative_ae9_pcm_pointer,
+	.copy		= creative_ae9_pcm_copy,
+	.fill_silence	= creative_ae9_pcm_fill_silence,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1738,7 +2383,7 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 /*     0x13, "What U Hear In"), input stream 2 (BAR0+0xc0), tag 3. What */
 /*     the card plays, both with Direct Mode on and off (with SBX off it */
 /*     is the stream as sent: a 440 Hz test tone came back level-exact  */
-/*     on both channels). 48 or 96 kHz (wuh_96k).			  */
+/*     on both channels). 48 or 96 kHz.				  */
 /*   PCM device 3 "AE-9 Rear RCA In": the head unit's rear RCA L/R	  */
 /*     jacks = codec 2 pin 0x11 -> ADC 0x08 (24-bit up to 192 kHz),	  */
 /*     input stream 3 (BAR0+0xe0), tag 4. Proven by hand 2026-11-07: a  */
@@ -1778,11 +2423,9 @@ static const struct ae9_xcap ae9_xcaps[3] = {
  * at 440 Hz and the same level (-23.1 dBFS, L == R) with the card playing
  * at 48 or 96 kHz. Also moving its DSP connection point (ca0132's
  * MEM_CONNID_WUH = 0x0a, 48 kHz from Windows' boot table) to 96 kHz was
- * wrong: ~810 Hz, 3 dB low. Leave it at 48 kHz.
+ * wrong: ~810 Hz, 3 dB low. Leave it at 48 kHz. (wuh_96k, until 0.12.14,
+ * could limit What U Hear to 48 kHz.)
  */
-static bool wuh_96k = true;
-module_param(wuh_96k, bool, 0644);
-MODULE_PARM_DESC(wuh_96k, "What U Hear at 48 or 96 kHz (1 = yes, default; 0 = 48 kHz only)");
 
 
 
@@ -1824,7 +2467,7 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 	runtime->hw.rates = x->rates;
 	runtime->hw.rate_min = x->rate_min;
 	runtime->hw.rate_max = x->rate_max;
-	if (i == AE9_XCAP_WUH && wuh_96k) {
+	if (i == AE9_XCAP_WUH) {
 		runtime->hw.rates |= SNDRV_PCM_RATE_96000;
 		runtime->hw.rate_max = 96000;
 	}
@@ -1948,6 +2591,7 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 		st->no_signal = ae9_xcap_verb(chip, x, x->signal_pin, 0xf09, 0, &sense) == 0 &&
 				!(sense & 0x80000000);
 		if (st->no_signal) {
+			st->n_nosig++;
 			dev_info_ratelimited(chip->dev,
 				"optical in: no signal; recording silence until one comes in\n");
 			memset(runtime->dma_area, 0, snd_pcm_lib_buffer_bytes(substream));
@@ -2015,6 +2659,7 @@ static int creative_ae9_xcap_trigger(struct snd_pcm_substream *substream, int cm
 		}
 		if (x->signal_pin) {
 			st->last_lpib = ~0U;
+			st->last_irqs = READ_ONCE(st->irqs) - 1;
 			queue_delayed_work(chip->wq, &st->sense_work, HZ);
 		}
 		break;
@@ -2076,15 +2721,32 @@ static void ae9_sense_work(struct work_struct *w)
 	sig = sense & 0x80000000;
 	if (st->no_signal && sig) {
 		dev_info(chip->dev, "optical in: signal came in; restarting the recording on it\n");
+		st->n_came++;
 		restart = true;
 	} else if (!st->no_signal) {
+		/*
+		 * Stopped = no period interrupt AND the same buffer position
+		 * since the last check. The position alone gave false stops:
+		 * the delayed work often runs ~1024 ms apart (timer-wheel
+		 * rounding), exactly 6 laps of a 16384-frame buffer at 96 kHz,
+		 * so a moving stream read the same LPIB (PS3 on optical in, a
+		 * restart and a click about once a minute). The position
+		 * stays for periods longer than the 1 s check.
+		 */
+		unsigned int irqs = READ_ONCE(st->irqs);
+
 		lpib = readl(chip->hda_regs + x->base + AZX_REG_SD_LPIB);
-		if (!sig || lpib == st->last_lpib) {
+		if (!sig || (lpib == st->last_lpib && irqs == st->last_irqs)) {
 			dev_info(chip->dev, "optical in: %s; recording silence until a signal comes in\n",
 				 sig ? "the stream stopped moving" : "signal lost");
+			if (sig)
+				st->n_stopped++;
+			else
+				st->n_lost++;
 			restart = true;
 		}
 		st->last_lpib = lpib;
+		st->last_irqs = irqs;
 	}
 	if (restart) {
 		snd_pcm_stop_xrun(ss);
@@ -2137,8 +2799,10 @@ void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i)
 	if (!sts)
 		return;
 	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
-	if ((sts & SD_INT_COMPLETE) && chip->xcap[i].substream)
+	if ((sts & SD_INT_COMPLETE) && chip->xcap[i].substream) {
+		WRITE_ONCE(chip->xcap[i].irqs, chip->xcap[i].irqs + 1);
 		snd_pcm_period_elapsed(chip->xcap[i].substream);
+	}
 }
 
 static void creative_ae9_xcap_pcm_free(struct snd_pcm *pcm)

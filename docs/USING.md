@@ -79,10 +79,16 @@ are also in `alsamixer -c AE9` and `amixer -c AE9`.
 - **Choosing a rate:** PipeWire runs at 48 kHz unless told otherwise.
   `pw-metadata -n settings 0 clock.allowed-rates '[ 44100 48000 88200 96000 176400 192000 384000 ]'`
   follows each file's rate, `clock.force-rate 192000` forces one (0 = back to
-  automatic). SbAe9-SBC does this from its rate picker. 44.1/88.2 kHz play
-  through the card's sample-rate converter; leave 44100/88200 out and PipeWire
-  resamples those files to 48 kHz instead. `pcm_rates=1` drops 44.1/88.2 kHz
+  automatic). SbAe9-SBC does this from its rate picker. 44.1/88.2/176.4 kHz
+  reach the DAC over the card's internal S/PDIF line (bit-exact, re-timed by
+  the DAC); leave 44100/88200 out and PipeWire resamples those files to 48 kHz
+  instead. `pcm_rates=1` drops 44.1/88.2 kHz
   from the card's list, `pcm_rates=0` limits it to 48 kHz.
+- **Quantum at high rates:** at 384 kHz use a quantum of 1024-2048
+  (`pw-metadata -n settings 0 clock.force-quantum 2048`); at 192 kHz, 1024.
+  Small quantums there (128 at 384 kHz = 0.33 ms) crackle as soon as the CPU
+  gets busy (measured: PipeWire's xruns went from 6 to 57 per 30 s with half
+  the cores loaded). The card itself has 85 ms of buffer at 384 kHz.
 - **DSP mode needs 48 or 96 kHz:** with Direct Mode off, a stream at another
   rate (44.1 kHz, say) keeps playing direct, and DSP mode and the effects
   start with the next 48 kHz stream. `pw-metadata -n settings 0
@@ -90,6 +96,51 @@ are also in `alsamixer -c AE9` and `amixer -c AE9`.
 - [Helvum](https://gitlab.freedesktop.org/pipewire/helvum) (on Flathub)
   draws PipeWire's patchbay: a great way to see the AE-9's ports (FL FR on
   stereo, all six on the 5.1 profile) and what's feeding them.
+
+## Native DSD64 (experimental, 0.12.14+)
+
+The card plays DSD64 natively: the 1-bit stream goes from the player to the
+DAC's DSD decoder, the way Creative's Windows DSD ASIO driver does it (the
+CA0113's own I2S to the ES9038, bypassing the DSP). Off by default:
+
+```
+echo "options snd-hda-codec-creative-ae9 pcm_dsd=1" | sudo tee /etc/modprobe.d/ae9-dsd.conf
+```
+
+then `ae9-reload` (or `echo 1 | sudo tee
+/sys/module/snd_hda_codec_creative_ae9/parameters/pcm_dsd` for this session).
+
+- **DSD64 only** (2.8224 MHz). DSD128/256 files play as PCM (any player
+  converts them). The card can't clock DSD128: its I2S block has no 44.1 kHz
+  family rate above 88.2 kHz (tested).
+- **Direct Mode only**, on the card's RCA out and the head unit's headphones
+  (not Rear, Center/Sub or optical). Direct Mode off stops a DSD stream.
+- **A player that sends native DSD to ALSA:** MPD with an output like
+
+  ```
+  audio_output {
+  	type		"alsa"
+  	name		"AE-9 direct"
+  	device		"hw:AE9,0"
+  	dop		"no"
+  	auto_resample	"no"
+  	auto_channels	"no"
+  	auto_format	"no"
+  	mixer_type	"none"
+  }
+  ```
+
+  (Cantata, ncmpcpp or mpc as the front end). It plays `.dsf`/`.dff` as
+  `DSD_U32_BE` at "88200". The device is the card itself, so PipeWire has to
+  let go of it first: `pactl suspend-sink
+  alsa_output.pci-0000_06_00.0.analog-stereo 1` (`pactl list sinks short` for
+  your card's name; `0` gives it back). Through PipeWire, DSD files play as
+  PCM.
+- **Seeing it:** PipeWire is bypassed, so `pw-top` and AudioMon show
+  nothing. `grep -E "^(format|rate)" /proc/asound/AE9/pcm0p/sub0/hw_params`
+  shows `DSD_U32_BE` / `88200`, and the kernel log `DSD64: native DSD on`.
+- With `pcm_dsd=1` the card also offers DSD to every app; PCM playback is
+  unchanged (the default turns on once that has had more testing).
 
 ## Direct Mode, SBX and the EQ
 

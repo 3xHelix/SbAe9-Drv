@@ -17,7 +17,9 @@ issues. Back to the [README](../README.md).
    shows that), and it says when the card didn't start. Since 0.12.13 it
    also leaves a notice (`/run/user/<your uid>/ae9-reload`) so Sound Blaster
    Command (v0.21.4+) and AudioMon (v0.4.9+) let go of the card while it
-   runs and come back by themselves.
+   runs and come back by themselves. Since 0.12.14 it keeps a forced
+   PipeWire rate or quantum (`clock.force-rate`, `clock.force-quantum` set
+   with `pw-metadata`), which PipeWire's restart used to clear.
 2. **Power off fully:** when a reload can't bring the card back ("the card
    didn't start"), or the card is dark (lights off, no head unit, no sound):
    shut down, switch the PSU off (or unplug) for 15-30 s, then boot. A warm
@@ -41,6 +43,41 @@ at all with `pactl list sink-inputs | grep -E "Sink:|application.name"`. Seen
 with Chrome Canary after output switches or a reboot (no stream; VLC played
 fine); restarting the app fixes it.
 
+**The desktop volume slider doesn't move the head unit's volume** (the
+slider changes the level, but the knob, the display and `amixer -c AE9 get
+Master` stay put): look for an old WirePlumber rule that sets
+`api.alsa.soft-mixer = true`, often left behind from a guide for another card:
+`grep -rs soft-mixer ~/.config/wireplumber /etc/wireplumber`. It makes
+PipeWire turn the volume down in software instead of using the card's
+volume. Remove that rule (or limit it to the other card) and restart
+WirePlumber: `systemctl --user restart wireplumber`. The "Pro Audio" profile
+also uses software volume only; use "Stereo Output + Stereo Input" (see
+[USING.md](USING.md#playback)).
+
+**Listening to an input on the speakers tears all audio now and then**
+(a console on optical in, a turntable on the rear RCA input, linked to the
+output in Helvum, qpwgraph or `pw-link`): PipeWire made the input the clock
+for the speakers, so every hiccup on the input tears everything that plays.
+Make the inputs follow the output instead: put this in
+`~/.config/wireplumber/wireplumber.conf.d/51-ae9-inputs.conf`
+
+```
+monitor.alsa.rules = [
+  {
+    matches = [
+      { node.name = "~alsa_input.pci-.*optical_in" }
+      { node.name = "~alsa_input.pci-.*rear_rca" }
+      { node.name = "~alsa_input.pci-.*what_u_hear" }
+    ]
+    actions = { update-props = { priority.driver = 500 } }
+  }
+]
+```
+
+and `systemctl --user restart wireplumber`. Optical in only takes PCM: a
+Dolby Digital or DTS bitstream (a console set to "Bitstream") comes in as
+noise, so set the source to Linear PCM.
+
 **SBX/EQ do nothing:** they work with Direct Mode off, at 48 or 96 kHz. A
 44.1 kHz stream keeps playing direct; `pw-metadata -n settings 0
 clock.force-rate 48000` and play again (see [USING.md](USING.md#playback)).
@@ -49,9 +86,20 @@ clock.force-rate 48000` and play again (see [USING.md](USING.md#playback)).
 
 `sudo ae9-full-dump` (from a source checkout: `sudo scripts/ae9-full-dump.sh`)
 saves everything the driver can read about the card (streams, controls,
-PipeWire, registers, the DSP's router, the driver's recent log, a "Driver
-state" section) to `ae9-dump-<time>.txt` in the current directory, without
-changing anything.
+PipeWire and the card's profile, registers, the DSP's router, the
+driver's recent log, a "Driver state" section, and the PCI path: link,
+power-saving and error counters of the card's bridges) to `~/ae9-dumps/ae9-dump-<time>.txt`, without changing
+anything (before 0.12.14: the current directory). To save them elsewhere:
+`AE9_DUMP_DIR=/some/folder ae9-full-dump`.
+
+For an issue, `ae9-full-dump --report` (0.12.14+) does the same and adds
+what we ask for every time: `system.txt` (kernel, distribution, driver
+version, how it's installed, `ae9-get-firmware --check`, PipeWire and
+WirePlumber versions, Driver Health) and `kernel-log.txt` (the driver's
+lines from this boot and the end of the last one, and IOMMU faults that
+point at the card). You get the
+files to read in `~/ae9-dumps/ae9-report-<time>/` and one
+`ae9-report-<time>.tar.gz` of them to attach.
 
 - Stop all audio first: while something plays it skips the chip readings,
   which can freeze the audio during playback.
@@ -59,6 +107,17 @@ changing anything.
   can) and attach them to your
   [issue](https://github.com/3xHelix/SbAe9-Drv/issues).
 - It only names the apps that are playing; look it over before posting.
+- Say what you did right before it went wrong, and whether a reload or a
+  power-off fixed it.
+- Without `--report` (an older version), also include, if you can (each is
+  one command):
+  - `uname -r` and your distribution;
+  - `modinfo -F version snd-hda-codec-creative-ae9` and `dkms status`
+    (or which package you installed);
+  - `ae9-get-firmware --check`;
+  - `journalctl -k -b | grep -iE "ae9|AMD-Vi|DMAR|IO_PAGE_FAULT"` (the
+    driver's lines from this boot, and IOMMU faults that point at the
+    card, if any).
 - In "Driver state", "STALE" means a leftover route; the driver switches
   those off at the next Direct Mode start.
 
@@ -115,6 +174,23 @@ For more detail in the kernel log:
   sample-rate or output change: the DAC re-locking to its new settings
   (Windows sends them at every start; we only when something changed,
   `dac_start_skip`).
+- **One channel silent after changing the bit depth or a forced rate
+  during playback** (PipeWire older than 1.6.8, e.g. Ubuntu 24.04's 1.0.5):
+  PipeWire can leave a playing stream's port silent when the output is
+  suspended and reopened under it (PipeWire issue #3547, fixed in 1.6.7 and
+  1.6.8). The right channel stays silent until the next track or the next
+  reopen; the driver gets the silence already mixed in (`pipewire
+  --version` shows yours). Update PipeWire, or change PCM Bit Depth and the
+  rate while nothing plays.
+- **"Refused to change power state from D0 to D3hot"** in the kernel log at
+  every suspend: the PCI core asking the card (behind its bridge) to sleep,
+  which it declines; harmless, a suspend cuts the card's power anyway and the
+  driver brings it back up at resume.
+- **A player that opens the card directly** (`hw:AE9,0`, e.g. MPD with
+  `buffer_time` set) can be refused some exact buffer times ("Invalid
+  argument" from `snd_pcm_hw_params_set_buffer_time_near`): leave the
+  player's buffer at its default or pick another value. Planned fix: 0.12.15.
+  (PipeWire isn't affected.)
 - **Suspend blocked** by other programs stuck on network file I/O (seen with
   Plex reading from a CIFS share); not driver-related.
 

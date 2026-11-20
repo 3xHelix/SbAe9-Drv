@@ -3,6 +3,68 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.14 (2026-11-20)
+Native DSD64. On Linux. On a PCIe card. 💣🎧
+
+Works with SbAe9-SBC v0.22.0 (shows a native DSD stream, and a switch for
+it) and SbAe9-AudioMon v0.4.9.
+
+- **Native DSD64 (experimental, opt-in).** `.dsf`/`.dff` files go to the
+  DAC's own DSD decoder as a 1-bit stream at 2.8224 MHz: no conversion to
+  PCM anywhere. It's the path Creative's Windows DSD driver uses, decoded
+  from it: the card's second chip (CA0113) clocks the bits straight to the
+  ES9038, past the DSP and the router. Turn it on with `pcm_dsd=1` (or SBC's
+  switch), then play with a player that sends DSD to ALSA, like MPD with
+  `dop "no"`. DSD64 only, Direct Mode only, on the card's RCA out and the
+  head unit's headphones. How to: [USING.md](docs/USING.md#native-dsd64-experimental-01214).
+  Checked on the card: the DAC reports its DSD decoder running and locked
+  at 2.8224 MHz, with the same register values Windows uses; clean with
+  aplay and MPD (whole albums), on both outputs, through output switches,
+  stops and restarts, and Direct Mode off mid-play (stopped cleanly). Off
+  by default this release while it gets more use; PCM is unchanged with it
+  off.
+- **No DSD128, and why:** the card can't clock it. Its I2S block has no
+  rate above 88.2 kHz in the 44.1 kHz family (we tried every code: the DAC
+  measured 192 kHz-family clocks). That's why Creative stops at DSD64 too.
+  DSD128/256 files still play, as PCM.
+- **Optical in: no more false restarts.** A once-a-second check could land
+  on the same buffer position a whole number of laps later and restart a
+  recording that was fine (a click). It now also checks that the card's
+  interrupts stopped. Optical-in events are counted in the debugfs `state`.
+- **Head unit:** while it's dark (unplugged, powered off), the log says
+  "not answering" once and "answering again" once, instead of a line every
+  half second; no status reads while it's quiet; every frame counted, with
+  why one went unanswered (debugfs).
+- **`ae9-reload` keeps your forced PipeWire rate and quantum** (PipeWire's
+  restart used to drop them).
+- **`ae9-full-dump --report`:** one `.tar.gz` to attach to an issue, plus
+  the files to read: the dump, `system.txt` (kernel, distribution, driver,
+  install, firmware, PipeWire/WirePlumber versions) and `kernel-log.txt`.
+  Every dump now also shows every PipeWire node with its xruns, each
+  stream's volume and channel map and what feeds the AE-9's outputs, the
+  card's PipeWire profile, the names of your PipeWire/WirePlumber config
+  files, and the PCI path: the card's bridges, link speed and width, ASPM,
+  power state, error counters, the card's interrupt and IOMMU group.
+  Dumps go to `~/ae9-dumps`.
+- **Names:** the 44.1 kHz family plays over the card's internal S/PDIF
+  line to the DAC (the log said "sample-rate converter"; the DAC measures
+  exactly 176.4 kHz on its S/PDIF input); the bridge is named by its chip
+  (Tundra Tsi381 or ASMedia).
+- **8 options removed:** the six Sound Blaster Command feature flags,
+  `router_poll`, `rt_dsp_walk` and `wuh_96k`, all always on.
+- **Firmware checked by SHA-256** and size instead of MD5.
+- **Docs:** an input linked to the speakers (a console on optical in) can
+  tear all audio, and the WirePlumber fix; optical in takes PCM only (no
+  Dolby/DTS); PipeWire older than 1.6.8 can leave one channel silent after
+  a bit-depth or rate change during playback (fixed in PipeWire); quantum
+  1024-2048 at 384 kHz; the harmless "Refused to change power state" line at
+  suspend.
+- Tested: every command and register write compared with 0.12.13 (the same,
+  DSD off), optical replugs, head-unit power cycles, CPU stress, three
+  suspend/resume cycles and a warm reboot: Driver Health 0 throughout.
+- Thanks s3boun3t, for the PipeWire 1.6.8 find and the dumps that shaped
+  the new report.
+
 ## 0.12.13 (2026-11-18)
 Same sound, tougher driver. 🛡️
 

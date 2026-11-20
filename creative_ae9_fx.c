@@ -417,20 +417,6 @@ static unsigned int fx_spk_cfg = 2;
 module_param(fx_spk_cfg, uint, 0444);
 MODULE_PARM_DESC(fx_spk_cfg, "Speaker Config at load, Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows)");
 
-/*
- * Live uploads, as Windows (21 uploads in 13 captures with playback, most
- * also with captures running; nothing paused or muted). Ours broke the DSP
- * while audio played (2026-11-08, note 54; Kaiba 0.10.1, note 55): every
- * one of those deaths followed a lost reply or a command timeout and ring
- * reset, i.e. the stale RIRB reads fixed in 0.12.10 (corb.c rirb_take).
- * uv77 (2026-11-15, x2): 160 live uploads with music, with all four
- * captures and with EQ toggled after each: all done, Y read-back 9/9,
- * 0 lost replies, 0 timeouts, 0 DMA channel leaks.
- */
-static bool hp_live_upload = true;
-module_param(hp_live_upload, bool, 0644);
-MODULE_PARM_DESC(hp_live_upload, "Upload headphone profiles while audio streams run, as Windows (default on; 0 = wait until every stream has stopped, as before 0.12.10)");
-
 static bool eq_headroom = true;
 module_param(eq_headroom, bool, 0644);
 MODULE_PARM_DESC(eq_headroom, "With a headphone profile and the EQ both on, send the DSP the EQ pre-gain 12 dB lower, not below -12 dB (default on; stops the DSP's overload, the \"metallic\" sound)");
@@ -584,26 +570,25 @@ static void fx_hp_set_locked(struct creative_chip *chip, bool on, bool log)
 	}
 }
 
-enum hp_sync { HP_IDLE, HP_WAIT, HP_LOADED, HP_RETRY, HP_BLOCKED };
+enum hp_sync { HP_IDLE, HP_LOADED, HP_RETRY, HP_BLOCKED };
 
 /*
- * Uploads that lost a reply or landed wrong broke the DSP until a
- * power-off (our crash 2026-11-08, note 54; Kaiba's 0.10.1 report, note
- * 55): most went wrong while audio played (stale RIRB reads, fixed in
- * 0.12.10). hp_live_upload=0 makes an upload wait until every stream has
- * stopped; with or without it, one that
- * failed after the DSP's DMA was armed, or after 2 channels went missing,
- * stops uploads until the next bring-up.
+ * Uploads run live, while audio plays, as Windows (21 uploads in 13
+ * captures with playback, most also with captures running; nothing paused
+ * or muted). Ours broke the DSP until a power-off while audio played
+ * (2026-11-08, note 54; Kaiba 0.10.1, note 55): every one of those deaths
+ * followed a lost reply or a command timeout and ring reset, i.e. the
+ * stale RIRB reads fixed in 0.12.10 (corb.c rirb_take). uv77 (2026-11-15,
+ * x2): 160 live uploads with music, with all four captures and with EQ
+ * toggled after each: all done, Y read-back 9/9, 0 lost replies, 0
+ * timeouts, 0 DMA channel leaks. (hp_live_upload=0, until 0.12.14, made an
+ * upload wait until every stream had stopped.) One that failed after the
+ * DSP's DMA was armed, or after 2 channels went missing, stops uploads
+ * until the next bring-up.
  */
-static bool fx_hp_must_wait(struct creative_chip *chip)
-{
-	return !hp_live_upload && creative_ae9_streams_running(chip);
-}
-
 static void fx_hp_block(struct creative_chip *chip, const char *why)
 {
 	chip->fx.hp_blocked = true;
-	chip->fx.hp_waiting = false;
 	dev_warn(chip->dev, "headphone profile: %s; no more profile uploads until the next start (sleep/wake or reboot; power the PC off if the sound is broken)\n",
 		 why);
 }
@@ -625,20 +610,10 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 
 	bool cur = fx_hp_current(fx);
 
-	if (!want || cur)
-		fx->hp_waiting = false;
 	if (want && !cur) {
 		if (fx->hp_blocked || fx->dead) {
 			st = HP_BLOCKED;
-		} else if (fx_hp_must_wait(chip)) {
-			if (!fx->hp_waiting)
-				dev_info(chip->dev, "headphone profile: loads when playback and recording stop (uploads during playback can break the DSP)\n");
-			fx->hp_waiting = true;
-			queue_delayed_work(chip->wq, &chip->hp_work,
-					   msecs_to_jiffies(HP_GAP_MS));
-			st = HP_WAIT;
 		} else {
-			fx->hp_waiting = false;
 			char key[HP_KEY_MAX + 1];
 			unsigned int gen;
 
@@ -659,11 +634,10 @@ static enum hp_sync fx_hp_sync_locked(struct creative_chip *chip, bool log)
 			}
 		}
 	}
-	/* while a new pick waits for a pause, the profile already loaded stays
-	 * on (Kaiba: it went off at once, audibly); the upload turns "use
-	 * speaker EQ" off itself before it writes, and a failure leaves it off */
+	/* the upload turns "use speaker EQ" off itself before it writes, and a
+	 * failure leaves it off */
 	fx_hp_set_locked(chip, want && fx->hp_loaded &&
-			 (fx->hp_loaded == fx->hp_profile || st == HP_WAIT), log);
+			 fx->hp_loaded == fx->hp_profile, log);
 	return st;
 }
 
@@ -955,7 +929,6 @@ static void fx_apply_spk(struct creative_chip *chip)
 static void creative_ae9_fx_hp_reset(struct creative_chip *chip)
 {
 	chip->fx.hp_on = false;
-	chip->fx.hp_waiting = false;
 	chip->hp_tries = 0;
 }
 
@@ -970,7 +943,6 @@ void creative_ae9_fx_dsp_reset(struct creative_chip *chip)
 	chip->fx.hp_on = false;
 	chip->fx.hp_loaded = 0;
 	chip->fx.hp_blocked = false;
-	chip->fx.hp_waiting = false;
 	chip->hp_leaks = 0;
 	chip->hp_tries = 0;
 	chip->scp_fail_logged = false;
@@ -1052,7 +1024,6 @@ void creative_ae9_fx_hp_work(struct work_struct *w)
 						  struct creative_chip, hp_work);
 	struct creative_ae9_fx *fx = &chip->fx;
 	unsigned long next = chip->hp_last + msecs_to_jiffies(HP_GAP_MS);
-	bool upload;
 	enum hp_sync st;
 
 	if (READ_ONCE(chip->unloading))	/* the card and its controls are going */
@@ -1062,14 +1033,6 @@ void creative_ae9_fx_hp_work(struct work_struct *w)
 		return;
 	if (chip->hp_last && time_before(jiffies, next)) {
 		queue_delayed_work(chip->wq, &chip->hp_work, next - jiffies);
-		return;
-	}
-	upload = fx->hp_profile && !fx_hp_current(fx) &&
-		 chip->hu_output && !fx->hp_blocked;
-	/* waiting for the streams to stop: look again later, no DSP traffic */
-	if (upload && fx->hp_waiting && fx_hp_must_wait(chip)) {
-		queue_delayed_work(chip->wq, &chip->hp_work,
-				   msecs_to_jiffies(HP_GAP_MS));
 		return;
 	}
 	fx_live_begin(chip);
@@ -1246,12 +1209,16 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 		if (!!v == fx->direct)
 			return 0;
 		fx->direct = !!v;
+		/* native DSD (pcm_dsd) is Direct Mode only: stopped and off; the
+		 * app's restart is refused (pcm.c prepare) */
+		if (!fx->direct)
+			creative_ae9_dsd_abort(chip, "Direct Mode off");
 		if (!fx->direct && !(chip->pcm_start_sent && chip->dsp_primed)) {
 			/* nothing playing: switch at the next stream (see
 			 * creative_ae9_dsp_switch_work) */
 			chip->dsp_switch_pending = true;
 		} else if (!fx->direct && chip->pcm_start_rate != 48000 &&
-			   !(ae9_dsp_96k && chip->pcm_start_rate == 96000)) {
+			   chip->pcm_start_rate != 96000) {
 			/* a direct stream above 48 kHz can't go through the DSP
 			 * (see pcm_open): it plays on direct, and the next
 			 * stream opens at 48 kHz and switches */

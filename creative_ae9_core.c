@@ -61,8 +61,10 @@ void creative_ae9_hu_ae9_hold(struct creative_chip *chip)
 }
 
 /*
- * After the init passes, poll the head unit every acm_heartbeat_ms to keep
- * the MCU/DAC alive (capture: ~500ms, runs during audio playback). 0=off:
+ * After the init passes, poll the head unit every acm_heartbeat_ms, as
+ * Windows does (~500 ms, playback or not): its knob, buttons, plugs and
+ * status come from these polls. Windows' cadence; that the head unit needs
+ * them to stay alive is not shown. 0=off:
  * tools/verbdiff loads the driver with 0 so its verb logs stay deterministic.
  */
 static unsigned int acm_heartbeat_ms = 500;
@@ -1026,13 +1028,11 @@ void creative_ae9_rt_dsp_dac_off_all(struct creative_chip *chip, const char *why
  * slots, as Windows' Direct Mode walk does for its stream (and Creative's
  * driver does for another card's stream 0x18, FUN_00037898): no fixed
  * slot, no collision possible (the 8051 never gives a connected link's
- * slots to anyone else). 0 = the fixed slots, as before; 1 = the front
- * lanes only (c0 c1 c6 c7 -> 40 41 42 43); 2 = all twelve, as the 8051's
- * own layout (default).
+ * slots to anyone else). All twelve lanes, as the 8051's own layout; the
+ * fixed slots stay only as the fallback when stream 0x18's list can't be
+ * used. (rt_dsp_walk, until 0.12.14, could force the fixed slots or the
+ * front lanes only.)
  */
-static unsigned int rt_dsp_walk = 2;
-module_param(rt_dsp_walk, uint, 0644);
-MODULE_PARM_DESC(rt_dsp_walk, "DSP mode: route the DSP outputs in the router chip's own slots for them (stream 0x18) instead of fixed slots: 0 = fixed slots, as before; 1 = front only (c0 c1 c6 c7 -> 40 41 42 43); 2 = all twelve, as the router chip lays them out (default)");
 
 #define AE9_XRAM_STREAM_REFS(id)	(0x0734 + 10 * (id))	/* record byte 5 */
 #define AE9_XRAM_STREAM18_REFS	AE9_XRAM_STREAM_REFS(0x18)	/* 0x0824 */
@@ -1103,16 +1103,14 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	int keep[AE9_DSP_LANES];	/* slots of our DSP -> DAC routes */
 	int lane[AE9_DSP_LANES], head18 = -1, chain = 0;
 	struct ae9_rt_map rtmap = { .state = 0 };
-	unsigned int i, n = 0, ff, seen, walked = 0, lanes_set = 0, lanes_off = 0, wrote = 0;
+	unsigned int i, n = 0, ff, seen, walked = 0, lanes_set = 0, wrote = 0;
 	unsigned int lanes_ff = 0, lanes_parked = 0, lanes_stray = 0;
 	unsigned int unsteady = 0, retried = 0, failed = 0;
-	unsigned int mode = min_t(unsigned int, READ_ONCE(rt_dsp_walk), 2);
 
 	for (i = 0; i < ARRAY_SIZE(keep); i++)
 		keep[i] = -1;
 	/* stream 0x18's list is the 8051's: let it finish connecting first */
-	if (mode)
-		ae9_8051_wait_idle(chip, "before the DSP route walk");
+	ae9_8051_wait_idle(chip, "before the DSP route walk");
 	mutex_lock(&chip->replay_mutex);
 	creative_dsp_chipio_addr_invalidate();
 	for (i = 0; i < AE9_RT_ENTRIES; i++) {
@@ -1164,15 +1162,13 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 		l = el >= 0 ? el : 0xc0;
 		r = er >= 0 ? er : 0xc1;
 	}
-	if (mode) {
+	chain = ae9_rt_dsp_chain(chip, e, n, lane, &head18, &unsteady);
+	/* one glitched pointer or slot read (partial or refused list, the list
+	 * itself readable): once more */
+	if ((chain > 0 && chain < AE9_DSP_LANES) ||
+	    (chain == 0 && head18 >= 0 && n == AE9_RT_ENTRIES))
 		chain = ae9_rt_dsp_chain(chip, e, n, lane, &head18, &unsteady);
-		/* one glitched pointer or slot read (partial or refused list,
-		 * the list itself readable): once more */
-		if ((chain > 0 && chain < AE9_DSP_LANES) ||
-		    (chain == 0 && head18 >= 0 && n == AE9_RT_ENTRIES))
-			chain = ae9_rt_dsp_chain(chip, e, n, lane, &head18, &unsteady);
-		walked = chain > 0 ? chain : 0;
-	}
+	walked = chain > 0 ? chain : 0;
 	if (walked) {
 		DECLARE_BITMAP(ours, AE9_RT_ENTRIES);
 
@@ -1204,12 +1200,7 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 		 * fixed routes were). Lane k < 6 is channel k's first sample,
 		 * k + 6 its second (96 kHz). Done before the feed repair below,
 		 * so its free-slot search never sees one of these as free.
-		 * rt_dsp_walk=1 (front only, stereo streams): the C/Sub and Rear
-		 * lanes go to 0xff, the 8051's own "unused" (not cleared: an
-		 * off DSP -> DAC entry counts as a free slot).
 		 */
-		bool front_only = mode == 1 && chip->in05_ch != 6;
-
 		for (i = 0; i < AE9_DSP_LANES; i++) {
 			unsigned int ch = i % 6;
 			u8 dst = ch < 2 ? 0x40 + ch : ae9_surround_port(ch - 2);
@@ -1218,17 +1209,6 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 
 			if (s2 < 0)
 				continue;
-			if (front_only && ch >= 2) {
-				if (((e[s2] >> 8) & 0xff) != 0xff) {	/* on or off: an off
-					 * DSP -> DAC entry would count as free */
-					want = (e[s2] & 0xfffd00ff) | 0xff00;
-					ae9_rt_write_checked(chip, 0x190000 + 4 * s2, want,
-							     &unsteady, &retried, &failed);
-					e[s2] = want;
-					lanes_off++;
-				}
-				continue;
-			}
 			if (i >= 6)
 				dst += 2;	/* the second sample: 42/43, 52/53, 62/63 */
 			if (!((e[s2] >> 16) & 3))
@@ -1304,9 +1284,9 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	if (walked) {
 		/* routed above, in stream 0x18's own slots */
 	} else if (!(chain < 0 && !chip->pcm_start_sent)) {
-		/* the fixed slots, as before (rt_dsp_walk=0, or the list
-		 * couldn't be trusted, or a stream plays but stream 0x18 isn't
-		 * connected); with no stream there's nothing to route */
+		/* the fixed slots, as before 0.12.11: the list couldn't be
+		 * trusted, or a stream plays but stream 0x18 isn't connected;
+		 * with no stream there's nothing to route */
 		keep[0] = ae9_rt_put(chip, e, n, &rtmap, AE9_RT_FRONT_L, 0x10000 | (0x40 << 8) | l,
 				     &unsteady, &retried, &failed);
 		keep[1] = ae9_rt_put(chip, e, n, &rtmap, AE9_RT_FRONT_R, 0x10000 | (0x41 << 8) | r,
@@ -1443,15 +1423,14 @@ static void creative_ae9_router_front_dsp(struct creative_chip *chip, bool judge
 	mutex_unlock(&chip->replay_mutex);
 	ae9_dbg(chip, "SBX: router front L/R <- DSP ports 0x%02x/0x%02x, %d DSP input entr%s active\n",
 		 l, r, inputs, inputs == 1 ? "y" : "ies");
-	if (walked && (wrote || lanes_off || lanes_stray))
-		dev_info(chip->dev, "SBX: router: DSP outputs routed in the router chip's own slots (stream 0x18 from 0x%02x): %u of %u lanes set (%u written; the router chip had %u at 0xff, %u off; %u other DSP route%s off)%s\n",
+	if (walked && (wrote || lanes_stray))
+		dev_info(chip->dev, "SBX: router: DSP outputs routed in the router chip's own slots (stream 0x18 from 0x%02x): %u of %u lanes set (%u written; the router chip had %u at 0xff, %u off; %u other DSP route%s off)\n",
 			 head18, lanes_set, walked, wrote, lanes_ff, lanes_parked,
-			 lanes_stray, lanes_stray == 1 ? "" : "s",
-			 lanes_off ? ", C/Sub and Rear lanes unused (rt_dsp_walk=1)" : "");
+			 lanes_stray, lanes_stray == 1 ? "" : "s");
 	else if (walked)
 		ae9_dbg(chip, "SBX: router: stream 0x18 from 0x%02x already routed (%u lanes)\n",
 			head18, lanes_set);
-	else if (mode && chip->pcm_start_sent)
+	else if (chip->pcm_start_sent)
 		dev_info_ratelimited(chip->dev, "SBX: router: stream 0x18's slot list %s (head %d): fixed slots, as before\n",
 				     chain < 0 ? "not connected" : "not usable", head18);
 	if (retried || (unsteady && ae9_debug))
@@ -2077,7 +2056,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	 * switches in with the first stream), so do the same; DSP mode on
 	 * connects it again. Then the DAC-port allocator: an allocation left on
 	 * connection point 0xd1 (stream 0x18's ROM default: a refused select at
-	 * an earlier first load connected it there; router_poll stops that)
+	 * an earlier first load connected it there; the router busy poll stops that)
 	 * holds DAC groups 1-3 until a power-off and makes the 8051's own
 	 * DSP-mode routing fail. Only stream 0x18 can hold 0xd1, so with its
 	 * count at 0 the 8051's own port free (0x713 0xd1: ROM E4A6 -> 656D ->
@@ -2112,7 +2091,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 				dev_info(chip->dev, "router: freed a DAC allocation left on connection point 0xd1 (an earlier first load): cfg 0x%02x -> 0x%02x, DAC groups 0x%02x -> 0x%02x\n",
 					 before, d1a, gb & 0xff, ga & 0xff);
 			else
-				dev_warn(chip->dev, "router: could not free the DAC allocation on connection point 0xd1 (cfg %d): DSP mode routes it itself (rt_dsp_walk); a power-off clears it\n",
+				dev_warn(chip->dev, "router: could not free the DAC allocation on connection point 0xd1 (cfg %d): DSP mode routes it itself (stream 0x18); a power-off clears it\n",
 					 d1a);
 		}
 		/* -1 = a read failed; counters add up since the driver loaded */
@@ -2524,6 +2503,73 @@ static const struct file_operations creative_dbg_fops = {
  * slot list and front router slots, the ChipIO flag word. Only reads;
  * each card read holds replay_mutex like the driver's own.
  */
+/*
+ * Every head-unit frame's outcome (creative_spi_frame_win), for debugfs
+ * state: counted only, no register access and no log line. The poll's
+ * occasional "1/15 poll frames unanswered" follows host load (2026-11-18,
+ * .tmp/hu-misses): most likely Windows' echo read after the f7 taking the
+ * reply's f0 when we were held up. A miss record that says so: why "no f0",
+ * the first skipped byte = the frame's command, the echo = f0.
+ */
+void creative_ae9_hu_frame_note(struct creative_chip *chip, int ret, u8 cmd, u8 why,
+				u32 a, u32 b)
+{
+	unsigned int k;
+
+	chip->hu_frames++;
+	if (ret >= 0)
+		return;
+	if (why < ARRAY_SIZE(chip->hu_misses))
+		chip->hu_misses[why]++;
+	k = chip->hu_miss_pos++ % ARRAY_SIZE(chip->hu_miss_ring);
+	chip->hu_miss_ring[k].at = jiffies ?: 1;
+	chip->hu_miss_ring[k].cmd = cmd;
+	chip->hu_miss_ring[k].why = why;
+	chip->hu_miss_ring[k].a = a;
+	chip->hu_miss_ring[k].b = b;
+}
+
+static void creative_ae9_hu_miss_show(struct seq_file *m, struct creative_chip *chip)
+{
+	static const char *const why[] = { "transmit FIFO full", "no reply", "no f0", "short" };
+	unsigned int i, n = min_t(unsigned int, chip->hu_miss_pos, ARRAY_SIZE(chip->hu_miss_ring));
+
+	seq_printf(m, "head unit frames: %llu sent, unanswered: %u no reply, %u no f0, %u short, %u transmit FIFO full\n",
+		   chip->hu_frames, chip->hu_misses[AE9_HU_MISS_NONE], chip->hu_misses[AE9_HU_MISS_NOF0],
+		   chip->hu_misses[AE9_HU_MISS_SHORT], chip->hu_misses[AE9_HU_MISS_TXFULL]);
+	for (i = 0; i < n; i++) {
+		unsigned int k = (chip->hu_miss_pos - 1 - i) % ARRAY_SIZE(chip->hu_miss_ring);
+		u32 a = chip->hu_miss_ring[k].a, b = chip->hu_miss_ring[k].b;
+
+		if (chip->hu_miss_ring[k].why == AE9_HU_MISS_TXFULL)
+			seq_printf(m, "  %lu s ago: frame %02x, %s after %u bytes, status 0x%02x\n",
+				   (jiffies - chip->hu_miss_ring[k].at) / HZ, chip->hu_miss_ring[k].cmd,
+				   why[0], a, b & 0xff);
+		else
+			seq_printf(m, "  %lu s ago: frame %02x, %s: %u bytes kept, %u skipped (first %02x), echo after f7 %02x, status %02x%s\n",
+				   (jiffies - chip->hu_miss_ring[k].at) / HZ, chip->hu_miss_ring[k].cmd,
+				   why[min_t(u8, chip->hu_miss_ring[k].why, 3)], a & 0xff, (a >> 8) & 0xff,
+				   (a >> 16) & 0xff, a >> 24, b & 0xff,
+				   b >> 8 ? ", line error" : "");
+	}
+}
+
+/*
+ * The PCIe-to-PCI bridge on the card, by its PCI ID: a Tundra Tsi381
+ * (10e3:8111; Tundra was bought by IDT, so "the IDT bridge" in older notes)
+ * or an ASMedia ASM1083/1085 (1b21:1080).
+ */
+static const char *ae9_bridge_name(struct creative_chip *chip)
+{
+	struct pci_dev *br = chip->pci->bus->self;
+
+	if (chip->asmedia)
+		return "ASMedia ASM1083/1085";
+	if (br && br->vendor == 0x10e3 && br->device == 0x8111)
+		return "Tundra Tsi381";
+	return "unknown";
+}
+
 static int creative_dbg_state_show(struct seq_file *m, void *v)
 {
 	struct creative_chip *chip = g_dbg_chip;
@@ -2535,8 +2581,10 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	if (!chip)
 		return -ENODEV;
 
-	seq_printf(m, "driver %s, %s bridge\n", CREATIVE_AE9_DRV_VERSION,
-		   chip->asmedia ? "ASMedia" : "IDT");
+	seq_printf(m, "driver %s, %s bridge (%04x:%04x)\n", CREATIVE_AE9_DRV_VERSION,
+		   ae9_bridge_name(chip),
+		   chip->pci->bus->self ? chip->pci->bus->self->vendor : 0,
+		   chip->pci->bus->self ? chip->pci->bus->self->device : 0);
 	seq_printf(m, "mode: %s, SBX %s, DSP routing %s, primed %d, halted %d, handshake %s\n",
 		   chip->fx.direct ? "Direct" : "DSP", chip->fx.sbx ? "on" : "off",
 		   chip->dsp_active ? "up" : "down", chip->dsp_primed,
@@ -2572,6 +2620,11 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		   chip->rirb_wlanded, chip->rirb_wanswer, chip->rirb_wexpired,
 		   chip->rirb_nwatch, chip->rirb_injected, chip->rirb_held >= 0 ? "one held" : "none held");
 	seq_printf(m, "BDLs kept (stream didn't stop): %d\n", atomic_read(&chip->bdl_leaks));
+	seq_printf(m, "optical in: %s; since load: started without a signal %u, signal came in %u, signal lost %u, stream stopped moving %u\n",
+		   !chip->xcap[0].substream ? "closed" :
+		   chip->xcap[0].no_signal ? "recording silence (no signal)" : "recording the signal",
+		   chip->xcap[0].n_nosig, chip->xcap[0].n_came, chip->xcap[0].n_lost,
+		   chip->xcap[0].n_stopped);
 	seq_printf(m, "router chip param verbs: %u waited for it to be idle, %u refused busy and resent, %u lost, %u busy waits that never cleared\n",
 		   chip->r51_waited, chip->r51_refused, chip->r51_lost, chip->r51_never_idle);
 	seq_printf(m, "router chip values refused (another task's select came between): %u\n",
@@ -2585,6 +2638,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			   chip->hu_noreply_idx[i], chip->hu_noreply_head[i] >> 8,
 			   chip->hu_noreply_head[i] & 0xff);
 	seq_printf(m, "%s\n", chip->hu_noreply_n > ARRAY_SIZE(chip->hu_noreply_idx) ? ", ..." : "");
+	creative_ae9_hu_miss_show(m, chip);
 
 	if (chip->suspended || chip->card_gone || chip->card_hung || !chip->corb_buf) {
 		seq_puts(m, "card: not readable now (suspended, gone or not up)\n");
@@ -2598,6 +2652,13 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	seq_printf(m, "GPIO: pin levels 0x300=0x%02x (pin 0 %s), outputs 0x304=0x%02x, last write 0x320=0x%03x\n",
 		   val & 0xff, val & 1 ? "high" : "LOW", readb(chip->ext_regs + 0x304),
 		   creative_ext_readw(chip, 0x320));
+	/* native DSD64 (pcm.c, pcm_dsd): on or off; BAR2 0x100/0x104, the
+	 * CA0113 I2S wrapper it uses (0x100 reads 0x00000700 while PCM plays;
+	 * Windows' DSD predicts 0x6000c7cc and 0x104 bytes 2-3 = 0x12 0x10) */
+	seq_printf(m, "DSD64 active: %s, BAR2 0x100=0x%08x 0x104=0x%08x\n",
+		   !chip->dsd_active ? "no" : chip->dsd_running ? "yes (stream running)" :
+		   "yes (stream stopped)",
+		   creative_ext_readl(chip, 0x100), creative_ext_readl(chip, 0x104));
 
 	seq_puts(m, "router stream references:");
 	for (i = 0; i < ARRAY_SIZE(ae9_drain_ids); i++) {
@@ -2615,7 +2676,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	x = ae9_8051_xram_byte(chip, 0x157d);
 	seq_printf(m, "router slot list head (XRAM 0x157d): ");
 	seq_printf(m, x < 0 ? "?\n" : "0x%02x\n", x);
-	/* stream 0x18 (DSP outputs -> DACs, rt_dsp_walk): refs, head, lanes */
+	/* stream 0x18 (DSP outputs -> DACs, the DSP route walk): refs, head, lanes */
 	{
 		int refs = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_REFS);
 		int s = ae9_8051_xram_byte(chip, AE9_XRAM_STREAM18_HEAD);
@@ -2800,7 +2861,8 @@ MODULE_PARM_DESC(hu_master, "post_windows: expose the head-unit volume as Master
 #define HU_ATT_DEFAULT	0x48	/* Windows' boot volume, -36.0 dB */
 #define HU_SP_TICKS	10	/* Windows shows "-SP-" ~5 s, then the volume */
 
-/* Volume = the same attenuation on six head-unit DAC registers, in the
+/* Volume = the same attenuation on six registers of the card's DACs
+ * (front 0x48 ES9038Q2M, rear 0x49 SABRE9006A), in the
  * order Windows writes them on a volume change; 0xff mutes. */
 static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 {
@@ -3132,6 +3194,9 @@ static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 	hp = !!hp;
 	if (hp == chip->hu_output)
 		return;
+	/* native DSD (pcm_dsd): stopped and off first; the app's restart
+	 * brings it up again on the new output */
+	creative_ae9_dsd_abort(chip, "output switch");
 	chip->hu_att_out[chip->hu_output] = chip->hu_att;
 	creative_ae9_hu_route(chip, hp);
 	chip->hu_output = hp;
@@ -3328,7 +3393,7 @@ static void creative_ae9_hb_fast(struct creative_chip *chip)
 	if (n > 0)
 		steps += creative_ae9_hu_parse(chip, resp, min_t(int, n, sizeof(resp)), &press_ms);
 	n = creative_spi_frame_win(chip, q_btn, sizeof(q_btn), resp, sizeof(resp));
-	if (n > 0 && !chip->hu_unattached)
+	if (n > 0 && !chip->hu_unattached && !chip->hu_quiet)
 		steps += creative_ae9_hu_parse(chip, resp, min_t(int, n, sizeof(resp)), &press_ms);
 	creative_ae9_hu_update(chip, steps, press_ms);
 }
@@ -3407,6 +3472,9 @@ static void creative_ae9_hb_windows(struct creative_chip *chip)
 		if (f->d[1] == 0xd5) {
 			int aa = creative_ae9_hu_marker(resp, n);
 
+			if (aa >= 0)
+				chip->hu_quiet = false;	/* answering again */
+
 			if (aa == 0) {
 				chip->hu_reattach_try = 0;	/* attached */
 				chip->hu_att_tick = chip->hu_ticks + 1;
@@ -3417,14 +3485,38 @@ static void creative_ae9_hb_windows(struct creative_chip *chip)
 					chip->hu_reattach_try < HU_REATTACH_TRIES;
 			continue;
 		}
-		/* its status bits while unattached aren't the jacks' */
-		if (chip->hu_unattached && resp[1] == 0x83)
+		/*
+		 * Its status bits while unattached aren't the jacks'; nor after it
+		 * went quiet, until a marker answers: a head unit just powered up
+		 * (re-power, hupause) can answer status 2 alone with 0x80, which
+		 * reads as "mic plug in, phantom power on" (rc1 soak, journal
+		 * entry 10). Windows: no 0x80 in 90117 status reads (36 captures).
+		 * A lone marker miss (~1% of Windows' marker reads) changes nothing.
+		 */
+		if ((chip->hu_unattached || chip->hu_quiet) && resp[1] == 0x83)
 			continue;
 		steps += creative_ae9_hu_parse(chip, resp, n, &press_ms);
 	}
-	if (fails)
-		dev_info_ratelimited(chip->dev, "head unit: %d/%zu poll frames unanswered\n",
-				     fails, (size_t)AE9_HU_POLL_FRAMES);
+	/*
+	 * A dark head unit (unplugged, powering up) misses most frames of
+	 * every poll, twice a second: say so once, and once when it answers
+	 * again, instead of a line per poll (~50 lines for a 25 s unplug).
+	 * A few misses in an answering poll (~1%, host load) keep their line.
+	 */
+	if (fails > AE9_HU_POLL_FRAMES / 2) {
+		if (!chip->hu_dark_polls++)
+			dev_info(chip->dev, "head unit: not answering (%d/%zu poll frames); waiting for it\n",
+				 fails, (size_t)AE9_HU_POLL_FRAMES);
+		chip->hu_quiet = true;		/* dark or powering up */
+	} else {
+		if (chip->hu_dark_polls)
+			dev_info(chip->dev, "head unit: answering again after %u poll(s) without\n",
+				 chip->hu_dark_polls);
+		chip->hu_dark_polls = 0;
+		if (fails)
+			dev_info_ratelimited(chip->dev, "head unit: %d/%zu poll frames unanswered\n",
+					     fails, (size_t)AE9_HU_POLL_FRAMES);
+	}
 	if (chip->hu_unattached) {
 		creative_ae9_hu_reattach(chip);
 		chip->hu_unattached = false;	/* the next read says */
@@ -4160,6 +4252,7 @@ static void creative_ae9_hb_work(struct work_struct *work)
 	}
 	if (chip->hu_paused) {
 		chip->hu_paused = false;
+		chip->hu_quiet = true;		/* it may have powered off meanwhile */
 		dev_info(chip->dev, "head unit: poll resumed\n");
 	}
 	if (chip->dsp_done) {
@@ -4249,7 +4342,7 @@ static void creative_ae9_log_state(struct creative_chip *chip, const char *when)
  * when the card (any of its functions) is alone there, as on the AE-9's
  * own PCIe-to-PCI bridge. */
 /*
- * The PCIe-to-PCI bridge above the card (IDT Tsi381 here, ASMedia
+ * The PCIe-to-PCI bridge above the card (Tundra Tsi381 here, ASMedia
  * ASM1083/1085 1b21:1080 on other AE-9s). An ASMedia card drops off the
  * bus during bring-up (bugzilla 219552 #81, stock driver too, #56), so log
  * the bridge's status at each step: a DMA or config cycle the card
@@ -4329,6 +4422,8 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	chip->hu_amp_fix = false;
 	chip->hu_amp_try = 0;
 	chip->hu_att_tick = 0;		/* a marker check after it says */
+	chip->hu_quiet = false;
+	chip->hu_dark_polls = 0;
 	creative_ae9_bridge_log(chip, "before bring-up");
 
 	if (do_reset && pdev->bus->self && !creative_ae9_alone_on_bus(pdev)) {
@@ -4371,7 +4466,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	 * PCI config register 0x40 on the Creative controller reads 0x8080
 	 * after a cold power-on; the Windows driver leaves it at 0x0080 (bit 15
 	 * cleared). Seen on both the ASMedia-bridge AE-9 (kernel bugzilla
-	 * 219552 #63) and this IDT-bridge card (dxrw/PCI-11020071.rw). Our VFIO
+	 * 219552 #63) and this Tsi381-bridge card (dxrw/PCI-11020071.rw). Our VFIO
 	 * captures never traced config-space writes, so this was missing from
 	 * every replay. Cleared here, at every bring-up.
 	 */
@@ -4717,6 +4812,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	mutex_init(&chip->replay_mutex);
 	mutex_init(&chip->ca0113_mutex);
 	mutex_init(&chip->spdif_mutex);
+	mutex_init(&chip->dsd_mutex);
 	chip->spdif_aes[0] = IEC958_AES0_CON_NOT_COPYRIGHT;	/* as 0x70d COPY */
 	chip->dac_filter = DAC_FILTER_DEFAULT_INDEX;
 	chip->dac_filter_bits = dac_filter_values[DAC_FILTER_DEFAULT_INDEX];
@@ -4746,6 +4842,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	INIT_DELAYED_WORK(&chip->spk_follow_work, creative_ae9_fx_spk_follow_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
+	INIT_DELAYED_WORK(&chip->dsd_mute_work, creative_ae9_dsd_mute_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
 	INIT_WORK(&chip->dead_work, creative_ae9_dead_work);
 	atomic_set(&chip->dma_running, 0);
@@ -5070,6 +5167,7 @@ static void ae9_cancel_timed_works(struct creative_chip *chip)
 	cancel_delayed_work_sync(&chip->dsp_switch_work);
 	cancel_delayed_work_sync(&chip->spk_follow_work);
 	cancel_delayed_work_sync(&chip->hp_work);
+	cancel_delayed_work_sync(&chip->dsd_mute_work);	/* queued by the trigger */
 }
 
 static void creative_ae9_stop_works(struct creative_chip *chip)
@@ -5089,6 +5187,7 @@ static void creative_ae9_shutdown(struct pci_dev *pdev)
 		return;
 	creative_ae9_set_unloading(chip);
 	creative_ae9_stop_works(chip);
+	creative_ae9_dsd_abort(chip, "reboot/power-off");	/* native DSD (pcm_dsd) off */
 	chip->suspended = true;		/* IRQ handler: hands off */
 	creative_ae9_win_shutdown(chip, "reboot/power-off");
 }
@@ -5112,6 +5211,9 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 
 	/* card first: it closes open streams while the hardware still runs */
 	if (chip->card) {
+		/* native DSD (pcm_dsd) off while the CORB still runs */
+		if (!chip->suspended)
+			creative_ae9_dsd_abort(chip, "unload");
 		snd_card_free(chip->card);
 		chip->card = NULL;
 		chip->answer_ctl = NULL;	/* freed with the card */
@@ -5155,6 +5257,9 @@ static int creative_ae9_suspend(struct device *dev)
 	cancel_work_sync(&chip->resume_work);
 	cancel_work_sync(&chip->dead_work);
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
+	/* native DSD (pcm_dsd) off: the stream is suspended already; the
+	 * app's prepare after the resume brings DSD up again */
+	creative_ae9_dsd_abort(chip, "suspend");
 	atomic_set(&chip->dma_running, 0);
 	ae9_cancel_timed_works(chip);
 	creative_ae9_streams_down(chip);
