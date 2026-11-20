@@ -186,16 +186,26 @@ For more detail in the kernel log:
   every suspend: the PCI core asking the card (behind its bridge) to sleep,
   which it declines; harmless, a suspend cuts the card's power anyway and the
   driver brings it back up at resume.
-- **A player that opens the card directly** (`hw:AE9,0`, e.g. MPD with
-  `buffer_time` set) can be refused some exact buffer times ("Invalid
-  argument" from `snd_pcm_hw_params_set_buffer_time_near`): leave the
-  player's buffer at its default or pick another value. Planned fix: 0.12.15.
-  (PipeWire isn't affected.)
 - **Suspend blocked** by other programs stuck on network file I/O (seen with
   Plex reading from a CIFS share); not driver-related.
 
 ## Fixed in earlier versions
 
+- 0.12.15: MPD (or another player) straight on `hw:AE9,0` crackled at
+  44.1 kHz with its default buffer (500 ms): it got only 2 periods
+  (2 x 11024 frames), and the card's DMA reads about 0.7 ms ahead of the
+  position the driver reports, so a refill that came a little late played
+  old audio, with no xrun logged; now 4 (4 x 5520). A player asking for a
+  buffer time or size of its own (MPD's `buffer_time`, `aplay
+  --buffer-time`, `speaker-test -b`) could be refused with "Invalid
+  argument" (0.12.14 refused about 1 request in 6 in our tests; 0.12.15
+  none). On 0.12.14, `buffer_time "481760"` in the AE-9's `audio_output`
+  in `mpd.conf` works around both (4 or more periods at every rate). A
+  native DSD stream that was set up but not yet playing when Direct Mode
+  went off (or an output switch began) could then start silent, with no
+  error (now the player gets an error and sets it up again). The
+  head-unit volume could cross outputs after a reload or `alsactl
+  restore` (the speakers got the headphones' level).
 - 0.12.11: DSP mode (Direct Mode off) played 6 dB quieter than Direct Mode
   and only half of the audio; the mic could sound like a chipmunk, or DSP
   mode go silent, after playing something at 96/192 kHz and switching

@@ -9,6 +9,7 @@ are also in `alsamixer -c AE9` and `amixer -c AE9`.
 
 - [The head unit](#the-head-unit)
 - [Playback](#playback)
+- [Native DSD64](#native-dsd64)
 - [Direct Mode, SBX and the EQ](#direct-mode-sbx-and-the-eq)
 - [Speakers and headphones](#speakers-and-headphones)
 - [5.1 surround](#51-surround)
@@ -28,8 +29,8 @@ are also in `alsamixer -c AE9` and `amixer -c AE9`.
   (< 1 s) = mute, hold 1.5-3 s = speakers / headphones, hold 3 s or more =
   knob light on/off.
 - **Volume:** the knob's setting is also the ALSA "Master Playback Volume" /
-  "Master Playback Switch" (`hu_master=0` names them "Head Unit Playback ..."
-  instead), so PipeWire, the desktop slider and the knob all stay in sync.
+  "Master Playback Switch", so PipeWire, the desktop slider and the knob all
+  stay in sync.
   Range -127 dB to 0 dB; the desktop slider at 100% is 0 dB, the card's full
   output level. Keep app volumes at 100% in PipeWire and use the knob or the
   system volume (the card's hardware volume); app volumes above 100% are
@@ -93,28 +94,49 @@ are also in `alsamixer -c AE9` and `amixer -c AE9`.
   rate (44.1 kHz, say) keeps playing direct, and DSP mode and the effects
   start with the next 48 kHz stream. `pw-metadata -n settings 0
   clock.force-rate 48000` gets you there.
+- **MPD (or another player) straight on `hw:AE9,0`:** nothing to set since
+  0.12.15: MPD's default buffer (500 ms) no longer lands on 2 periods
+  (44.1 kHz: 4 x 5520 frames, was 2 x 11024), and a `buffer_time` it asks
+  for is no longer refused.
+  On 0.12.14 add `buffer_time "481760"` to its `audio_output`: there a
+  44.1 kHz file got only 2 periods and crackled (the card's DMA reads about
+  0.7 ms ahead of the position the driver reports, so a refill that's a
+  little late plays old audio, with no xrun logged), and some other values,
+  like `buffer_time "200000"`, were refused ("Invalid argument") at 44.1 and
+  88.2 kHz and for DSD. Through PipeWire none of this applies.
 - [Helvum](https://gitlab.freedesktop.org/pipewire/helvum) (on Flathub)
   draws PipeWire's patchbay: a great way to see the AE-9's ports (FL FR on
   stereo, all six on the 5.1 profile) and what's feeding them.
 
-## Native DSD64 (experimental, 0.12.14+)
+<a id="native-dsd64-experimental-01214"></a>
+
+## Native DSD64
 
 The card plays DSD64 natively: the 1-bit stream goes from the player to the
 DAC's DSD decoder, the way Creative's Windows DSD ASIO driver does it (the
-CA0113's own I2S to the ES9038, bypassing the DSP). Off by default:
+CA0113's own I2S to the ES9038, bypassing the DSP). On by default since
+0.12.15 (0.12.14: opt-in with `pcm_dsd=1`). To turn it off:
 
 ```
-echo "options snd-hda-codec-creative-ae9 pcm_dsd=1" | sudo tee /etc/modprobe.d/ae9-dsd.conf
+echo "options snd-hda-codec-creative-ae9 pcm_dsd=0" | sudo tee /etc/modprobe.d/ae9-dsd.conf
 ```
 
-then `ae9-reload` (or `echo 1 | sudo tee
+then `ae9-reload` (or `echo 0 | sudo tee
 /sys/module/snd_hda_codec_creative_ae9/parameters/pcm_dsd` for this session).
+An `/etc/modprobe.d/ae9-dsd.conf` with `pcm_dsd=1` (from SbAe9-SBC's switch
+or 0.12.14's instructions) keeps it on, as before. **Turned it off with
+SbAe9-SBC v0.22.0?** That version deleted the file to turn DSD off, and
+with no file 0.12.15 has it on: switch it off once more in SbAe9-SBC
+v0.22.1 (it writes `pcm_dsd=0`), or write the line above.
 
 - **DSD64 only** (2.8224 MHz). DSD128/256 files play as PCM (any player
   converts them). The card can't clock DSD128: its I2S block has no 44.1 kHz
   family rate above 88.2 kHz (tested).
 - **Direct Mode only**, on the card's RCA out and the head unit's headphones
   (not Rear, Center/Sub or optical). Direct Mode off stops a DSD stream.
+  An output switch stops it too; the player starts it again, and since
+  0.12.15 that restart waits for the switch to finish (before, it could
+  run in the middle of it).
 - **A player that sends native DSD to ALSA:** MPD with an output like
 
   ```
@@ -130,7 +152,8 @@ then `ae9-reload` (or `echo 1 | sudo tee
   }
   ```
 
-  (Cantata, ncmpcpp or mpc as the front end). It plays `.dsf`/`.dff` as
+  (Cantata, ncmpcpp or mpc as the front end; on 0.12.14 also
+  `buffer_time "481760"`: see [Playback](#playback)). It plays `.dsf`/`.dff` as
   `DSD_U32_BE` at "88200". The device is the card itself, so PipeWire has to
   let go of it first: `pactl suspend-sink
   alsa_output.pci-0000_06_00.0.analog-stereo 1` (`pactl list sinks short` for
@@ -139,8 +162,8 @@ then `ae9-reload` (or `echo 1 | sudo tee
 - **Seeing it:** PipeWire is bypassed, so `pw-top` and AudioMon show
   nothing. `grep -E "^(format|rate)" /proc/asound/AE9/pcm0p/sub0/hw_params`
   shows `DSD_U32_BE` / `88200`, and the kernel log `DSD64: native DSD on`.
-- With `pcm_dsd=1` the card also offers DSD to every app; PCM playback is
-  unchanged (the default turns on once that has had more testing).
+- The card offers DSD to every app that opens `hw:AE9,0` directly; PCM
+  playback is the same either way, and PipeWire keeps playing PCM.
 
 ## Direct Mode, SBX and the EQ
 

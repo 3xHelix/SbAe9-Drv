@@ -36,7 +36,7 @@ adapted, with the original copyright notices.
 | `scripts/ae9-headroom.sh`, `config/ae9-headroom.service` | Optional per-rate PipeWire headroom, as a user service |
 | `config/61-ae9-names.conf` | Optional desktop names: "AE-9 Head Unit Mic / Aux", "AE-9 Rear RCA In", "AE-9 What U Hear" (stereo and 5.1), "AE-9 Optical In", "AE-9 Optical Out", "AE-9 Analog Out" |
 | `config/ae9-clean-mic.conf` | Optional "AE-9 Mic (clean)" input: the mic through PipeWire's WebRTC noise suppression |
-| `config/50-ae9-safe-volume.conf`, `config/51-ae9-safe-volume.lua` | Installed by the packages: the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (`.lua` for WirePlumber 0.4, where it applies to every output with no saved volume: quieter, never louder) |
+| `config/50-ae9-safe-volume.conf`, `config/51-ae9-safe-volume.lua` | Installed by the packages: the AE-9's outputs start at -36 dB, the driver's boot volume, when WirePlumber has no saved volume for them (`.lua` for WirePlumber 0.4, where it applies to every output with no saved volume: quieter, never louder; WirePlumber 0.5 warns about a `.lua`, so the .deb links it into `main.lua.d` only when the installed WirePlumber is 0.4, and the RPMs ship it only for openSUSE Leap 15) |
 | `config/ae9-optical-in.conf`, `config/ae9-what-u-hear.conf`, `config/ae9-rear-rca-in.conf` | 0.10.x only: hand-copied PipeWire sources. Since 0.11.0 the card profile opens them; don't copy these any more |
 | `scripts/ae9-reload.sh` | `ae9-reload`: reloads the driver in one go |
 | `scripts/ae9-hp-profile` | Makes and installs your own headphone profiles |
@@ -46,3 +46,13 @@ adapted, with the original copyright notices.
 | `scripts/ae9-surround-test.sh` | Speaks each 5.1 channel's name |
 | `scripts/restore-stock-audio.sh` | Removes the driver and restores stock `snd_hda_intel` |
 | `packaging/` | Fedora/COPR specs (akmod, DKMS), the Debian package builder |
+
+## Test builds
+
+`make AE9_TEST=1` builds a test version of the driver with five
+fault-injection options for exercising its error paths: `dsp_fail_inject`,
+`hung_inject`, `scp_full_inject`, `rirb_inject` and `rirb_inject_us`
+(described in [OPTIONS.md](OPTIONS.md#test-hooks-test-builds-only)). Each
+acts only with `debug=1` or more. A release build (a plain `make`, DKMS,
+the packages) has neither the options nor their code since 0.12.15:
+`modinfo -p` lists 21 options there, 26 in a test build.

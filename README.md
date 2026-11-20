@@ -7,25 +7,31 @@ An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 `snd_hda_intel` + `snd_hda_codec_ca0132` drivers don't support this card;
 this one does, by doing what Creative's Windows driver does, step by step.
 
-**Latest: v0.12.14** (2026-11-20) · [Changelog](CHANGELOG.md) ·
+**Latest: v0.12.15** (2026-11-20) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
 Pre-releases, tested on two cards.
 
-## 💣 New in v0.12.14: native DSD64
+## 💣 New in v0.12.15: native DSD64, now on by default
 
-Yep. **Native DSD. On Linux. On a PCIe sound card.** As far as we can tell,
-nobody's done that before.
+**Native DSD. On Linux. On a PCIe sound card.** As far as we can tell,
+nobody's done that before, and as of v0.12.15 it's simply on.
 
 Your `.dsf` files go bit-for-bit, a 1-bit stream at 2.8224 MHz, straight
 into the AE-9's ES9038 DSD decoder. No PCM conversion, no DoP, no
 resampling. It's the same lane Creative's own Windows DSD driver uses: we
-dug it out of their driver, found the hidden path past the DSP, and lit it
-up. The DAC itself signs off on it: DSD decoder on, locked, 2.8224 MHz.
+watched what their driver does to the card, decoded it, found the hidden
+path past the DSP, and lit it up. The DAC itself signs off on it: DSD decoder on, locked, 2.8224 MHz.
 
-It's opt-in for now while it racks up hours: `pcm_dsd=1`, or flip the switch
-in [SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) v0.22.0. Then point MPD
-(Cantata, ncmpcpp, ...) at `hw:AE9,0` with `dop "no"` and hit play.
-How-to: [docs/USING.md](docs/USING.md#native-dsd64-experimental-01214).
+Point MPD (Cantata, ncmpcpp, ...) at `hw:AE9,0` with `dop "no"` and hit
+play. How-to: [docs/USING.md](docs/USING.md#native-dsd64). Don't want it?
+`pcm_dsd=0`, or the switch in
+[SbAe9-SBC](https://github.com/3xHelix/SbAe9-SBC) v0.22.1. Turned it off
+with SBC v0.22.0? Turn it off once more: with the new default it's back on.
+
+Also in v0.12.15:
+- **MPD's 44.1 kHz crackle is gone.** No more `buffer_time` workaround.
+- **Volume safety:** after a reboot or reload, your speakers no longer pick up the
+  headphones' volume.
 
 DSD128? The card can't clock it, we tried every setting there is. That's why
 Creative stops at DSD64 too. Those files still play, as PCM.
@@ -35,9 +41,9 @@ Creative stops at DSD64 too. Those files still play, as PCM.
 - **Playback** on the card's RCA outputs (speakers) and the head unit's
   headphone jacks: 44.1 to 384 kHz, 24- or 32-bit, hardware volume synced
   with the knob and the desktop slider.
-- **Native DSD64** (experimental, opt-in): `.dsf`/`.dff` straight to the
-  DAC's DSD decoder through MPD, the way Creative's Windows DSD driver does
-  it ([USING.md](docs/USING.md#native-dsd64-experimental-01214)).
+- **Native DSD64** (on by default): `.dsf`/`.dff` straight to the DAC's
+  DSD decoder through MPD, the way Creative's Windows DSD driver does it
+  ([USING.md](docs/USING.md#native-dsd64)).
 - **5.1 surround** on the card's RCA, Rear and C/Sub jacks.
 - **The DSP:** SBX (Surround, Dialog Plus, Smart Volume, Crystalizer, Bass),
   the EQ with Windows' 20 presets, Scout Mode, speaker setup (bass redirect,
@@ -63,7 +69,7 @@ Creative stops at DSD64 too. Those files still play, as PCM.
 - **[SbAe9-AudioMon](https://github.com/3xHelix/SbAe9-AudioMon)**: level
   meters for every AE-9 input and output, with a debug log.
 
-Driver v0.12.14 works with SbAe9-SBC v0.22.0 and SbAe9-AudioMon v0.4.9. Older
+Driver v0.12.15 works with SbAe9-SBC v0.22.1 and SbAe9-AudioMon v0.4.9. Older
 app versions still work, with fewer controls. Earlier pairings are in the
 [changelog](CHANGELOG.md).
 
@@ -129,7 +135,7 @@ Download `creative-ae9-dkms_<version>-1_all.deb` from the
 [latest release](https://github.com/3xHelix/SbAe9-Drv/releases), then:
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.14-1_all.deb innoextract
+sudo apt install ./creative-ae9-dkms_0.12.15-1_all.deb innoextract
 ```
 
 Secure Boot: `sudo mokutil --import /var/lib/dkms/mok.pub` once, then

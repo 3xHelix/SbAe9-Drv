@@ -60,7 +60,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.14"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.15"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -191,7 +191,7 @@ struct creative_chip {
 	unsigned int		rirb_nwatch;
 	int			rirb_send_wp;	/* RIRBWP when the verb in flight was sent; -1 = none */
 	int			rirb_wp0;	/* RIRBWP when the ring was marked at init, until rirb_rp is seeded; -1 = none */
-	int			rirb_held;	/* rirb_inject: slot whose landed entry is held back; -1 = none */
+	int			rirb_held;	/* rirb_inject (test build): slot whose landed entry is held back; -1 = none */
 	u32			rirb_held_res, rirb_held_fl;
 	ktime_t			rirb_held_until;
 
@@ -342,6 +342,7 @@ struct creative_chip {
 	 * for ~20s so the DSP and head-unit MCU are ready.
 	 */
 	struct delayed_work	dsp_switch_work;	/* live switch to DSP mode */
+	struct work_struct	pb_restart_work;	/* Direct Mode on: the playback to XRUN */
 	struct delayed_work	hp_work;	/* headphone profile upload, debounced (fx.c) */
 	struct delayed_work	spk_follow_work;	/* Speaker Config follows the stream, debounced */
 	unsigned int		spk_follow_ch;	/* channels of the prepared playback */
@@ -382,7 +383,7 @@ struct creative_chip {
 	unsigned int		rirb_wlanded;	/* given-up slots that landed later (read and marked) */
 	unsigned int		rirb_wanswer;	/* ...of which the answer to the verb in flight, used */
 	unsigned int		rirb_wexpired;	/* watched slots that never landed (watch ended) */
-	unsigned int		rirb_injected;	/* rirb_inject test give-ups */
+	unsigned int		rirb_injected;	/* rirb_inject test give-ups (test build; else 0) */
 	int			r51_sel;	/* router-chip param index the 8051 took last (0x717), -1 = none or lost */
 	const void		*r51_owner;	/* task that sent that select (compared, never dereferenced) */
 	unsigned int		r51_crossed;	/* values refused: another task's select came between */
@@ -418,7 +419,7 @@ struct creative_chip {
 	u16			pcm_start_fmt;	/* and its stream format */
 	bool			pcm_start_dsd;	/* and it was the native DSD start (pcm.c) */
 	/*
-	 * Native DSD64 (pcm.c, pcm_dsd; experimental): DSD on in the hardware
+	 * Native DSD64 (pcm.c, pcm_dsd; on by default): DSD on in the hardware
 	 * (DAC 48/01 = 0xc3, GPIO pin 1 high, BAR2 I2S channels 2/3 fed by the
 	 * playback stream), its stream running, DAC 48/07 bit 0 (mute) and
 	 * BAR2 0x100/0x104 as they were before DSD came on, the lock for DSD
@@ -429,6 +430,10 @@ struct creative_chip {
 	bool			dsd_dac_muted;
 	u32			dsd_bar2_100, dsd_bar2_104;
 	struct mutex		dsd_mutex;
+	/* an output switch is running (core.c creative_ae9_hu_switch()): a
+	 * DSD prepare waits for it on dsd_wq, so it starts on the new output */
+	bool			dsd_switching;
+	wait_queue_head_t	dsd_wq;
 	struct delayed_work	dsd_mute_work;
 	u32			dac_start_key;	/* rate row + output the DAC start commands
 						 * were last sent for; 0 = unknown (any DAC
@@ -465,6 +470,8 @@ struct creative_chip {
 	int			hu_phantom_req;	/* phantom power to send: 0/1, -1 = none */
 	unsigned long		hu_phantom_hold; /* "on" requests ignored until (jiffies) */
 	int			hu_switch_to;	/* pending output switch, -1 none */
+	unsigned int		hu_att_for;	/* the output hu_att is the volume of: hu_output,
+						 * or already the new one while a switch runs */
 	bool			lo_virt;	/* "Line Out Virtualization": headphone mode on the line out */
 	bool			lo_virt_phys;	/* the line out carries the headphone mode now */
 	bool			hu_reroute;	/* pending: redo the headphone routing */

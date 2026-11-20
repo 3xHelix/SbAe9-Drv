@@ -7,9 +7,18 @@
 # so the same .noarch.rpm installs everywhere.
 %global srcname SbAe9-Drv
 %global modname snd-hda-codec-creative-ae9
+# WirePlumber 0.4 reads Lua (main.lua.d), 0.5 only the .conf and warns
+# "Old configuration file detected" for a .lua there: the .lua only where
+# the distribution's WirePlumber is 0.4 (openSUSE Leap 15); Tumbleweed,
+# Leap 16 and EL10 have 0.5
+%if 0%{?sle_version} && 0%{?sle_version} < 160000
+%global wp04 1
+%else
+%global wp04 0
+%endif
 
 Name:           creative-ae9-dkms
-Version:        0.12.14
+Version:        0.12.15
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -54,7 +63,9 @@ install -D -m 644 config/ae9-omit.conf %{buildroot}/usr/lib/dracut/dracut.conf.d
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}/usr/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+%if %{wp04}
 install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+%endif
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}/usr/bin/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}/usr/bin/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}/usr/bin/ae9-dsp-snapshot
@@ -108,8 +119,10 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir /usr/share/wireplumber
 %dir /usr/share/wireplumber/wireplumber.conf.d
 /usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
+%if %{wp04}
 %dir /usr/share/wireplumber/main.lua.d
 /usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+%endif
 /usr/bin/ae9-get-firmware
 /usr/bin/ae9-full-dump
 /usr/bin/ae9-dsp-snapshot
@@ -120,6 +133,17 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/share/creative-ae9/
 
 %changelog
+* Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.15-1
+- Driver 0.12.15: native DSD64 on by default (pcm_dsd=0 turns it off; a
+  file with pcm_dsd=1 keeps it on). MPD on hw:AE9,0 no longer crackles at
+  44.1 kHz (4 periods with its default buffer) and buffer times a player
+  asks for are no longer refused; the head-unit volume no longer crosses
+  outputs after a reload; DSD stop/abort/unload hardened, DSD reports 32
+  significant bits; no "unlocked secondary bus reset" warning and no
+  phantom-power alsactl error; debugfs and ae9-full-dump clearer; the
+  WirePlumber 0.4 .lua only where WirePlumber is 0.4; 21 module options
+  (4 removed, 5 test hooks only in AE9_TEST=1 builds).
+
 * Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.14-1
 - Driver 0.12.14: native DSD64 (experimental, opt-in with pcm_dsd=1): DSD
   straight to the DAC's DSD decoder, as Creative's Windows DSD driver does

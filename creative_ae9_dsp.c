@@ -83,15 +83,32 @@
 #define AE9_DSP_SOFT_TRIES	3
 
 /*
- * Test only: make the next DSP load(s) fail on purpose, to exercise the
- * retry. 1 = stop the download after its first chunk (DSP never started),
- * 2 = start the DSP but skip the boot handshake (as a DSP that never
- * answered). Cleared when used; set it again for each test. Only acts with
- * debug >= 1, so a stray setting can't fail a normal start.
+ * Test only (a test build, make AE9_TEST=1): make the next DSP load(s) fail
+ * on purpose, to exercise the retry. 1 = stop the download after its first
+ * chunk (DSP never started), 2 = start the DSP but skip the boot handshake
+ * (as a DSP that never answered). Cleared when used; set it again for each
+ * test. Only acts with debug >= 1, so a stray setting can't fail a normal
+ * start.
  */
+#ifdef AE9_TEST
 static unsigned int dsp_fail_inject;
 module_param(dsp_fail_inject, uint, 0644);
 MODULE_PARM_DESC(dsp_fail_inject, "Test (needs debug=1): fail the next DSP load once (1 = download, 2 = handshake); cleared when used");
+
+/* true = fail this step (what: 1 = download, 2 = handshake), once */
+static bool dsp_fail_inject_take(unsigned int what)
+{
+	if (dsp_fail_inject != what || !ae9_debug)
+		return false;
+	dsp_fail_inject = 0;
+	return true;
+}
+#else
+static inline bool dsp_fail_inject_take(unsigned int what)
+{
+	return false;
+}
+#endif
 
 /* a retry (soft or a whole bring-up) comes after this attempt: don't sit
  * out every timeout */
@@ -434,13 +451,33 @@ static int dspio_send(struct creative_chip *chip, unsigned int reg,
  *   caller (scp_send_words) keeps the rest of a cut message
  */
 
-/* Test hook for the resend path (cards that never fill the queue): every
- * Nth word's first send stops after the low half and reports "full", as a
- * word the router chip refused. Needs debug=1; only after start-up
- * (dsp_done), never before the DSP's boot handshake. */
+/* Test hook for the resend path (cards that never fill the queue), in a
+ * test build only (make AE9_TEST=1): every Nth word's first send stops
+ * after the low half and reports "full", as a word the router chip
+ * refused. Needs debug=1; only after start-up (dsp_done), never before the
+ * DSP's boot handshake. */
+#ifdef AE9_TEST
 static unsigned int scp_full_inject;
 module_param(scp_full_inject, uint, 0644);
 MODULE_PARM_DESC(scp_full_inject, "Test (needs debug=1): every Nth DSP word is treated as refused 'queue full' once, to exercise the resend (0 = off)");
+
+/* true = this word's first send counts as refused */
+static bool scp_full_inject_take(struct creative_chip *chip)
+{
+	static unsigned int inject_n;
+
+	if (!scp_full_inject || !ae9_debug || !chip->dsp_done ||
+	    ++inject_n < scp_full_inject)
+		return false;
+	inject_n = 0;
+	return true;
+}
+#else
+static inline bool scp_full_inject_take(struct creative_chip *chip)
+{
+	return false;
+}
+#endif
 
 #define SCP_ROOM_WAIT_MS	2000	/* busy before a word / resends of a word */
 #define SCP_RESEND_MAX_MS	20	/* longest pause between resends */
@@ -485,20 +522,15 @@ static int dsp_kick(struct creative_chip *chip);
 
 static int dspio_write(struct creative_chip *chip, unsigned int scp_data)
 {
-	static unsigned int inject_n;
 	unsigned long start = jiffies;
 	unsigned int tries, pause = 1;
-	bool kicked = false, inject = false;
+	bool kicked = false, inject;
 	int status;
 
 	status = dspio_write_wait(chip, SCP_ROOM_WAIT_MS);
 	if (status < 0)
 		return status;
-	if (scp_full_inject && ae9_debug && chip->dsp_done &&
-	    ++inject_n >= scp_full_inject) {
-		inject_n = 0;
-		inject = true;
-	}
+	inject = scp_full_inject_take(chip);
 
 	for (tries = 1; ; tries++) {
 		/* dspio_send() returns -EIO for a half the DSP answers busy */
@@ -2878,8 +2910,7 @@ static int dspxfr_image(struct creative_chip *chip,
 					port_map_mask);
 		if (status < 0)
 			break;
-		if (dsp_fail_inject == 1 && ae9_debug) {
-			dsp_fail_inject = 0;
+		if (dsp_fail_inject_take(1)) {
 			dev_warn(chip->dev, "dspxfr: dsp_fail_inject=1: stopping the download after its first segment (test)\n");
 			status = -ETIMEDOUT;
 			break;
@@ -2931,8 +2962,7 @@ static int dspload_image(struct creative_chip *chip,
 		 * and the first bring-up failed on 5 of 13 boots (2026-11-07).
 		 */
 		msleep(250);
-		if (dsp_fail_inject == 2 && ae9_debug) {
-			dsp_fail_inject = 0;
+		if (dsp_fail_inject_take(2)) {
 			dev_warn(chip->dev, "dspload: dsp_fail_inject=2: skipping the boot handshake (test)\n");
 			msleep(2000);	/* Windows' wait for state 3 */
 			hs = -ETIMEDOUT;

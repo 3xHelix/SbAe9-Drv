@@ -1841,6 +1841,32 @@ static void creative_ae9_dsp_switch_work(struct work_struct *w)
 	creative_ae9_fx_restore(chip);	/* DSP mode + the SBX profile */
 }
 
+/*
+ * Direct Mode on while DSP mode played (fx.c fx_put): the stream, now
+ * unbound, to XRUN so the app restarts it on the direct route. From a work,
+ * not from fx_put: the substream can close (and its runtime be freed) at
+ * any moment, and only the PCM's open_mutex, which close runs under,
+ * keeps it; fx_put runs under the card's controls_rwsem, which the PCM
+ * disconnect takes inside open_mutex, so taking open_mutex there could
+ * deadlock. Here it can be taken, as dead_work does. A stream that closed
+ * meanwhile is gone: nothing to stop; one opened since starts unrouted
+ * anyway (pcm_start_sent was cleared), so the xrun is harmless.
+ */
+static void creative_ae9_pb_restart_work(struct work_struct *w)
+{
+	struct creative_chip *chip = container_of(w, struct creative_chip,
+						  pb_restart_work);
+	struct snd_pcm_substream *ss;
+
+	if (READ_ONCE(chip->unloading) || !chip->pcm)
+		return;
+	mutex_lock(&chip->pcm->open_mutex);
+	ss = chip->playback_substream;
+	if (ss && ss->runtime)
+		snd_pcm_stop_xrun(ss);
+	mutex_unlock(&chip->pcm->open_mutex);
+}
+
 /* Playback trigger start (atomic): run a pending switch shortly after. */
 void creative_ae9_dsp_switch_kick(struct creative_chip *chip)
 {
@@ -2589,9 +2615,20 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		   chip->fx.direct ? "Direct" : "DSP", chip->fx.sbx ? "on" : "off",
 		   chip->dsp_active ? "up" : "down", chip->dsp_primed,
 		   chip->dsp_halted, chip->hs_ok ? "ok" : "not ok");
-	seq_printf(m, "streams: playback fmt 0x%04x (%u bit), optical out fmt 0x%04x, "
+	/* playback: the link format the open stream was prepared with and
+	 * its sample bits (latched at open); native DSD keeps pb_format 0 (no
+	 * optical mirror of it) and has its own link format */
+	seq_puts(m, "streams: playback ");
+	if (chip->dsd_active)
+		seq_printf(m, "DSD64 (link fmt 0x%04x, 6 x 16 bit carrying DSD), ",
+			   chip->pcm_start_fmt);
+	else if (chip->pb_format)
+		seq_printf(m, "fmt 0x%04x (%u bit), ", chip->pb_format, chip->pcm_bits);
+	else
+		seq_puts(m, "fmt 0x0000 (none), ");
+	seq_printf(m, "optical out fmt 0x%04x, "
 		   "mic %s, optical in %s, What U Hear %s, rear RCA %s\n",
-		   chip->pb_format, chip->pcm_bits, chip->opt_format,
+		   chip->opt_format,
 		   chip->capture_substream ? "open" : "-",
 		   chip->xcap[0].substream ? "open" : "-",
 		   chip->xcap[1].substream ? "open" : "-",
@@ -2785,7 +2822,15 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		for (i = 0; i < ARRAY_SIZE(cnt); i++)
 			if (cnt[i] > 1)
 				bad++;
-		if (!feeds)
+		/* no host feed into a DAC port is right for two kinds of
+		 * playback: say which, from the driver's own state */
+		if (!feeds && chip->dsd_active)
+			seq_puts(m, " none (native DSD64: the I2S wrapper feeds the DAC, no router)");
+		else if (!feeds && chip->pb_format && chip->fx.direct &&
+			 chip->pcm_start_rate % 11025 == 0)
+			seq_printf(m, " none (%u Hz: the 44.1 kHz family plays through the S/PDIF transmitter, not a DAC port)",
+				   chip->pcm_start_rate);
+		else if (!feeds)
 			seq_puts(m, " none");
 		seq_puts(m, bad ? "  STALE: a port has two feeds, a route is on twice, or a DSP feed in Direct Mode (power-off clears it)" : "  ok");
 		seq_printf(m, "\nrouter free slots: %d in no router-chip list (%u by the old rule)",
@@ -2850,13 +2895,6 @@ MODULE_PARM_DESC(debug, "Log detail: 0 startup, actions and problems (default), 
  * hu_fast_ms option until 0.12.12).
  */
 #define HU_FAST_MS		40U
-
-/* hu_master=1: name the head-unit volume/mute "Master Playback Volume" /
- * "Switch", so PipeWire/PulseAudio use them as the hardware volume and the
- * desktop slider and the knob move together. 0: "Head Unit Playback ...". */
-static unsigned int hu_master = 1;
-module_param(hu_master, uint, 0444);
-MODULE_PARM_DESC(hu_master, "post_windows: expose the head-unit volume as Master (1=on, default)");
 
 #define HU_ATT_DEFAULT	0x48	/* Windows' boot volume, -36.0 dB */
 #define HU_SP_TICKS	10	/* Windows shows "-SP-" ~5 s, then the volume */
@@ -3187,20 +3225,59 @@ static void creative_ae9_hu_jack(struct creative_chip *chip, bool lo)
 	creative_ae9_out_jack(chip, lo);
 }
 
+/*
+ * Volume per output (0.12.15). hu_att is the live volume, the one of output
+ * hu_att_for; hu_att_out[] keeps the other output's. "Master Playback
+ * Volume" addresses the output the user picked last: a pending switch's
+ * (hu_switch_to), else hu_att_for. Until 0.12.14 a volume put while a
+ * switch was pending changed the live (old) output, and the switch then
+ * stored that as the old output's level and loaded the new output's stale
+ * one: alsactl restores "Head Unit Output" before the volume, so after a
+ * reload the headphones' level went to the speakers (2026-11-20: speakers
+ * at att 0x0c = -6 dB) and the headphones got the boot default. Taking the
+ * pending switch, the swap below and a put's slot choice all hold
+ * chip->lock, so a put lands on one side of a switch, never between.
+ */
+static unsigned int *creative_ae9_hu_att_slot(struct creative_chip *chip)
+{
+	int to = chip->hu_switch_to;	/* caller holds chip->lock */
+
+	if (to >= 0 && (unsigned int)to != chip->hu_att_for)
+		return &chip->hu_att_out[to];
+	return &chip->hu_att;
+}
+
+/* the live volume becomes output hp's (caller holds chip->lock) */
+static void creative_ae9_hu_att_swap(struct creative_chip *chip, unsigned int hp)
+{
+	if (hp == chip->hu_att_for)
+		return;
+	chip->hu_att_out[chip->hu_att_for] = chip->hu_att;
+	chip->hu_att = chip->hu_att_out[hp];
+	chip->hu_att_for = hp;
+}
+
 static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 {
+	unsigned long flags;
 	u8 resp[24];
 
 	hp = !!hp;
 	if (hp == chip->hu_output)
 		return;
+	/* the volume first (hu_update already did it for a pending switch;
+	 * the knob's switch comes here directly) */
+	spin_lock_irqsave(&chip->lock, flags);
+	creative_ae9_hu_att_swap(chip, hp);
+	spin_unlock_irqrestore(&chip->lock, flags);
 	/* native DSD (pcm_dsd): stopped and off first; the app's restart
-	 * brings it up again on the new output */
+	 * brings it up again on the new output, once the switch is done (its
+	 * prepare waits on dsd_switching: it used to start DSD on the old
+	 * output while the route below changed under it) */
+	WRITE_ONCE(chip->dsd_switching, true);
 	creative_ae9_dsd_abort(chip, "output switch");
-	chip->hu_att_out[chip->hu_output] = chip->hu_att;
 	creative_ae9_hu_route(chip, hp);
 	chip->hu_output = hp;
-	chip->hu_att = chip->hu_att_out[hp];
 	creative_ae9_fx_output_changed(chip);	/* headphone profile back on */
 	chip->hu_name_until = chip->hu_ticks + HU_SP_TICKS;
 	creative_ae9_hu_label(chip);
@@ -3219,6 +3296,8 @@ static void creative_ae9_hu_switch(struct creative_chip *chip, unsigned int hp)
 		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->hu_out_ctl->id);
 	dev_info(chip->dev, "head unit: output %s, volume att 0x%02x\n",
 		 hp ? "headphones" : "speakers", chip->hu_att);
+	WRITE_ONCE(chip->dsd_switching, false);
+	wake_up_all(&chip->dsd_wq);
 }
 
 /* Knob light: f0 22 02 02 <0 off / 1 on> f7 (Windows, 3 s+ hold). */
@@ -3259,8 +3338,9 @@ static void creative_ae9_hu_display(struct creative_chip *chip, bool on)
 static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				   int press_ms)
 {
+	unsigned long flags;
 	u8 resp[24];
-	int sbx_led;
+	int sbx_led, to;
 
 	if (chip->hu_sbx_press) {
 		chip->hu_sbx_press = false;
@@ -3308,19 +3388,29 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 	if (chip->hu_plug_pending &&
 	    time_after_eq(jiffies, chip->hu_plug_at + msecs_to_jiffies(HU_PLUG_SETTLE_MS))) {
 		int want = !(chip->hu_status & 0x20);
+		bool sw = false;
 
 		chip->hu_plug_pending = false;
+		spin_lock_irqsave(&chip->lock, flags);
 		if (chip->hu_auto_hp && chip->hu_switch_to < 0 &&
 		    want != (int)chip->hu_output) {
+			chip->hu_switch_to = want;
+			sw = true;
+		}
+		spin_unlock_irqrestore(&chip->lock, flags);
+		if (sw)
 			dev_info(chip->dev, "head unit: auto switch to %s (3.5 mm headphone plug %s)\n",
 				 want ? "headphones" : "speakers", want ? "in" : "out");
-			chip->hu_switch_to = want;
-		}
 	}
-	if (chip->hu_switch_to >= 0) {
-		int to = chip->hu_switch_to;
-
-		chip->hu_switch_to = -1;
+	/* a pending switch: taken, and the volume swapped to its output, in
+	 * one go (see creative_ae9_hu_att_slot) */
+	spin_lock_irqsave(&chip->lock, flags);
+	to = chip->hu_switch_to;
+	chip->hu_switch_to = -1;
+	if (to >= 0)
+		creative_ae9_hu_att_swap(chip, to);
+	spin_unlock_irqrestore(&chip->lock, flags);
+	if (to >= 0) {
 		chip->hu_reroute = false;	/* the switch routes it */
 		creative_ae9_hu_switch(chip, to);
 	}
@@ -3355,7 +3445,11 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 	}
 
 	if (steps) {
+		/* the knob turns the output playing now (hu_att): a switch
+		 * pending at this tick already ran above */
+		spin_lock_irqsave(&chip->lock, flags);
 		chip->hu_att = clamp_t(int, (int)chip->hu_att - steps, 0, 254);
+		spin_unlock_irqrestore(&chip->lock, flags);
 		chip->hu_mute = 0;
 		if (chip->hu_vol_ctl)
 			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
@@ -3527,8 +3621,8 @@ static void creative_ae9_hb_windows(struct creative_chip *chip)
 }
 
 /* ALSA controls: "Head Unit Playback Volume" (0..254 = -127.0..0 dB) and
- * "Head Unit Playback Switch" (renamed to "Master Playback ..." with
- * hu_master=1). The heartbeat applies changes. */
+ * "Head Unit Playback Switch", renamed to "Master Playback ..." when they
+ * are added. The heartbeat applies changes. */
 static const DECLARE_TLV_DB_SCALE(hu_vol_tlv, -12700, 50, 0);
 
 static int hu_vol_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
@@ -3540,27 +3634,42 @@ static int hu_vol_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 	return 0;
 }
 
+/* get and put address the output picked last: with a switch pending, the
+ * new output's volume, which the switch then loads (creative_ae9_hu_att_slot) */
 static int hu_vol_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	unsigned long flags;
 
-	uv->value.integer.value[0] = 254 - chip->hu_att;
+	spin_lock_irqsave(&chip->lock, flags);
+	uv->value.integer.value[0] = 254 - *creative_ae9_hu_att_slot(chip);
+	spin_unlock_irqrestore(&chip->lock, flags);
 	return 0;
 }
 
 static int hu_vol_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
-	long v = clamp_t(long, uv->value.integer.value[0], 0, 254);
+	unsigned int att = 254 - clamp_t(long, uv->value.integer.value[0], 0, 254);
+	unsigned int *slot;
+	unsigned long flags;
+	int changed = 0;
 
 	if (creative_ae9_dead(chip))
 		return -ENODEV;
 
-	if (254 - v == chip->hu_att)
-		return 0;
-	chip->hu_att = 254 - v;
-	chip->hu_dirty = 1;
-	return 1;
+	spin_lock_irqsave(&chip->lock, flags);
+	slot = creative_ae9_hu_att_slot(chip);
+	if (*slot != att) {
+		*slot = att;
+		/* the live volume: the heartbeat sends it; a pending
+		 * output's: its switch does, nothing goes out now */
+		if (slot == &chip->hu_att)
+			chip->hu_dirty = 1;
+		changed = 1;
+	}
+	spin_unlock_irqrestore(&chip->lock, flags);
+	return changed;
 }
 
 static int hu_mute_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
@@ -3869,24 +3978,38 @@ static int hu_out_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 
+	unsigned long flags;
+
+	spin_lock_irqsave(&chip->lock, flags);
 	uv->value.enumerated.item[0] = chip->hu_switch_to >= 0 ?
-				       chip->hu_switch_to : chip->hu_output;
+				       chip->hu_switch_to : chip->hu_att_for;
+	spin_unlock_irqrestore(&chip->lock, flags);
 	return 0;
 }
 
 static int hu_out_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
-	unsigned int v = uv->value.enumerated.item[0];
+	unsigned int v = uv->value.enumerated.item[0], cur;
+	unsigned long flags;
 
 	if (creative_ae9_dead(chip))
 		return -ENODEV;
 
 	if (v > 1)
 		return -EINVAL;
-	if (v == chip->hu_output && chip->hu_switch_to < 0)
+	spin_lock_irqsave(&chip->lock, flags);
+	cur = chip->hu_switch_to >= 0 ? chip->hu_switch_to : chip->hu_att_for;
+	if (v != cur)
+		/* the heartbeat does the switch; back to the live output
+		 * before it did = no switch */
+		chip->hu_switch_to = v == chip->hu_att_for ? -1 : v;
+	spin_unlock_irqrestore(&chip->lock, flags);
+	if (v == cur)
 		return 0;
-	chip->hu_switch_to = v;		/* the heartbeat does the switch */
+	/* the volume control now reads the picked output's level */
+	if (chip->hu_vol_ctl)
+		snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &chip->hu_vol_ctl->id);
 	return 1;
 }
 
@@ -4120,8 +4243,20 @@ static int hu_phantom_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv
 	if (creative_ae9_dead(chip))
 		return -ENODEV;
 
-	if (!chip->hu_status_valid)
-		return -EAGAIN;
+	/*
+	 * No status read yet (just loaded, or the head unit was just set up
+	 * again): phantom power is off, our own set-up sent it off, and
+	 * the control reads off. "Off" is then no change (alsactl restore
+	 * at boot failed on the -EAGAIN this returned until 0.12.14);
+	 * "on" is refused like during the hold below, never queued for
+	 * later.
+	 */
+	if (!chip->hu_status_valid) {
+		if (!on)
+			return 0;
+		dev_info(chip->dev, "head unit: phantom power on refused, head unit status not read yet\n");
+		return -EBUSY;
+	}
 	if (on == !(chip->hu_status & 0x01))
 		return 0;
 	if (on && time_before(jiffies, chip->hu_phantom_hold)) {
@@ -4189,6 +4324,7 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 	chip->hu_att = HU_ATT_DEFAULT;
 	chip->hu_att_out[0] = chip->hu_att_out[1] = HU_ATT_DEFAULT;
 	chip->hu_output = 0;		/* the boot replay selects speakers */
+	chip->hu_att_for = 0;
 	chip->hu_name_until = HU_SP_TICKS;
 	chip->hu_switch_to = -1;
 	chip->hu_display = true;
@@ -4212,7 +4348,11 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 		chip->hu_disp_ctl = NULL;
 	chip->hu_vol_ctl = snd_ctl_new1(&hu_controls[0], chip);
 	chip->hu_mute_ctl = snd_ctl_new1(&hu_controls[1], chip);
-	if (hu_master && chip->hu_vol_ctl && chip->hu_mute_ctl) {
+	/* named "Master Playback Volume" / "Switch", so PipeWire/PulseAudio
+	 * use them as the hardware volume and the desktop slider and the knob
+	 * move together (the hu_master option until 0.12.15: 0 kept the
+	 * "Head Unit Playback ..." names) */
+	if (chip->hu_vol_ctl && chip->hu_mute_ctl) {
 		strscpy(chip->hu_vol_ctl->id.name, "Master Playback Volume",
 			sizeof(chip->hu_vol_ctl->id.name));
 		strscpy(chip->hu_mute_ctl->id.name, "Master Playback Switch",
@@ -4430,6 +4570,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		dev_warn(&pdev->dev, "other devices behind %s: skipping the secondary bus reset\n",
 			 pci_name(pdev->bus->self));
 	} else if (do_reset && pdev->bus->self) {
+		struct pci_dev *bridge = pdev->bus->self;
 		int rret;
 
 		/*
@@ -4441,7 +4582,20 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		int waited;
 
 		pci_save_state(pdev);
-		rret = pci_bridge_secondary_bus_reset(pdev->bus->self);
+		/*
+		 * The PCI core's own bus resets (pci_bus_lock()) hold the config
+		 * access lock of the bridge and of every device below it:
+		 * userspace config reads (lspci, sysfs "config") wait instead
+		 * of reading a device in reset. Since 6.10 the reset warns
+		 * "unlocked secondary bus reset" without the bridge's. The same
+		 * here, the card's until its config space is back. Only that
+		 * lock: the core's device locks would mean taking the bridge's
+		 * while probe holds ours, the core's order reversed. Kernel
+		 * config accessors (the wait and restore below) don't wait on it.
+		 */
+		pci_cfg_access_lock(bridge);
+		pci_cfg_access_lock(pdev);
+		rret = pci_bridge_secondary_bus_reset(bridge);
 		/*
 		 * A conventional PCI device may need up to 1 s after reset
 		 * before it responds properly (the helper doesn't wait for a
@@ -4456,9 +4610,11 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 			msleep(50);
 		}
 		pci_restore_state(pdev);
+		pci_cfg_access_unlock(pdev);
+		pci_cfg_access_unlock(bridge);
 		pci_set_master(pdev);
 		dev_info(&pdev->dev, "secondary bus reset via %s: %d, ready after %d ms (id 0x%08x)\n",
-			 pci_name(pdev->bus->self), rret, waited, id);
+			 pci_name(bridge), rret, waited, id);
 		creative_ae9_log_state(chip, "after bus reset");
 	}
 
@@ -4813,6 +4969,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	mutex_init(&chip->ca0113_mutex);
 	mutex_init(&chip->spdif_mutex);
 	mutex_init(&chip->dsd_mutex);
+	init_waitqueue_head(&chip->dsd_wq);
 	chip->spdif_aes[0] = IEC958_AES0_CON_NOT_COPYRIGHT;	/* as 0x70d COPY */
 	chip->dac_filter = DAC_FILTER_DEFAULT_INDEX;
 	chip->dac_filter_bits = dac_filter_values[DAC_FILTER_DEFAULT_INDEX];
@@ -4838,6 +4995,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	 * no relay click, no audio. Moving INIT here fixes the race.
 	 */
 	INIT_DELAYED_WORK(&chip->dsp_switch_work, creative_ae9_dsp_switch_work);
+	INIT_WORK(&chip->pb_restart_work, creative_ae9_pb_restart_work);
 	INIT_DELAYED_WORK(&chip->hp_work, creative_ae9_fx_hp_work);
 	INIT_DELAYED_WORK(&chip->spk_follow_work, creative_ae9_fx_spk_follow_work);
 	INIT_DELAYED_WORK(&chip->acm_work, creative_ae9_acm_work);
@@ -5174,6 +5332,7 @@ static void creative_ae9_stop_works(struct creative_chip *chip)
 {
 	cancel_work_sync(&chip->resume_work);
 	cancel_work_sync(&chip->dead_work);
+	cancel_work_sync(&chip->pb_restart_work);
 	atomic_set(&chip->dma_running, 0);
 	ae9_cancel_timed_works(chip);
 }
@@ -5286,7 +5445,8 @@ static void creative_ae9_resume_work(struct work_struct *work)
 {
 	struct creative_chip *chip =
 		container_of(work, struct creative_chip, resume_work);
-	unsigned int want_hp = chip->hu_output, attempt;
+	unsigned int want_hp, attempt;
+	unsigned long flags;
 	int ret = -EIO;
 
 	chip->dac_start_key = 0;	/* the card lost power */
@@ -5295,11 +5455,16 @@ static void creative_ae9_resume_work(struct work_struct *work)
 	chip->cv.sent_voicefx = chip->cv.sent_miceq = -1;	/* and the DSP's defaults */
 	chip->cv.mon_bound = false;	/* and ADC 0x07 unbound */
 
-	/* the boot replay brings the head unit up on speakers */
-	chip->hu_att_out[chip->hu_output] = chip->hu_att;
+	/* the boot replay brings the head unit up on speakers; the heartbeat
+	 * then switches to the output picked last (a switch still pending
+	 * at suspend included: its volume waits in hu_att_out[]) */
+	spin_lock_irqsave(&chip->lock, flags);
+	want_hp = chip->hu_switch_to >= 0 ? chip->hu_switch_to : chip->hu_att_for;
+	chip->hu_switch_to = -1;
+	creative_ae9_hu_att_swap(chip, 0);
 	chip->hu_output = 0;
+	spin_unlock_irqrestore(&chip->lock, flags);
 	chip->lo_virt_phys = false;
-	chip->hu_att = chip->hu_att_out[0];
 
 	for (attempt = 1; attempt <= AE9_RESUME_TRIES; attempt++) {
 		if (attempt > 1) {
@@ -5346,8 +5511,12 @@ static void creative_ae9_resume_work(struct work_struct *work)
 
 	/* the heartbeat (started by the bring-up's ACM work) applies these */
 	chip->hu_dirty = 1;
-	if (want_hp)
-		chip->hu_switch_to = 1;
+	if (want_hp) {
+		spin_lock_irqsave(&chip->lock, flags);
+		if (chip->hu_switch_to < 0)	/* none picked since */
+			chip->hu_switch_to = 1;
+		spin_unlock_irqrestore(&chip->lock, flags);
+	}
 	/* the head unit wakes lit; if the light was off, the heartbeat turns
 	 * it off again (sending it from here raced the heartbeat's frames) */
 	chip->hu_light_sent = 1;

@@ -44,27 +44,22 @@ card's PCIe bridge, and debugging. (Sound Blaster Command reads `pcm_rates`,
   L/R outputs in DSP mode (stereo streams too since 0.12.11: Bass Redirect's
   sub, the rears of 4.0/4.1); each must be a DAC pair's first port
   (0x40-0x7f with bits 3:1 clear), else the default is used.
-- `pcm_dsd` (0, writable at runtime, applied at the next stream open):
-  EXPERIMENTAL (card-tested with aplay and MPD): native DSD64 on playback device 0, the
-  way Creative's Windows DSD ASIO driver plays it (the CA0113's own I2S to
-  the front DAC in DSD mode). 1 = the device also offers `DSD_U32_BE`, 2
-  channels at rate 88200 (ALSA's DSD64 rate for 32-bit words), in Direct
-  Mode only (with `pcm_rates=2`) and read/write access only (no mmap: each
-  frame is repacked for the card). Plays on the card's RCA out and the head
-  unit's headphones. Direct Mode off, an output switch, suspend and unload
-  stop a DSD stream (the player restarts it, or gets an error in DSP mode).
+- `pcm_dsd` (1, writable at runtime, applied at the next stream open):
+  native DSD64 on playback device 0, the way Creative's Windows DSD ASIO
+  driver plays it (the CA0113's own I2S to the front DAC in DSD mode); on by
+  default since 0.12.15 (opt-in in 0.12.14; card-tested with aplay and
+  MPD). The device also offers `DSD_U32_BE`, 2 channels at rate 88200
+  (ALSA's DSD64 rate for 32-bit words), in Direct Mode only (with
+  `pcm_rates=2`) and read/write access only (no mmap: each frame is
+  repacked for the card). Plays on the card's RCA out and the head unit's
+  headphones. Direct Mode off, an output switch, suspend and unload stop a
+  DSD stream (the player restarts it, or gets an error in DSP mode). PCM
+  playback is the same either way. 0 = off: `DSD_U32_BE` isn't offered.
   `tools/dsd/dsf2raw.py` turns a `.dsf` file into raw data for `aplay`. How
-  to use it: [USING.md](USING.md#native-dsd64-experimental-01214).
+  to use it: [USING.md](USING.md#native-dsd64).
 
 ### Direct Mode, SBX and headphone profiles
 
-- `fx_spk_cfg` (2): the "Speaker Config" setting at load (1 = 2.0, 2 = 2.1
-  as Windows).
-- `eq_headroom` (1, writable at runtime, used at the next EQ or profile
-  change): with a headphone profile and the EQ both on, the DSP gets the EQ
-  pre-gain 12 dB lower (not below -12 dB). Without it a hot signal overloads
-  the DSP and it drops audio blocks: the "metallic" sound. The control
-  keeps your value; only what the DSP gets changes.
 - `hp_custom` (empty, writable at runtime): the four custom slots of
   "Headphone Profile", `KEY=Name;KEY=Name;...` (slot N loads
   `creative-ae9/hp/<KEY>.bin` and shows Name; an empty slot shows "Custom
@@ -91,9 +86,6 @@ card's PCIe bridge, and debugging. (Sound Blaster Command reads `pcm_rates`,
 The driver replays Windows' post-boot head-unit setup and runs Windows'
 head-unit poll, volume display and knob.
 
-- `hu_master` (1): names the volume/mute "Master" for desktop sync, so the
-  desktop slider and the knob move together (0 = "Head Unit Playback
-  Volume" / "Head Unit Playback Switch").
 - `hu_auto_switch` (0): start with "Head Unit Auto Switch" on: plugging into
   the head unit's 3.5 mm headphone jack switches to headphones, unplugging
   back to speakers. Off, plugs only log.
@@ -127,25 +119,29 @@ need one, please report it.
 
 - `debug` (0, writable at runtime): log detail. 0: startup, your actions
   (Direct Mode/SBX, output switches, mutes) and problems. 1: also the routine
-  per-stream and per-step lines (command blocks, router, volume steps). 2:
-  plus the raw head-unit button state.
+  per-stream and per-step lines (command blocks, router, volume steps; each
+  stream's buffer and BDL addresses when it's prepared, for matching an
+  `IO_PAGE_FAULT` address to a stream). 2: plus the raw head-unit button
+  state.
 - `verb_log` (0): keep the first this many card commands and replies after
   load (the log stops when full) for debugfs
   `creative_ae9/verblog` (in the capture log's format, for diffing against
   Windows captures and for `tools/verbdiff`); 0 = off.
 - `mmio_log` (0): 1 = also log the BAR0/BAR2 register accesses in the
   verblog (needs `verb_log`).
-- `dma_trace` (0, writable at runtime): log each stream's buffer and BDL
-  addresses when it's prepared, for matching an `IO_PAGE_FAULT` address to a
-  stream.
 - `acm_heartbeat_ms` (500): the head-unit heartbeat (Windows' cadence; it
   reads the knob, buttons, plugs and status, and drives the volume display
   and every volume/mute change); 0 = off, which also stops the knob and leaves volume
   and mute changes unsent: only for `tools/verbdiff`, which loads with 0 so
   its verb logs stay deterministic. Leave it at 500 otherwise.
 
-Test hooks: each acts only with `debug` at 1 or more (so a stray setting can't break a
-normal start) and is writable at runtime.
+### Test hooks (test builds only)
+
+These exist only in a test build of the driver: `make AE9_TEST=1` in the
+source tree (or `AE9_TEST=1` added to a kbuild `make ... M=<dir> modules`).
+A release build (DKMS, the packages, a plain `make`) has neither the options
+nor their code (since 0.12.15). Each acts only with `debug` at 1 or more (so
+a stray setting can't break a normal start) and is writable at runtime.
 
 - `dsp_fail_inject` (0, clears itself): fails the next DSP load once (1 =
   download, 2 = handshake) to exercise the soft retry (Windows' DSP_INIT +
@@ -161,6 +157,28 @@ normal start) and is writable at runtime.
 - `rirb_inject_us` (300): how long `rirb_inject` hides a reply, in µs; over
   100000 its command times out. A hidden reply is dropped, as never landed,
   once the reply ring has moved 128 entries past it.
+
+## Removed in 0.12.15
+
+Fixed at their defaults now. An old line naming one is ignored, with an
+"unknown parameter" line in the kernel log; the driver still loads. Remove
+it at your convenience.
+
+- `hu_master`: the head-unit volume and mute are always "Master Playback
+  Volume" / "Master Playback Switch", so the desktop slider and the knob
+  move together.
+- `eq_headroom`: always on. With a headphone profile and the EQ both on, the
+  DSP gets the EQ pre-gain 12 dB lower (not below -12 dB); without it a hot
+  signal overloads the DSP and it drops audio blocks: the "metallic" sound.
+  The control keeps your value; only what the DSP gets changes.
+- `fx_spk_cfg`: "Speaker Config" starts at 2.1, as Windows; the control
+  still changes it.
+- `dma_trace`: `debug=1` now logs each stream's buffer and BDL addresses
+  when it's prepared.
+
+Test builds only now (`make AE9_TEST=1`, above): `dsp_fail_inject`,
+`hung_inject`, `scp_full_inject`, `rirb_inject`, `rirb_inject_us`. In a
+release build a line naming one is ignored the same way.
 
 ## Removed in 0.12.14
 

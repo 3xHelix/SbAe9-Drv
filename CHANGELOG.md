@@ -3,6 +3,85 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.15 (2026-11-20)
+Native DSD64, on by default. And MPD stops crackling. 🎧✨
+
+Works with SbAe9-SBC v0.22.1 (its DSD switch now writes `pcm_dsd=1` or
+`pcm_dsd=0`) and SbAe9-AudioMon v0.4.9.
+
+- **Native DSD64 is on by default.** No option, no switch: a player that
+  sends DSD to ALSA (MPD with `dop "no"`) on `hw:AE9,0` gets it straight to
+  the DAC's DSD decoder. PCM plays as before. `pcm_dsd=0` turns it off
+  (`/etc/modprobe.d/ae9-dsd.conf`); a file with `pcm_dsd=1` keeps it on.
+  How to: [USING.md](docs/USING.md#native-dsd64).
+- **Upgrading? If you turned DSD off with SbAe9-SBC v0.22.0,** turn it off
+  once more: that version deleted `/etc/modprobe.d/ae9-dsd.conf` to turn it
+  off, and with no file 0.12.15 has it on. Switch it off in SBC v0.22.1, or
+  write `options snd-hda-codec-creative-ae9 pcm_dsd=0` to that file. Never
+  touched it? Nothing to do, you get DSD.
+- **MPD on `hw:AE9,0` no longer crackles at 44.1 kHz.** With its default
+  buffer (500 ms) a 44.1 kHz file got only 2 periods (2 x 11024 frames),
+  and a refill that came a little late played old audio (the card's DMA
+  reads about 0.7 ms ahead), with no xrun logged. The buffer's ends now
+  sit on sizes 4 periods make: 4 x 5520 at 44.1 kHz, and 5.1 got the same
+  fix. The `buffer_time "481760"` workaround is only needed on 0.12.14.
+  PipeWire was never affected; its default buffers are unchanged.
+- **Players asking for their own buffer size work.** A player that opens
+  the card directly and asks for a buffer time or size (MPD's
+  `buffer_time`, `aplay --buffer-time`, `speaker-test -b`) could get
+  "Invalid argument": the card's buffer is a whole number of periods, and
+  some sizes ALSA offered no split of periods could make. 0.12.14 refused
+  about 1 such request in 6 in our tests (on the card at 88.2 kHz, 108 of
+  471 buffer times); now none.
+- **Volume safety: the head-unit volume no longer crosses outputs.** After
+  every reload (`alsactl restore` sets the output first, then the volume),
+  the speakers could get the headphones' level and the headphones the boot
+  default. A volume set while an output switch is still pending now goes
+  to the output you picked.
+- **Native DSD64, sturdier.** An output switch while DSD plays: the
+  player's restart now waits for the switch to finish (interruptibly, 3 s
+  at most) instead of running in the middle of it. A DSD stream that was
+  set up but not yet playing when Direct Mode went off (or a switch began)
+  could then start silent, with no error; now the player gets an error and
+  sets it up again. Draining and paused DSD streams are stopped too, and
+  Direct Mode off can no longer deadlock against an unload. DSD streams
+  report 32 significant bits (`aplay -v`, MPD), not the PCM 24. With DSD
+  on, a PCM stream's buffer is cleared in full at setup, as ALSA does it
+  (for players that use mmap).
+- **Direct Mode on** stops a DSP-mode stream from a work item now, so a
+  player closing at that moment can't free the stream under the stop.
+- **Kernel log:** the "unlocked secondary bus reset" warning at every load
+  is gone (the driver holds the PCI config locks the kernel expects during
+  the card's bus reset), and so is `alsactl restore`'s "Head Unit Phantom
+  Power: Resource temporarily unavailable" at every boot and reload.
+- **debugfs `state`:** the playback line says DSD64 while native DSD
+  plays, and "DAC port feeds: none" says why when that's right (native
+  DSD, or the 44.1 kHz family through the S/PDIF transmitter).
+- **`ae9-full-dump`:** every stream labelled by where its jack lives
+  (head-unit rear RCA in and optical out added), every capture device, a
+  driver log that keeps its timestamps, and whether the PCI error (AER)
+  counters can move on your machine.
+- **WirePlumber:** the 0.4 `.lua` is installed only where WirePlumber is
+  0.4 (Fedora's 0.5 logged "Old configuration file detected"); the safe
+  start volume is unchanged everywhere.
+- **Module options: 30 -> 21.** Removed, each fixed at its default:
+  `hu_master` (the head-unit volume and mute are always "Master"),
+  `eq_headroom` (always on), `fx_spk_cfg` ("Speaker Config" starts at 2.1;
+  the control still changes it) and `dma_trace` (its lines now come with
+  `debug=1`). The five fault-injection hooks (`dsp_fail_inject`,
+  `hung_inject`, `scp_full_inject`, `rirb_inject`, `rirb_inject_us`) are
+  only in a test build now (`make AE9_TEST=1`). An old line in
+  `/etc/modprobe.d` naming one is ignored, with an "unknown parameter" line
+  in the kernel log; the driver still loads. Details:
+  [OPTIONS.md](docs/OPTIONS.md#removed-in-01215).
+- Tested: every command and register write compared with 0.12.14 (the
+  same); the card's buffer negotiation matched the desk model on about
+  450,000 requests; MPD at 44.1 kHz with its default buffer, DSD output
+  switches, knob switches, end-of-track switches, Direct Mode off mid-DSD
+  and a driver reload with Direct Mode off; before that, about 21 hours of
+  DSD/PCM playback on 0.12.14 with DSD on (130+ DSD switches, four
+  suspend/resume cycles): Driver Health 0 throughout.
+
 ## 0.12.14 (2026-11-20)
 Native DSD64. On Linux. On a PCIe card. 💣🎧
 
@@ -12,7 +91,7 @@ it) and SbAe9-AudioMon v0.4.9.
 - **Native DSD64 (experimental, opt-in).** `.dsf`/`.dff` files go to the
   DAC's own DSD decoder as a 1-bit stream at 2.8224 MHz: no conversion to
   PCM anywhere. It's the path Creative's Windows DSD driver uses, decoded
-  from it: the card's second chip (CA0113) clocks the bits straight to the
+  by watching it drive the card: the card's second chip (CA0113) clocks the bits straight to the
   ES9038, past the DSP and the router. Turn it on with `pcm_dsd=1` (or SBC's
   switch), then play with a player that sends DSD to ALSA, like MPD with
   `dop "no"`. DSD64 only, Direct Mode only, on the card's RCA out and the

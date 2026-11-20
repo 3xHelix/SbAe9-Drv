@@ -11,6 +11,13 @@ obj-m += snd-hda-codec-creative-ae9.o
 # the kernel's own header instead of its version
 ccflags-y += $(shell grep -qs 'void hrtimer_setup\b' $(srctree)/include/linux/hrtimer.h && echo -DAE9_HAVE_HRTIMER_SETUP)
 
+# make AE9_TEST=1: a test build, with the fault-injection hooks
+# rirb_inject, rirb_inject_us, hung_inject, dsp_fail_inject and
+# scp_full_inject (docs/OPTIONS.md). Release builds leave them out.
+ifeq ($(AE9_TEST),1)
+ccflags-y += -DAE9_TEST
+endif
+
 KDIR := /lib/modules/$(shell uname -r)/build
 
 all:

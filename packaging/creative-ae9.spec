@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.14
+Version:        0.12.15
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -51,7 +51,8 @@ install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
-install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+# no 51-ae9-safe-volume.lua: Fedora's WirePlumber 0.5 reads the .conf and
+# only warns about a .lua ("Old configuration file detected")
 install -D -m 755 scripts/ae9-get-firmware.sh %{buildroot}%{_bindir}/ae9-get-firmware
 install -D -m 755 scripts/ae9-full-dump.sh %{buildroot}%{_bindir}/ae9-full-dump
 install -D -m 755 scripts/ae9-dsp-snapshot.sh %{buildroot}%{_bindir}/ae9-dsp-snapshot
@@ -91,8 +92,6 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir %{_datadir}/wireplumber
 %dir %{_datadir}/wireplumber/wireplumber.conf.d
 %{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
-%dir %{_datadir}/wireplumber/main.lua.d
-%{_datadir}/wireplumber/main.lua.d/51-ae9-safe-volume.lua
 %{_bindir}/ae9-get-firmware
 %{_bindir}/ae9-full-dump
 %{_bindir}/ae9-dsp-snapshot
@@ -103,6 +102,17 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.15-1
+- Driver 0.12.15: native DSD64 on by default (pcm_dsd=0 turns it off; a
+  file with pcm_dsd=1 keeps it on). MPD on hw:AE9,0 no longer crackles at
+  44.1 kHz (4 periods with its default buffer) and buffer times a player
+  asks for are no longer refused; the head-unit volume no longer crosses
+  outputs after a reload; DSD stop/abort/unload hardened, DSD reports 32
+  significant bits; no "unlocked secondary bus reset" warning and no
+  phantom-power alsactl error; debugfs and ae9-full-dump clearer; the
+  WirePlumber 0.4 .lua only where WirePlumber is 0.4; 21 module options
+  (4 removed, 5 test hooks only in AE9_TEST=1 builds).
+
 * Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.14-1
 - Driver 0.12.14: native DSD64 (experimental, opt-in with pcm_dsd=1): DSD
   straight to the DAC's DSD decoder, as Creative's Windows DSD driver does

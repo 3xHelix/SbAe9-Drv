@@ -55,16 +55,6 @@ static unsigned int pcm_periods = 8;
 module_param(pcm_periods, uint, 0644);
 MODULE_PARM_DESC(pcm_periods, "Most playback periods per buffer, 2-32 (default 8; 2 = Windows' 48 kHz layout)");
 
-/*
- * dma_trace=1: log every stream's buffer and BDL address at prepare, for
- * matching an IOMMU IO_PAGE_FAULT address to a stream (the 2026-11-13
- * rapid-SBX hang: 8-byte writes to an unmapped address ~70 ms after the
- * first command timeout). The stop check and the dump below run always.
- */
-static unsigned int dma_trace;
-module_param(dma_trace, uint, 0644);
-MODULE_PARM_DESC(dma_trace, "Log stream buffer/BDL DMA addresses at prepare (1=yes; diagnostic)");
-
 /* HD-Audio spec 3.3.35: after RUN is cleared, the DMA engine has stopped
  * only once RUN reads back 0. Wait up to 1 ms; log a stream that doesn't */
 static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, const char *why)
@@ -86,9 +76,9 @@ static bool ae9_sd_wait_stopped(struct creative_chip *chip, unsigned int base, c
 				return false;
 		}
 		if (!(c & SD_CTL_DMA_START)) {
-			if (dma_trace && t)
-				dev_info(chip->dev, "dma: SD 0x%03x stopped after ~%d us (%s)\n",
-					 base, t * 10, why);
+			if (t)
+				ae9_dbg(chip, "dma: SD 0x%03x stopped after ~%d us (%s)\n",
+					base, t * 10, why);
 			return true;
 		}
 		udelay(10);
@@ -138,13 +128,20 @@ static bool ae9_bdl_may_free(struct creative_chip *chip, unsigned int base,
 	return false;
 }
 
+/*
+ * debug=1: log every stream's buffer and BDL address at prepare, for
+ * matching an IOMMU IO_PAGE_FAULT address to a stream (the 2026-11-13
+ * rapid-SBX hang: 8-byte writes to an unmapped address ~70 ms after the
+ * first command timeout; the dma_trace option until 0.12.15). The stop
+ * check above and the dump below run always.
+ */
 static void ae9_dma_trace_prep(struct creative_chip *chip, const char *what, unsigned int base,
 			       struct snd_pcm_substream *substream, dma_addr_t bdl)
 {
 	struct snd_pcm_runtime *rt = substream->runtime;
 	size_t n = snd_pcm_lib_buffer_bytes(substream);
 
-	if (!dma_trace)
+	if (!ae9_debug)
 		return;
 	dev_info(chip->dev, "dma: %s SD 0x%03x buffer 0x%llx-0x%llx (%zu bytes, %u ch, %u Hz), BDL 0x%llx\n",
 		 what, base, (unsigned long long)rt->dma_addr,
@@ -754,7 +751,7 @@ static const struct snd_kcontrol_new spdif_out_control = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Native DSD64 (experimental, pcm_dsd=1)				  */
+/* Native DSD64 (pcm_dsd, on by default since 0.12.15)		  */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -776,11 +773,12 @@ static const struct snd_kcontrol_new spdif_out_control = {
  * channels at 88200 (ALSA's DSD64 rate for 32-bit words), in Direct Mode,
  * without mmap (each 8-byte ALSA frame becomes a 12-byte link frame: the
  * copy op below). Enter and leave follow Windows' order (ae9_dsd_enter(),
- * ae9_dsd_exit()). Off by default until card-tested; read at stream open.
+ * ae9_dsd_exit()). On by default since 0.12.15 (opt-in in 0.12.14, until
+ * card-tested); pcm_dsd=0 turns it off. Read at stream open.
  */
-static bool pcm_dsd;
+static bool pcm_dsd = true;
 module_param(pcm_dsd, bool, 0644);
-MODULE_PARM_DESC(pcm_dsd, "EXPERIMENTAL: native DSD64 on playback device 0 (DSD_U32_BE, 2 ch, rate 88200, no mmap; Direct Mode only, card RCA out and headphones); 0 = off (default). Read at stream open");
+MODULE_PARM_DESC(pcm_dsd, "Native DSD64 on playback device 0 (DSD_U32_BE, 2 ch, rate 88200, no mmap; Direct Mode only, card RCA out and headphones); 1 = on (default), 0 = off (DSD_U32_BE not offered). Read at stream open");
 
 #define AE9_DSD_RATE		88200	/* ALSA's DSD64 rate for 32-bit DSD words */
 #define AE9_DSD_FMT		0x4815	/* SDnFMT: 44.1 kHz x 2, 16 bit, 6 channels */
@@ -872,7 +870,7 @@ static bool ae9_pcm_is_dsd(const struct snd_pcm_runtime *runtime)
 
 /*
  * The copy and silence ops (the DSD ops table only, so only streams opened
- * with pcm_dsd=1 use them): DSD repacked into the link frame at 12/8 the
+ * with pcm_dsd on use them): DSD repacked into the link frame at 12/8 the
  * offset; anything else as ALSA's own default_write_copy() and silence.
  */
 static int creative_ae9_pcm_copy(struct snd_pcm_substream *substream, int channel,
@@ -919,6 +917,23 @@ static bool ae9_dsd_only(const struct snd_pcm_hw_params *params)
 
 	return snd_mask_test_format(f, SNDRV_PCM_FORMAT_DSD_U32_BE) &&
 	       !snd_mask_test_format(f, SNDRV_PCM_FORMAT_S32_LE);
+}
+
+/*
+ * DSD: all 32 bits of a DSD_U32_BE word are DSD data. The open's msbits
+ * constraint (24 PCM bits) goes by the sample width alone, and DSD_U32_BE
+ * is 32 bits wide too, so DSD streams said 24 significant bits (aplay -v,
+ * mpd). Once the format is DSD only, no msbits: the core then reports the
+ * format's width, 32. Added after that constraint and on the same
+ * SAMPLE_BITS dependency, so it runs after it on every pass it does, and
+ * again when the format narrows; PCM and a mixed format mask keep the
+ * constraint's value.
+ */
+static int ae9_rule_dsd_msbits(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	if (ae9_dsd_only(params))
+		params->msbits = 0;
+	return 0;
 }
 
 /* DSD: no other rate or channel count (rule->private: 88200 or 2) */
@@ -968,20 +983,21 @@ static int ae9_rule_dsd_buffer(struct snd_pcm_hw_params *params, struct snd_pcm_
 
 	if (!ae9_dsd_only(params))
 		return 0;
-	lo = b->min + (b->openmin ? 1 : 0);
-	hi = min_t(unsigned int, b->max - (b->openmax && b->max ? 1 : 0),
-		   CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME);
-	if (lo > UINT_MAX - AE9_DSD_PERIOD_STEP)
-		return -EINVAL;
-	snd_interval_any(&t);
-	t.min = roundup(lo, AE9_DSD_PERIOD_STEP);
 	/* the cap itself in 8 x 32 frames, so the largest buffer splits into
 	 * 2, 4 or 8 whole periods: 21824 (32 x 682) only made 2, and mpd, asking
 	 * for 4 (buffer_time / 4), got 2 of 124 ms, fed a quarter buffer per
 	 * wakeup and ran it to 30 frames from empty: a click every period (card
-	 * test 2026-11-19). 21760 = 8 x 2720. */
-	if (hi >= CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME)
-		hi = rounddown(CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME, AE9_DSD_PERIOD_STEP * 8);
+	 * test 2026-11-19). 21760 = 8 x 2720. For every upper end above it, not
+	 * only the preallocated size: an end between 21761 and 21844 (a buffer
+	 * limit set before the format) rounded down to 21792 (3 periods) or
+	 * 21824 (2) (review 2026-11-20). */
+	lo = b->min + (b->openmin ? 1 : 0);
+	hi = min_t(unsigned int, b->max - (b->openmax && b->max ? 1 : 0),
+		   rounddown(CREATIVE_PCM_BUF_MAX / AE9_DSD_HW_FRAME, AE9_DSD_PERIOD_STEP * 8));
+	if (lo > UINT_MAX - AE9_DSD_PERIOD_STEP)
+		return -EINVAL;
+	snd_interval_any(&t);
+	t.min = roundup(lo, AE9_DSD_PERIOD_STEP);
 	t.max = rounddown(hi, AE9_DSD_PERIOD_STEP);
 	t.integer = 1;
 	return snd_interval_refine(b, &t);
@@ -1018,6 +1034,200 @@ static int ae9_rule_dsd_format(struct snd_pcm_hw_params *params, struct snd_pcm_
 	return snd_mask_refine(f, &m);
 }
 
+/*
+ * Whole periods, for every stream with a BDL (playback, optical out, the
+ * captures): the buffer is periods x period, one BDL entry per period, each
+ * a whole number of rule->private bytes (128: the boundary the HD-Audio spec
+ * wants a BDL entry's address on). So the buffer sizes that can be met are
+ * a sparse lattice, not a range. ALSA's own rule sees BUFFER_SIZE =
+ * PERIOD_SIZE x PERIODS only as the product of two ranges, and while both
+ * are open an end of the buffer range can sit on a size no split reaches
+ * (S32_LE stereo: 17648 frames = 16 x 1103, 1103 prime).
+ * snd_pcm_hw_params_set_buffer_time_near() and _size_near() take an end of
+ * the range, so they failed with EINVAL: 108 of 471 buffer times from 12 to
+ * 247 ms at 88.2 kHz (111 in DSD), mpd's buffer_time 200000 among them
+ * (card test 2026-11-19).
+ *
+ * This rule moves each end of the buffer range inward to the nearest size
+ * that a whole number of periods inside the current period and periods
+ * ranges makes, so near() lands on the closest buffer that can be met. It
+ * only removes sizes nothing can make, so a request that negotiated before
+ * gets the same result, with two exceptions (harness, 2026-11-20): just
+ * below the largest buffer near() now sees one size above the request and
+ * takes it outright (alsa-lib does that when that side is a single value:
+ * 32737-32743 frames give 32768, not 32736), and a client that reads a
+ * range end reads one it can get (What U Hear 6 ch offered 10922 frames,
+ * which no split makes). The period and periods ends need no such rule:
+ * they are quotients, and the integer rounding of BUFFER_SIZE / PERIODS and
+ * BUFFER_SIZE / PERIOD_SIZE already settles them on values a split reaches.
+ *
+ * The period step in frames: the alignment over the frame size's largest
+ * power-of-two factor (S32_LE 2 or 6 ch: 16 frames; S16_LE stereo: 32), and
+ * AE9_DSD_PERIOD_STEP for DSD (powers of two, so the larger is a multiple
+ * of both). 1 while the frame size is still open: still correct, less tight.
+ *
+ * Playback (AE9_WP_PLAYBACK) also steers buffer-first clients to 4 periods.
+ * mpd asks for a buffer time, then a quarter of what it got as the period;
+ * at 44.1 kHz its default 500 ms landed on 22048 frames, which only 2
+ * periods make (22048 / 16 = 1378 = 2 x 13 x 53), so it got 2 of 250 ms,
+ * and at times ran the buffer down to 29 frames from empty. The DMA reads
+ * ~0.7 ms ahead of the position the pointer reports, so below that it plays
+ * audio it fetched before mpd wrote it: a crackle and no xrun (card test
+ * 2026-11-20; the DSD64 clicks the 21760 cap fixed were the same). 3
+ * periods leaves such a client a third of the buffer at the wakeup it
+ * counts on, and mpd and aplay ask for 4, so the target is 4.
+ *
+ * So an end that the buffer range's own bound sets (a buffer request, or
+ * the size cap at the top) moves on to the nearest size 4 periods make, if
+ * that is less than one 4-period step away (4 x the period step: 64 frames
+ * for S32_LE stereo): near() looks at the ends either side of the request,
+ * so it lands on a 4-period size, and the quarter period mpd asks for next
+ * is exactly one. Further than a step, the end stays where it was: below
+ * 4 x the smallest period (4096 bytes: 46 ms at 44.1 kHz S32_LE stereo, up
+ * to 93 ms for S16_LE optical) the nearest 4-period size is far above a
+ * small request, and moving the end to it made near() take a 2-period size
+ * under the request (48 kHz buffer_size_near(1920): 1888 = 2 x 944 instead
+ * of 1920 = 3 x 640). Small buffers negotiate as without this.
+ *
+ * Moving an end removes the sizes it passes over from the range for good
+ * (a refine never widens it again): up to 4 period steps per end, so an
+ * explicit set_buffer_size_min()/_max() or _time_min()/_max() pair that
+ * leaves only such sizes, which a near() probe can't be told from inside a
+ * refine, can now fail with EINVAL. At 6 ch the cap moves the top from
+ * 10912 (2 x 5456) to 10880 (4 x 2720), so 10881-10912 are gone outright:
+ * set_buffer_size(10912) and set_period_size(5456) fail there. No client
+ * modelled (PipeWire, PulseAudio, mpd, aplay, speaker-test, Kodi,
+ * GStreamer, mpv, ffmpeg, RetroArch, snd_pcm_set_params, JACK, SDL, OpenAL
+ * Soft, Wine) calls in such an order. Sizes between the ends stay. It is
+ * left out where it would take a count or a period away from a client:
+ * - the periods range already below 4 (set_periods 2, PipeWire's
+ *   period-num=2 and its IRQ mode's 3, pcm_periods 2 or 3);
+ * - an end that the period and periods ranges set (b_lo at the smallest
+ *   period x the fewest periods, b_hi at the largest x the most): moving it
+ *   would cut periods off a client that picked its period first (PipeWire's
+ *   1024 frames then period-num=2 must still give 2 x 1024);
+ * - a move that would narrow the periods range ALSA derives from the end.
+ * Exactly 4, not 4 or more: a size only 5 or 7 periods make left mpd's
+ * period_time_near() a single value above its request, which alsa-lib takes
+ * outright, and it ended on 2. The same shortcut works the other way for a
+ * client that sets the buffer, then an explicit period: a 4-period buffer
+ * often has only 2 x as the next split above a period between B/4 and B/2
+ * (PulseAudio with tsched=0 and default-fragments=3, 25 ms: 2 periods on 21
+ * of 25 streams, 4 before; its default timer-based path is unaffected).
+ * Captures keep the plain rule (the read-ahead is a playback matter).
+ */
+
+/* rule->private of ae9_rule_whole_periods: the alignment in bytes (a power
+ * of two, at most 128), plus AE9_WP_PLAYBACK on the playback streams */
+#define AE9_WP_ALIGN		0xffffUL
+#define AE9_WP_PLAYBACK		0x10000UL
+#define AE9_PLAY_PERIODS	4
+
+/* the smallest buffer of at least b_lo and the largest of at most b_hi that
+ * k_lo..k_hi whole periods of p_lo..p_hi frames (in @step steps) make; *lo
+ * > *hi when there is none */
+static void ae9_split_ends(u64 b_lo, u64 b_hi, u64 p_lo, u64 p_hi, u64 step,
+			   unsigned int k_lo, unsigned int k_hi, u64 *lo, u64 *hi)
+{
+	unsigned int k;
+
+	*lo = U64_MAX;
+	*hi = 0;
+	/* per period count k: the smallest period that makes at least b_lo
+	 * and the largest that keeps to b_hi, both in whole steps */
+	for (k = k_lo; k <= k_hi; k++) {
+		u64 small = max(p_lo, round_up(div_u64(b_lo + k - 1, k), step));
+		u64 big = min(p_hi, round_down(div_u64(b_hi, k), step));
+
+		if (small > big)
+			continue;
+		*lo = min(*lo, small * k);
+		*hi = max(*hi, big * k);
+	}
+}
+
+/* the fewest periods (@least) a buffer of @b frames needs with periods up to
+ * @p frames, or the most it takes with periods of at least @p (0: no
+ * limit), inside the current count limit @n: what ALSA's PERIODS =
+ * BUFFER_SIZE / PERIOD_SIZE rule makes of a buffer range end */
+static unsigned int ae9_counts(u64 b, u64 p, unsigned int n, bool least)
+{
+	if (least)
+		return max_t(u64, n, div_u64(b + p - 1, (u32)p));
+	return p ? min_t(u64, n, div_u64(b, (u32)p)) : n;
+}
+
+static int ae9_rule_whole_periods(struct snd_pcm_hw_params *params, struct snd_pcm_hw_rule *rule)
+{
+	struct snd_interval *b = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+	const struct snd_interval *p = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+	const struct snd_interval *n = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_PERIODS);
+	const struct snd_interval *fb = hw_param_interval_c(params, SNDRV_PCM_HW_PARAM_FRAME_BITS);
+	unsigned long how = (unsigned long)rule->private;
+	unsigned int align_bits = (how & AE9_WP_ALIGN) * 8;
+	unsigned int n_lo, n_hi;
+	u64 step = 1, p_lo, p_hi, b_lo, b_hi, lo, hi;
+	struct snd_interval t;
+
+	if (snd_interval_single(fb) && snd_interval_value(fb) > 0) {
+		unsigned int bits = snd_interval_value(fb);
+
+		step = align_bits / min(bits & -bits, align_bits);
+	}
+	if (ae9_dsd_only(params))
+		step = max_t(u64, step, AE9_DSD_PERIOD_STEP);
+
+	n_lo = max(n->min + n->openmin, 1U);
+	n_hi = n->max - (n->openmax && n->max ? 1 : 0);
+	if (n_hi < n_lo || n_hi - n_lo > 2 * CREATIVE_PCM_BDL_MAX)
+		return 0;	/* not narrowed to the hardware's counts yet */
+	p_lo = round_up((u64)p->min + p->openmin, step);
+	p_hi = round_down((u64)p->max - (p->openmax && p->max ? 1 : 0), step);
+	b_lo = (u64)b->min + b->openmin;
+	b_hi = (u64)b->max - (b->openmax && b->max ? 1 : 0);
+
+	ae9_split_ends(b_lo, b_hi, p_lo, p_hi, step, n_lo, n_hi, &lo, &hi);
+	if (lo > hi)
+		return -EINVAL;	/* no split at all */
+
+	/* playback, while the periods range still reaches 4: an end that the
+	 * buffer range's own bound sets moves on to the nearest size 4 periods
+	 * make, if it is less than one 4-period step away and leaves the
+	 * periods range as the plain end does (see above) */
+	if ((how & AE9_WP_PLAYBACK) && n_lo < AE9_PLAY_PERIODS && n_hi >= AE9_PLAY_PERIODS &&
+	    p_hi) {
+		u64 lo4, hi4;
+
+		ae9_split_ends(b_lo, b_hi, p_lo, p_hi, step, AE9_PLAY_PERIODS,
+			       AE9_PLAY_PERIODS, &lo4, &hi4);
+		if (lo4 <= hi4) {
+			if (b_lo > p_lo * n_lo && lo4 - lo < AE9_PLAY_PERIODS * step &&
+			    ae9_counts(lo4, p_hi, n_lo, true) == ae9_counts(lo, p_hi, n_lo, true))
+				lo = lo4;
+			if (b_hi < p_hi * n_hi && hi - hi4 < AE9_PLAY_PERIODS * step &&
+			    ae9_counts(hi4, p_lo, n_hi, false) == ae9_counts(hi, p_lo, n_hi, false))
+				hi = hi4;
+		}
+	}
+	snd_interval_any(&t);
+	t.min = lo;
+	t.max = hi;
+	t.integer = 1;
+	return snd_interval_refine(b, &t);
+}
+
+/* the rule above, for a stream whose periods are whole @align-byte steps
+ * (@align a power of two); @playback: steer buffer-first clients to 4 */
+static int ae9_whole_periods(struct snd_pcm_runtime *runtime, unsigned int align, bool playback)
+{
+	unsigned long how = align | (playback ? AE9_WP_PLAYBACK : 0);
+
+	return snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+				   ae9_rule_whole_periods, (void *)how,
+				   SNDRV_PCM_HW_PARAM_BUFFER_SIZE, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+				   SNDRV_PCM_HW_PARAM_PERIODS, SNDRV_PCM_HW_PARAM_FRAME_BITS, -1);
+}
+
 static int ae9_dsd_rules(struct snd_pcm_runtime *runtime)
 {
 	int err;
@@ -1043,6 +1253,12 @@ static int ae9_dsd_rules(struct snd_pcm_runtime *runtime)
 		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
 					  ae9_rule_dsd_buffer, NULL, SNDRV_PCM_HW_PARAM_FORMAT,
 					  SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
+	/* the whole-periods rule again when the format narrows to DSD (its
+	 * 32-frame step; the open's copy has no room for a fifth dependency) */
+	if (!err)
+		err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+					  ae9_rule_whole_periods, (void *)(128UL | AE9_WP_PLAYBACK),
+					  SNDRV_PCM_HW_PARAM_FORMAT, -1);
 	return err;
 }
 
@@ -1210,7 +1426,7 @@ static void ae9_dsd_enter(struct creative_chip *chip)
 	/* stage 3's end: no stream 0x14 enable in DSD, ASI 0x0f */
 	creative_ae9_dsd_asi_block(chip);
 
-	chip->dsd_active = true;
+	WRITE_ONCE(chip->dsd_active, true);	/* the trigger reads it */
 	chip->dsd_running = false;
 	chip->pcm_start_sent = 1;
 	chip->pcm_start_dsd = true;
@@ -1243,7 +1459,7 @@ static void ae9_dsd_exit(struct creative_chip *chip, const char *why)
 		{ AE9_DSD_DAC, ES9038_REG_SPDIF, 0x20 },
 	};
 
-	chip->dsd_active = false;
+	WRITE_ONCE(chip->dsd_active, false);
 	WRITE_ONCE(chip->dsd_running, false);
 	chip->pcm_start_sent = 0;
 	chip->pcm_start_dsd = false;
@@ -1291,31 +1507,96 @@ static void ae9_dsd_leave(struct creative_chip *chip, const char *why)
 
 /*
  * Something DSD can't stay on through (Direct Mode off, the output switch,
- * suspend, unload, reboot): a running DSD stream stopped as an xrun (the app
+ * suspend, unload, reboot): a DSD stream stopped as an xrun (the app
  * prepares it again: DSD again, or refused with Direct Mode off), then DSD
  * taken down. Process context; sleeps.
+ *
+ * Under dsd_mutex only, not the PCM's open_mutex: Direct Mode off calls this
+ * from a control put, under the card's controls_rwsem, and ALSA's PCM
+ * disconnect takes open_mutex, then controls_rwsem (to remove the chmap
+ * control). dsd_mutex is enough to keep the stream's runtime: DSD on means
+ * a prepare of chip->playback_substream turned it on, and that runtime is
+ * freed only after its hw_free, which takes dsd_mutex (ae9_dsd_leave())
+ * before DSD can go off. Lock order: open_mutex (release) -> dsd_mutex ->
+ * the stream lock; nothing that holds dsd_mutex takes open_mutex or
+ * controls_rwsem.
  */
 void creative_ae9_dsd_abort(struct creative_chip *chip, const char *why)
 {
 	struct snd_pcm_substream *ss;
 
-	if (!READ_ONCE(chip->dsd_active) || !chip->pcm)
+	if (!chip->pcm)
 		return;
-	mutex_lock(&chip->pcm->open_mutex);
+	/* under the mutex: a prepare entering DSD now holds it; Direct Mode
+	 * off, the output switch and the shutdown set their state before this,
+	 * and the prepare checks it under the mutex */
+	mutex_lock(&chip->dsd_mutex);
+	if (!chip->dsd_active) {
+		mutex_unlock(&chip->dsd_mutex);
+		return;
+	}
 	ss = chip->playback_substream;
-	if (ss && ss->runtime && ae9_pcm_is_dsd(ss->runtime))
-		snd_pcm_stop_xrun(ss);
-	ae9_dsd_leave(chip, why);
-	mutex_unlock(&chip->pcm->open_mutex);
+	if (ss && ss->runtime && ae9_pcm_is_dsd(ss->runtime)) {
+		/*
+		 * Running, draining (an app's end of playback), paused or only
+		 * prepared: all to XRUN (snd_pcm_stop_xrun() covers only the
+		 * first two; a prepared stream then started with DSD off:
+		 * silence and no error). DSD reads off for the trigger in the
+		 * same locked section: a prepare that entered DSD before this
+		 * and whose stream wasn't PREPARED yet, started now, gets
+		 * -EPIPE instead of running while DSD goes down below.
+		 */
+		snd_pcm_stream_lock_irq(ss);
+		if (snd_pcm_running(ss) ||
+		    ss->runtime->state == SNDRV_PCM_STATE_PREPARED ||
+		    ss->runtime->state == SNDRV_PCM_STATE_PAUSED)
+			snd_pcm_stop(ss, SNDRV_PCM_STATE_XRUN);
+		WRITE_ONCE(chip->dsd_active, false);
+		snd_pcm_stream_unlock_irq(ss);
+	}
+	ae9_dsd_exit(chip, why);
+	mutex_unlock(&chip->dsd_mutex);
 }
 
 /* DSD prepare, after the stream descriptor: the buffer DSD silence, DSD on
  * once per open (as the PCM start block), no optical mirror */
 static int ae9_dsd_prepare(struct creative_chip *chip, struct snd_pcm_runtime *runtime)
 {
+	unsigned long until = jiffies + msecs_to_jiffies(3000);
+
 	ae9_dsd_silence(runtime->dma_area, runtime->buffer_size);
 	wmb();
-	mutex_lock(&chip->dsd_mutex);
+	/*
+	 * An output switch stopped this stream: start again once it's done (it
+	 * takes ~1 s), on the new output. Checked again under dsd_mutex: Direct
+	 * Mode off, an output switch and the shutdown set their state before
+	 * their abort takes this mutex, so either they see DSD on and take it
+	 * down, or this sees them. At most 3 s in all, so a stuck switch can't
+	 * hold the app (-EBUSY then, as with Direct Mode off; the app's next
+	 * prepare tries again), and a signal ends the wait (the prepare is
+	 * restarted, or the app gets -EINTR): this holds ALSA's link rwsem.
+	 */
+	for (;;) {
+		if (READ_ONCE(chip->dsd_switching)) {
+			long left = (long)(until - jiffies);
+
+			if (left > 0 &&
+			    wait_event_interruptible_timeout(chip->dsd_wq,
+							     !READ_ONCE(chip->dsd_switching),
+							     left) < 0)
+				return -ERESTARTSYS;
+		}
+		mutex_lock(&chip->dsd_mutex);
+		if (!READ_ONCE(chip->fx.direct) || READ_ONCE(chip->unloading)) {
+			mutex_unlock(&chip->dsd_mutex);
+			return -EBUSY;
+		}
+		if (!READ_ONCE(chip->dsd_switching))
+			break;
+		mutex_unlock(&chip->dsd_mutex);
+		if (time_after_eq(jiffies, until))
+			return -EBUSY;
+	}
 	/* on, but the start marked unsent since (a bring-up, a mode switch):
 	 * off first, so the enter saves the state from before DSD again */
 	if (chip->dsd_active && !(chip->pcm_start_sent && chip->pcm_start_dsd))
@@ -1336,6 +1617,7 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	/* DSD64: pcm_dsd, Direct Mode, and 88.2 kHz offered */
 	bool dsd = pcm_dsd && chip->fx.direct && pcm_rates == 2;
+	int err;
 
 	chip->substream = substream;
 	chip->playback_substream = substream;
@@ -1414,6 +1696,10 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 128);
 	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 128);
+	/* and the buffer range's ends only on sizes such a split makes */
+	err = ae9_whole_periods(runtime, 128, true);
+	if (err < 0)
+		goto fail;
 	chip->pcm_bits = pcm_bits == 32 ? 32 : 24;
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, chip->pcm_bits);
 	chip->pcm_start_sent = 0;
@@ -1424,22 +1710,26 @@ static int creative_ae9_pcm_open(struct snd_pcm_substream *substream)
 	 * DSD read/write). Without pcm_dsd the stream keeps the plain ops.
 	 */
 	if (dsd) {
-		int err;
-
 		substream->ops = &creative_ae9_pcm_dsd_ops;
 		runtime->hw.formats |= SNDRV_PCM_FMTBIT_DSD_U32_BE;
 		err = ae9_dsd_rules(runtime);
-		if (err < 0) {
-			chip->substream = NULL;
-			chip->playback_substream = NULL;
-			return err;
-		}
-		ae9_dbg(chip, "DSD64: playback open offers DSD_U32_BE (pcm_dsd=1)\n");
+		if (err < 0)
+			goto fail;
+		err = snd_pcm_hw_rule_add(runtime, 0, -1, ae9_rule_dsd_msbits, NULL,
+					  SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_HW_PARAM_SAMPLE_BITS, -1);
+		if (err < 0)
+			goto fail;
+		ae9_dbg(chip, "DSD64: playback open offers DSD_U32_BE (pcm_dsd on)\n");
 	} else {
 		substream->ops = &creative_ae9_pcm_ops;
 	}
 
 	return 0;
+
+fail:
+	chip->substream = NULL;
+	chip->playback_substream = NULL;
+	return err;
 }
 
 static int creative_ae9_pcm_close(struct snd_pcm_substream *substream)
@@ -1487,8 +1777,21 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (substream->ops->copy) {
 		if (params_format(hw_params) == SNDRV_PCM_FORMAT_DSD_U32_BE)
 			ae9_dsd_silence(substream->runtime->dma_area, params_buffer_size(hw_params));
-		else
-			memset(substream->runtime->dma_area, 0, substream->runtime->dma_bytes);
+		else {
+			/* as snd_pcm_hw_params() does without a copy op: whole
+			 * pages for mmap, so a client sees no earlier stream's
+			 * audio past dma_bytes. The refined params' info, not
+			 * runtime->info: the core sets that only after this op
+			 * returns (0 at an open's first hw_params) */
+			struct snd_pcm_runtime *rt = substream->runtime;
+			size_t n = rt->dma_bytes;
+
+			if (hw_params->info & SNDRV_PCM_INFO_MMAP)
+				n = PAGE_ALIGN(n);
+			if (rt->dma_buffer_p)
+				n = min_t(size_t, n, rt->dma_buffer_p->bytes);
+			memset(rt->dma_area, 0, n);
+		}
 	}
 
 	alloc_size = ae9_dma_size(chip, CREATIVE_PCM_BDL_SIZE + 128);
@@ -1525,9 +1828,10 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 	 * re-prepare would otherwise leave node 0x02 unbound) */
 	chip->pb_format = 0;
 	ae9_spdif_out_apply(chip);	/* mirror off (unless optical has its own) */
-	/* DSD64: its own stop (clears pcm_start_sent: no PCM stop block) */
-	if (chip->dsd_active)
-		ae9_dsd_leave(chip, "stream released");
+	/* DSD64: its own stop (clears pcm_start_sent: no PCM stop block).
+	 * Always through dsd_mutex, also with DSD off: an abort in progress
+	 * uses this stream's runtime under it (creative_ae9_dsd_abort()) */
+	ae9_dsd_leave(chip, "stream released");
 	if (chip->pcm_start_sent) {
 		creative_ae9_playback_seq(chip, false, 0, 0);
 		chip->pcm_start_sent = 0;
@@ -1573,10 +1877,13 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	dma_addr_t addr;
 	int i;
 
-	if (creative_ae9_dead(chip))	/* the card stopped answering */
+	/* the card stopped answering, or the driver is going away (reboot,
+	 * unload: the player's restart after the DSD abort mustn't start
+	 * DSD again beside the shutdown) */
+	if (creative_ae9_dead(chip) || READ_ONCE(chip->unloading))
 		return -ENODEV;
 	/* DSD64: Direct Mode only (it was on at open; it went off since) */
-	if (dsd && !chip->fx.direct) {
+	if (dsd && !READ_ONCE(chip->fx.direct)) {
 		dev_info_ratelimited(chip->dev, "DSD64: refused, Direct Mode is off (native DSD plays in Direct Mode only)\n");
 		return -EBUSY;
 	}
@@ -1690,10 +1997,16 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int base = chip->playback_stream_base;
 	/* DSD64: the I2S output follows the stream (ae9_dsd_run()) */
-	bool dsd = ae9_pcm_is_dsd(substream->runtime) && chip->dsd_active;
+	bool dsd = ae9_pcm_is_dsd(substream->runtime) && READ_ONCE(chip->dsd_active);
 
 	if (cmd == SNDRV_PCM_TRIGGER_START && creative_ae9_dead(chip))
 		return -ENODEV;
+	/* a DSD stream whose DSD went off after its prepare (an abort raced
+	 * it): an xrun, so the app prepares again, instead of silence */
+	if ((cmd == SNDRV_PCM_TRIGGER_START || cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE ||
+	     cmd == SNDRV_PCM_TRIGGER_RESUME) &&
+	    ae9_pcm_is_dsd(substream->runtime) && !dsd)
+		return -EPIPE;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -1768,7 +2081,7 @@ static const struct snd_pcm_ops creative_ae9_pcm_ops = {
 	.pointer	= creative_ae9_pcm_pointer,
 };
 
-/* the same with the DSD copy and silence ops: streams opened with pcm_dsd=1 */
+/* the same with the DSD copy and silence ops: streams opened with pcm_dsd on */
 static const struct snd_pcm_ops creative_ae9_pcm_dsd_ops = {
 	.open		= creative_ae9_pcm_open,
 	.close		= creative_ae9_pcm_close,
@@ -1794,6 +2107,7 @@ static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	int err;
 
 	chip->opt_substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
@@ -1817,7 +2131,10 @@ static int creative_ae9_opt_open(struct snd_pcm_substream *substream)
 	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 128);
 	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 128);
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
-	return 0;
+	err = ae9_whole_periods(runtime, 128, true);	/* as playback */
+	if (err < 0)
+		chip->opt_substream = NULL;
+	return err;
 }
 
 static int creative_ae9_opt_close(struct snd_pcm_substream *substream)
@@ -2146,6 +2463,7 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	int err;
 
 	chip->capture_substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
@@ -2170,6 +2488,12 @@ static int creative_ae9_cap_open(struct snd_pcm_substream *substream)
 	runtime->hw.periods_max = CREATIVE_CAP_BDL_MAX;
 	snd_pcm_hw_constraint_msbits(runtime, 0, 32, cap_bits_now());
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	/* whole periods (any frame count here): buffer ends as playback */
+	err = ae9_whole_periods(runtime, 1, false);
+	if (err < 0) {
+		chip->capture_substream = NULL;
+		return err;
+	}
 	chip->cap_start_sent = 0;
 	return 0;
 }
@@ -2456,6 +2780,7 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	unsigned int i = ae9_xcap_idx(substream);
 	const struct ae9_xcap *x = &ae9_xcaps[i];
+	int err;
 
 	chip->xcap[i].substream = substream;
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
@@ -2494,7 +2819,10 @@ static int creative_ae9_xcap_open(struct snd_pcm_substream *substream)
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	/* whole periods; BDL entries want 128-byte aligned addresses */
 	snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 128);
-	return 0;
+	err = ae9_whole_periods(runtime, 128, false);	/* buffer ends as playback */
+	if (err < 0)
+		chip->xcap[i].substream = NULL;
+	return err;
 }
 
 static int creative_ae9_xcap_close(struct snd_pcm_substream *substream)

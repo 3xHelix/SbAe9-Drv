@@ -408,11 +408,18 @@ static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
  * dropped from the watch (safe: it still holds the mark). Nothing here needs
  * the card to write its entries in order. Never seen on a real card so far
  * (rirb_never 0 in every run, worst lateness 8 us of the 200 waited);
- * rirb_inject exercises it.
+ * rirb_inject (a test build's) exercises it.
  */
 #define RIRB_DIST(a, b)		(((b) - (a)) & 0xff)
 #define RIRB_WATCH_GUARD	128
 
+/*
+ * The test hooks (here rirb_inject, rirb_inject_us and hung_inject; in
+ * dsp.c dsp_fail_inject and scp_full_inject) exist only in a test build,
+ * make AE9_TEST=1 (docs/OPTIONS.md). A release build has neither the
+ * options nor their code.
+ */
+#ifdef AE9_TEST
 static unsigned int rirb_inject;
 module_param(rirb_inject, uint, 0644);
 MODULE_PARM_DESC(rirb_inject, "Test (needs debug=1): after start-up, every Nth landed RIRB entry is hidden (its slot marked again) for rirb_inject_us and given up on, then put back, as an entry landing far too late: the late-entry watch must find it (0 = off)");
@@ -420,6 +427,7 @@ static unsigned int rirb_inject_us = 300;
 module_param(rirb_inject_us, uint, 0644);
 MODULE_PARM_DESC(rirb_inject_us, "Test: how long rirb_inject hides an entry (us, default 300; over 100000 = its verb times out; dropped, as never landed, once the ring has moved 128 entries past it)");
 static unsigned int rirb_inject_n;
+#endif
 
 /* a slot seen landed: read it and mark it */
 static u32 rirb_consume(struct creative_rirb_entry *rirb, u16 i)
@@ -433,6 +441,7 @@ static u32 rirb_consume(struct creative_rirb_entry *rirb, u16 i)
 	return res;
 }
 
+#ifdef AE9_TEST
 /* rirb_inject: take a landed entry back out of its slot (marked again) */
 static bool rirb_inject_hide(struct creative_chip *chip, struct creative_rirb_entry *rirb,
 			     u16 i, u32 fl)
@@ -450,8 +459,16 @@ static bool rirb_inject_hide(struct creative_chip *chip, struct creative_rirb_en
 	chip->rirb_held_until = ktime_add_us(ktime_get(), rirb_inject_us);
 	return true;
 }
+#else
+static inline bool rirb_inject_hide(struct creative_chip *chip, struct creative_rirb_entry *rirb,
+				    u16 i, u32 fl)
+{
+	return false;
+}
+#endif
 
-/* ...and put it back once its time is up: it "lands" now */
+/* ...and put it back once its time is up: it "lands" now (built in every
+ * build: without a test build's rirb_inject, rirb_held stays -1) */
 static void rirb_inject_release(struct creative_chip *chip, struct creative_rirb_entry *rirb)
 {
 	int i = chip->rirb_held;
@@ -676,9 +693,25 @@ void creative_ae9_corb_scan_unsol(struct creative_chip *chip)
  */
 #define CARD_HUNG_RUN	8
 
+#ifdef AE9_TEST
 static unsigned int hung_inject;
 module_param(hung_inject, uint, 0644);
 MODULE_PARM_DESC(hung_inject, "Test (needs debug=1): the next N commands after start-up count as timed out without being sent, to exercise the 'card stopped answering' stop (counts down to 0)");
+
+/* hung_inject: true = this command counts as timed out, unsent */
+static bool hung_inject_take(struct creative_chip *chip)
+{
+	if (!hung_inject || !ae9_debug || !chip->dsp_done)
+		return false;
+	hung_inject--;
+	return true;
+}
+#else
+static inline bool hung_inject_take(struct creative_chip *chip)
+{
+	return false;
+}
+#endif
 
 static void ae9_corb_hung_check(struct creative_chip *chip, u32 verb)
 {
@@ -872,8 +905,7 @@ static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *re
 		mutex_unlock(&chip->corb_mutex);
 		return -ENODEV;
 	}
-	if (hung_inject && ae9_debug && chip->dsp_done) {
-		hung_inject--;
+	if (hung_inject_take(chip)) {
 		dev_err(chip->dev, "CORB verb response timeout (verb=0x%08x, injected)\n", verb);
 		chip->corb_timeouts++;
 		creative_ae9_health_notify(chip);

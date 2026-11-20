@@ -66,8 +66,17 @@ echo "# driver $(cat /sys/module/snd_hda_codec_creative_ae9/version) $(cat /sys/
 
 sec "ALSA playback stream"
 for f in hw_params sw_params status; do echo "--- $f"; cat /proc/asound/AE9/pcm0p/sub0/$f; done
-sec "ALSA capture stream"
-cat /proc/asound/AE9/pcm0c/sub0/hw_params /proc/asound/AE9/pcm0c/sub0/status 2>/dev/null
+sec "ALSA capture streams and optical out"
+# every recording device and the optical out (the driver's device numbers),
+# "closed" when nothing has it open
+for d in "0c head unit mic (XLR/TRS jack + 3.5 mm mic jack)" "1c optical in" "2c What U Hear" \
+	 "3c head unit rear RCA in" "4p optical out"; do
+	n=${d%% *}
+	f=/proc/asound/AE9/pcm$n/sub0
+	echo "--- hw:AE9,${n%?} ${d#* }"
+	if [ "$(cat $f/status 2>/dev/null)" = closed ] || [ ! -r $f/status ]; then echo closed
+	else cat $f/hw_params $f/status 2>/dev/null; fi
+done
 
 sec "ALSA controls"
 # one line per control: name + values (enum item lists dropped; pairing lines two at a time broke on them)
@@ -92,6 +101,7 @@ echo "--- links into the AE-9 outputs (pw-link)"
 [ -n "$ae9pci" ] && asuser pw-link -l 2>/dev/null |
 	awk -v t="alsa_output.pci-$ae9pci." 'index($0, t) == 1 && /:playback_/ {p = 1; print; next}
 		/^ / && p {print; next} {p = 0}'
+echo "--- PipeWire clock settings (pw-metadata settings: rate, quantum)"
 asuser pw-metadata -n settings 0 2>/dev/null | grep -E "rate|quantum"
 # every running node from pw-top's second sample: a driver (a clock) first,
 # its followers under it ("+", "="); ERR = that node's xruns since it started
@@ -128,12 +138,24 @@ else echo "--- IOMMU: off (no group for the card)"; fi
 echo "--- PCI path (card first, then each bridge up to the root port)"
 for d in $(echo "$DEV" | tr / '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' | tac); do
 	s=/sys/bus/pci/devices/$d
-	lspci -vvv -s "$d" 2>/dev/null | grep -E "^[0-9a-f]|LnkCap:|LnkCtl:|LnkSta:|DevSta:|MSI: Enable|Status: D[0-3]|Kernel driver"
+	lspci -vvv -s "$d" 2>/dev/null | grep -E "^[0-9a-f]|LnkCap:|LnkCtl:|LnkSta:|DevSta:|UESta:|CESta:|MSI: Enable|Status: D[0-3]|Kernel driver"
 	echo "	power: runtime $(cat $s/power/runtime_status 2>/dev/null), control $(cat $s/power/control 2>/dev/null)"
 	for a in correctable nonfatal fatal; do
 		[ -r "$s/aer_dev_$a" ] && printf '\tAER %s: %s\n' $a "$(grep -E '^TOTAL' "$s/aer_dev_$a" | cut -d' ' -f2)"
 	done
+	# the port services the kernel bound (pcieNNN: ...01 PME, ...02 AER,
+	# ...04 hotplug, ...08 DPC, ...10 link bandwidth); only a root port's
+	# own AER service counts errors, for every device below it
+	svc=$(ls -d /sys/bus/pci_express/devices/"$d":pcie* 2>/dev/null | sed 's/.*:pcie//' | tr '\n' ' ')
+	[ -n "$svc" ] && printf '\tport services: %s\n' "$svc"
 done
+# the AER counts above only move when the root port has the AER service
+root=$(echo "$DEV" | tr / '\n' | grep -E '^[0-9a-f]{4}:[0-9a-f]{2}:' | head -1)
+if ls -d /sys/bus/pci_express/devices/"$root":pcie?02 >/dev/null 2>&1; then
+	echo "--- AER: on (root port $root has the AER service; the counts above are live)"
+else
+	echo "--- AER: off for this card (no AER service on root port $root: no AER capability there, the firmware kept AER, or pci=noaer): the AER counts above can't move; UESta/CESta (lspci) still show error bits"
+fi
 
 sec "HDA controller and playback stream SD4 (BAR0)"
 for o in 0x08 0x0c 0x0e 0x20 0x24 0x40 0x4c 0x58 0x5c 0x100 0x104 0x108 0x10c 0x110 0x118 0x11c; do
@@ -141,8 +163,10 @@ for o in 0x08 0x0c 0x0e 0x20 0x24 0x40 0x4c 0x58 0x5c 0x100 0x104 0x108 0x10c 0x
 done
 echo "--- SD4 position x3 (should change while playing)"
 for i in 1 2 3; do dbg "r0 0x104" | grep -o '0x[0-9a-f]*$'; sleep 0.2; done | tr '\n' ' '; echo
-echo "--- capture streams: SD0 (mic / line-in), SD1 (optical in), SD2 (What U Hear)"
-for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
+echo "--- capture streams: SD0 (hw:AE9,0 head unit mic: XLR/TRS + 3.5 mm mic jack), SD1 (hw:AE9,1 optical in), SD2 (hw:AE9,2 What U Hear), SD3 (hw:AE9,3 head unit rear RCA in)"
+for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0 0xe0 0xe4 0xe8 0xf0; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
+echo "--- optical out stream SD6 (hw:AE9,4)"
+for o in 0x140 0x144 0x148 0x14c 0x150; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
 
 sec "Card registers (BAR2, the ones the driver logs at bring-up)"
 for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
@@ -150,8 +174,15 @@ for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(d
 # ChipIO reads go through codec 1 one verb at a time; hundreds of them
 # (the router scan) while audio plays killed codec 1 on 2026-11-07 22:30
 # (CORB timeouts, IOMMU faults, PSU cycle needed). Skip them while any AE-9
-# stream runs; ALLOW_PLAYING_CHIPIO=1 forces them.
-playing=$(grep -ls "^state: RUNNING" /proc/asound/AE9/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
+# stream runs (DRAINING too: its DMA still runs); ALLOW_PLAYING_CHIPIO=1
+# forces them.
+# Not consistent with the debugfs state above, which reads always (~300
+# ChipIO and ~80 router XRAM reads, through the driver's locks): the
+# 2026-11-07 death predates the RIRB fix (0.12.10) that turned out to be
+# behind the reads' "wear", and since then about 20 dumps read the state
+# while audio played without a problem. Kept until a card test shows the
+# scan below is safe while playing too.
+playing=$(grep -lsE "^state: (RUNNING|DRAINING)" /proc/asound/AE9/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
 if [ -n "$playing" ] && [ "${ALLOW_PLAYING_CHIPIO:-0}" != 1 ]; then
 sec "ChipIO sections skipped"
 echo "skipped: AE-9 stream(s) running ($playing). Stop playback and dump again for them."
@@ -161,7 +192,7 @@ for a in 0x189000 0x189004 0x189008 0x189024 0x189028 0x18b008 0x18a020 0x18a024
 	printf '%-9s %s\n' "$a" "$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')"
 done
 
-sec "ChipIO: I2S output check and power registers (names from Creative's Windows driver)"
+sec "ChipIO: I2S output check and power registers"
 # Windows' I2S DAC check (for its I2S-DAC cards) wants 0x189030 = 0x82 and
 # 0x18902c = 3. A healthy AE-9 reads 0x81 / 0xf instead (2026-11-06, idle,
 # audio fine; 0x81 = the rate class the 0x725 request sets for 44.1-192 kHz),
@@ -210,8 +241,8 @@ fi
 sec "Codec converter state (GET verbs; replies in the log section below)"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 # codec 1: DACs 0x02-0x04, 0x05, mic ADC 0x07, What U Hear ADC 0x0a;
-# codec 2: optical out 0x05, optical in 0x09
-for cn in 1:0x02 1:0x03 1:0x04 1:0x05 1:0x07 1:0x0a 2:0x05 2:0x09; do
+# codec 2: optical out 0x05, head unit rear RCA in ADC 0x08, optical in 0x09
+for cn in 1:0x02 1:0x03 1:0x04 1:0x05 1:0x07 1:0x0a 2:0x05 2:0x08 2:0x09; do
 	for v in 0xa0000 0xf0600 0xf0500 0xf0d00; do	# format, stream/channel, power, digital conv
 		printf -v w '0x%x%02x%05x' ${cn%%:*} $((${cn#*:})) $((v))
 		echo "verb $w" > $CMD
@@ -223,8 +254,12 @@ journalctl -k --since "$SINCE" --no-pager | grep -o 'dbg verb.*' | awk '{
 	if (and(rshift(v,16),0xf)==0xa) c=0xa00
 	printf "codec %d node 0x%02x verb 0x%03x -> %s %s\n", cad, n, c, $5, $6 }'
 
-sec "Driver log (last 60 lines, no head-unit chatter)"
-journalctl -k -b --no-pager | grep creative-ae9 | grep -vE "hu_debug|head unit: volume|dbg verb" | tail -60 | cut -c60-
+sec "Driver log (last 60 lines, no head-unit chatter or debugfs reads)"
+# local time to the millisecond, then the message without the device prefix
+journalctl -k -b -o short-iso-precise --no-hostname --no-pager | grep -E "creative.ae9" |
+	grep -vE "hu_debug|head unit: volume|dbg (verb|dacr)" | tail -60 |
+	sed -E 's/^([0-9T:-]+\.[0-9]{3})[0-9]*[+-][0-9:]+ kernel: /\1 /
+		s/^([^ ]+ )snd-hda-codec-creative-ae9 [0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]: /\1/'
 } > "$OUT" 2>&1
 chown "$U": "$OUT"
 # a line in the kernel log (dmesg / journalctl -k), so a later log shows

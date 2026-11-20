@@ -2114,7 +2114,7 @@ void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 }
 
 /* ------------------------------------------------------------------ */
-/* Native DSD64 (experimental; pcm.c, pcm_dsd): the verb parts of	  */
+/* Native DSD64 (pcm.c, pcm_dsd): the verb parts of		  */
 /* Windows' DSD start and stop						  */
 /* ------------------------------------------------------------------ */
 

@@ -44,8 +44,9 @@ install -Dm644 "$SRC/config/ae9-modules-load.conf" "$R/usr/lib/modules-load.d/cr
 install -Dm644 "$SRC/config/89-ae9-pipewire.rules" "$R/usr/lib/udev/rules.d/89-ae9-pipewire.rules"
 install -Dm644 "$SRC/config/creative-ae9.conf" "$R/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf"
 install -Dm644 "$SRC/config/50-ae9-safe-volume.conf" "$R/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf"
-# WirePlumber 0.4 (Ubuntu 24.04, Debian 12) reads Lua, not the .conf
-install -Dm644 "$SRC/config/51-ae9-safe-volume.lua" "$R/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua"
+# WirePlumber 0.4 (Ubuntu 24.04, Debian 12) reads Lua, not the .conf; 0.5
+# warns about a .lua: the postinst links it into main.lua.d for 0.4 only
+install -Dm644 "$SRC/config/51-ae9-safe-volume.lua" "$R/usr/share/creative-ae9/wireplumber-0.4/51-ae9-safe-volume.lua"
 # tools
 install -Dm755 "$SRC/scripts/ae9-get-firmware.sh" "$R/usr/bin/ae9-get-firmware"
 install -Dm755 "$SRC/scripts/ae9-full-dump.sh" "$R/usr/bin/ae9-full-dump"
@@ -116,7 +117,26 @@ EOF
 cat > "$R/DEBIAN/postinst" <<EOF
 #!/bin/sh
 set -e
+wp04_link() {
+	# WirePlumber 0.4 (Ubuntu 24.04, Mint 22, Debian 12) reads Lua, not the
+	# .conf; 0.5 reads the .conf and warns "Old configuration file
+	# detected" for a .lua in main.lua.d: link the .lua there only for 0.4
+	# (again at every WirePlumber upgrade: the trigger)
+	L=/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+	S=/usr/share/creative-ae9/wireplumber-0.4/51-ae9-safe-volume.lua
+	v=\$(dpkg-query -W -f='\${Version}' wireplumber 2>/dev/null || true)
+	if [ -n "\$v" ] && dpkg --compare-versions "\$v" lt 0.5~; then
+		[ -e "\$L" ] || { mkdir -p /usr/share/wireplumber/main.lua.d; ln -s "\$S" "\$L"; }
+	elif [ -L "\$L" ] && [ "\$(readlink "\$L")" = "\$S" ]; then
+		rm -f "\$L"
+	fi
+}
+if [ "\$1" = triggered ]; then
+	wp04_link
+	exit 0
+fi
 if [ "\$1" = configure ]; then
+	wp04_link
 	dkms add -m $MOD -v $VER >/dev/null 2>&1 || true
 	# build for every installed kernel that has headers
 	for k in /lib/modules/*; do
@@ -148,9 +168,19 @@ EOF
 cat > "$R/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
+case "$1" in
+remove|purge)
+	L=/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
+	if [ -L "$L" ] && [ "$(readlink "$L")" = /usr/share/creative-ae9/wireplumber-0.4/51-ae9-safe-volume.lua ]; then
+		rm -f "$L"
+		rmdir /usr/share/wireplumber/main.lua.d 2>/dev/null || true
+	fi ;;
+esac
 udevadm control --reload >/dev/null 2>&1 || true
 exit 0
 EOF
+# WirePlumber upgraded (0.4 -> 0.5): the postinst drops the .lua link
+echo "interest-noawait /usr/share/wireplumber" > "$R/DEBIAN/triggers"
 chmod 755 "$R/DEBIAN/postinst" "$R/DEBIAN/prerm" "$R/DEBIAN/postrm"
 
 dpkg-deb --root-owner-group -Zxz --build "$R" "$OUT/${PKG}_${VER}-1_all.deb" >/dev/null

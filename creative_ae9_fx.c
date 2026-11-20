@@ -413,14 +413,6 @@ void creative_ae9_fx_remove(struct creative_chip *chip)
 	mutex_unlock(&hp_custom_lock);
 }
 
-static unsigned int fx_spk_cfg = 2;
-module_param(fx_spk_cfg, uint, 0444);
-MODULE_PARM_DESC(fx_spk_cfg, "Speaker Config at load, Direct Mode off (DSP MASTERCONTROL 0x04): 1 = 2.0, 2 = 2.1 (default, as Windows)");
-
-static bool eq_headroom = true;
-module_param(eq_headroom, bool, 0644);
-MODULE_PARM_DESC(eq_headroom, "With a headphone profile and the EQ both on, send the DSP the EQ pre-gain 12 dB lower, not below -12 dB (default on; stops the DSP's overload, the \"metallic\" sound)");
-
 /* num/den as IEEE-754 single bits, without the FPU. |num/den| >= 2^-16. */
 static u32 fx_f32(s32 num, u32 den)
 {
@@ -527,7 +519,7 @@ static s32 fx_pregain_tenths(const struct creative_ae9_fx *fx)
 {
 	s32 v = fx->eq[0];
 
-	if (eq_headroom && fx->hp_on)
+	if (fx->hp_on)
 		v = max(v - 120, -120);
 	return v;
 }
@@ -547,7 +539,7 @@ static void fx_hp_set_locked(struct creative_chip *chip, bool on, bool log)
 {
 	struct creative_ae9_fx *fx = &chip->fx;
 	bool was = fx->hp_on;
-	bool eq = fx_eq_live(fx);	/* not eq_headroom: switching it off must restore */
+	bool eq = fx_eq_live(fx);
 
 	if (on) {
 		fx->hp_on = true;
@@ -560,7 +552,7 @@ static void fx_hp_set_locked(struct creative_chip *chip, bool on, bool log)
 		if (eq && was)
 			fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), log);
 	}
-	if (eq && eq_headroom && was != on) {
+	if (eq && was != on) {
 		s32 a = fx_pregain_tenths(fx), b = fx->eq[0];
 
 		dev_info(chip->dev, "EQ headroom: pre-gain %s%d.%d dB to the DSP (setting %s%d.%d dB)%s\n",
@@ -989,7 +981,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 	memset(fx, 0, sizeof(*fx));
 	fx->eq_preset = EQ_PRESET_FLAT;	/* the EQ values above are flat (0) */
 	fx->direct = true;
-	fx->spk = fx_spk_cfg == 1 ? 0 : 1;
+	fx->spk = 1;	/* 2.1, as Windows (the fx_spk_cfg option until 0.12.15) */
 	fx->xover = XOVER_DEF;
 	fx->hp_virt = true;	/* Windows: always on with headphones, DSP mode */
 	for (i = 0; i < FX_COUNT; i++) {
@@ -1208,7 +1200,8 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	case K_DIRECT:
 		if (!!v == fx->direct)
 			return 0;
-		fx->direct = !!v;
+		/* read by a DSD prepare under dsd_mutex, not this lock */
+		WRITE_ONCE(fx->direct, !!v);
 		/* native DSD (pcm_dsd) is Direct Mode only: stopped and off; the
 		 * app's restart is refused (pcm.c prepare) */
 		if (!fx->direct)
@@ -1266,7 +1259,9 @@ static int fx_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 				dev_info(chip->dev, "Direct Mode on: restarting the running stream\n");
 				chip->pcm_start_sent = 0;
 				chip->dac_start_key = 0;
-				snd_pcm_stop_xrun(ss);
+				/* from a work: see creative_ae9_pb_restart_work */
+				if (!READ_ONCE(chip->unloading))
+					queue_work(chip->wq, &chip->pb_restart_work);
 			}
 		}
 		/* Line Out Virtualization is DSP mode only: re-route after
