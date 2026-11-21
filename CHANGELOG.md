@@ -3,6 +3,63 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.16 (2026-11-21)
+Under the hood: the driver now hears when a DAC misses a command, and
+leaves other cards alone. 🔧
+
+Works with SbAe9-SBC v0.23.0 and SbAe9-AudioMon v0.4.11.
+
+- **Other cards are refused, even when forced.** A driver_override or new_id
+  could bind the driver to another card (an AE-7 or AE-5 owner editing our
+  udev rule, say), and it then ran the AE-9 start-up on the wrong registers.
+  The driver now checks the card's IDs before it touches anything and leaves
+  every card but the AE-9 alone (AE-7, AE-5, AE-5 Plus, AE-9 PE, AE-3, Z,
+  ZxR, Recon3D or anything else), with one log line that names it and says
+  how to undo the override
+  ([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)). Nothing changes for the
+  AE-9.
+- **The DACs' start-up mute is no longer lost.** The first command after
+  the DACs leave reset came 9 µs after it, too soon: the DACs didn't take
+  it, on every load. The driver now waits 1-2 ms first, as Windows does.
+  It was harmless (nothing plays yet, and the mute is sent again later), but
+  now every start-up command gets through.
+- **Every DAC command is checked.** The card tells the driver when a DAC
+  didn't acknowledge a command (an I2C NACK); the driver read that answer
+  and threw it away. Now it counts it and acts on it:
+  - a refused command is sent once more, 2 ms later, with a warning that
+    says whether the second try got through;
+  - a refused head-unit volume write is sent again (up to 3 times), so the
+    level can't silently stay behind;
+  - a playback start whose DAC setup was refused is set up again at the
+    next start;
+  - native DSD stays muted, with a warning, if the DAC's switch to DSD was
+    refused (the DAC would play the DSD stream as noise).
+
+  On our cards none of this fires in normal use: 0 refused commands. It's
+  there for the day one happens.
+- **DAC register reads are checked too,** and the "first read is junk /
+  one behind" lag is gone. The board start-up's chip-ID check now tells
+  "no acknowledge", "wrong chip ID" and "card off the bus" apart (it said
+  "does not answer" for all three).
+- **Quiet shutdown.** At unload the driver mutes both DACs once more after
+  putting them in reset; they refuse that by design (in Windows too). It's
+  counted, not retried or warned about.
+- **debugfs:** `state` has a "DAC I2C" line (commands not acknowledged per
+  DAC, retries and whether they got through, reads not acknowledged).
+  `dacr` prints its three reads or "not acknowledged (I2C NACK)". For
+  debugging, `dacabrt 1` (off by default) also reads why a command was
+  refused. Driver Health still has 8 values.
+- **Nothing else changes:** 21 module options, the same defaults and
+  controls, card id `AE9`. In normal use the card gets the same commands and
+  register writes as with 0.12.15.
+- Tested: every command and register write compared with 0.12.15 (the
+  same; the only new reads are the DAC checks); 6 reloads and a cold boot with 0 refused DAC
+  commands; about 1,100 DAC commands of exercise (knob, output switches,
+  the 7 DAC filters, 4 rates, DSP mode, DSD) with 0 refused; the read lag
+  gone; an absent DAC address caught, with nothing blamed on the real
+  DACs; another PCI device pointed at the driver was refused and left
+  untouched.
+
 ## 0.12.15 (2026-11-20)
 Native DSD64, on by default. And MPD stops crackling. 🎧✨
 

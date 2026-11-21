@@ -234,9 +234,17 @@ DEFINE_SEQ_ATTRIBUTE(vlog_seq);
 /* PCI device ID table						  */
 /* ------------------------------------------------------------------ */
 /*
- * AE-9 only: 1102:0010 with subsystem 1102:0071. The same device ID is used
- * by the AE-7 and AE-5 (other subsystem IDs); they must not get the AE-9
- * bus reset and Windows replay. Other Creative device IDs aren't claimed.
+ * AE-9 only: 1102:0010 with subsystem 1102:0071. The AE-7 shares the device
+ * ID (subsystem 0x0081); the AE-5 and AE-5 Plus are 1102:0012 (subsystems
+ * 0x0051, 0x0191), as are the Recon3D, Z and ZxR (in-tree snd_hda_intel +
+ * ca0132). None of them may get the AE-9 bus reset, BAR2 set-up and Windows
+ * replay: ae9_board_lookup() refuses them if a driver_override or new_id
+ * sends one here anyway.
+ *
+ * Creative's CtxHda.inf also lists 1102:0012 with the AE-9 and AE-7
+ * subsystems, but every AE-9 and AE-7 seen is 1102:0010. The INF's
+ * DEV_0011/0013/0015 are HD-Audio codec IDs (HDAUDIO\FUNC_01&VEN_1102&...),
+ * not PCI devices.
  */
 static const struct pci_device_id creative_ae9_pci_tbl[] = {
 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_CREATIVE, DEVICE_AE7_AE9,
@@ -246,13 +254,83 @@ static const struct pci_device_id creative_ae9_pci_tbl[] = {
 };
 MODULE_DEVICE_TABLE(pci, creative_ae9_pci_tbl);
 
-/* Per-device BAR layout data */
-static const struct creative_ae9_bar_layout creative_ae9_bar_layouts[] = {
-	[DEVICE_AE7_AE9] = { .hda_bar = 0, .ext_bar = 2, .ext_min_size = 0x4000 },
-	[DEVICE_RECON3D] = { .hda_bar = 0, .ext_bar = 2, .ext_min_size = 0x4000 },
-	[DEVICE_AE9_0013] = { .hda_bar = 0, .ext_bar = 1, .ext_min_size = 0x20000 },
-	[DEVICE_AE9_0014] = { .hda_bar = 0, .ext_bar = 1, .ext_min_size = 0x20000 },
+/*
+ * Probe guard. The id_table matches the AE-9 alone, but a driver_override
+ * (sysfs, or config/00-ae9-override.rules edited for another card) or a
+ * new_id binds the driver to any PCI device. pci_match_device() then passes
+ * pci_device_id_any (driver_data 0); until 0.12.16 that picked an all-zero
+ * BAR layout, which sent the AE-9 BAR2 set-up to BAR0. The probe checks the
+ * IDs itself now, from the values the PCI core cached at enumeration (no
+ * config read, no MMIO, nothing enabled or mapped yet), and takes the BAR
+ * layout from here. Anything but the AE-9 gets one log line saying what it
+ * is, and -ENODEV.
+ *
+ * Names: Creative's CtxHda.inf (AE series) and the in-tree ca0132 quirk
+ * table (Z, ZxR, Recon3D): subsystem vendor 0x1102, PCI device 0x0010 or
+ * 0x0012.
+ */
+#define AE9_IN_TREE	"not an AE-9; snd_hda_intel with the in-tree ca0132 driver handles it"
+
+static const struct {
+	u16 subsys;
+	const char *name, *why;
+} ae9_other_boards[] = {
+	{ 0x0081, "Sound Blaster AE-7", "not supported by this driver" },
+	{ 0x0073, "Sound Blaster AE-9PE", "not tested with this driver; please report it" },
+	{ 0x0051, "Sound BlasterX AE-5", AE9_IN_TREE },
+	{ 0x0191, "Sound BlasterX AE-5 Plus", AE9_IN_TREE },
+	{ 0x0061, "Sound BlasterX AE-3", "not an AE-9" },
+	{ 0x0010, "Sound Blaster Z", AE9_IN_TREE },
+	{ 0x0023, "Sound Blaster Z", AE9_IN_TREE },
+	{ 0x0027, "Sound Blaster Z", AE9_IN_TREE },
+	{ 0x0033, "Sound Blaster ZxR", AE9_IN_TREE },
+	{ 0x0013, "Sound Blaster Recon3D", AE9_IN_TREE },
+	{ 0x0018, "Sound Blaster Recon3D", AE9_IN_TREE },
 };
+
+#define AE9_REFUSED "%s (PCI %04x:%04x, subsystem %04x:%04x): %s. Leaving it alone; " \
+	"if a driver_override or new_id sent it here, remove that so its own driver can take it\n"
+
+/* the AE-9's BAR layout, or NULL (logged) for any other device */
+static const struct creative_ae9_bar_layout *ae9_board_lookup(struct pci_dev *pdev)
+{
+	static const struct creative_ae9_bar_layout ae9_layout = {
+		.hda_bar = 0, .ext_bar = 2, .ext_min_size = 0x4000,
+	};
+	const char *name = "Unknown device", *why = "not a Creative CA0132 sound card";
+	bool known = false;
+	unsigned int i;
+
+	if (pdev->vendor == PCI_VENDOR_ID_CREATIVE &&
+	    (pdev->device == DEVICE_AE7_AE9 || pdev->device == DEVICE_Z_AE5) &&
+	    pdev->subsystem_vendor == PCI_VENDOR_ID_CREATIVE) {
+		if (pdev->subsystem_device == CREATIVE_SUBSYS_AE9) {
+			if (pdev->device == DEVICE_AE7_AE9)
+				return &ae9_layout;
+			/* in Creative's INF, but no such card seen: not claimed untested */
+			name = "Sound Blaster AE-9";
+			why = "never seen on PCI device 0x0012, so not claimed; please report it";
+		} else {
+			name = "Unknown Creative CA0132 board";
+			why = "not an AE-9";
+		}
+		for (i = 0; i < ARRAY_SIZE(ae9_other_boards); i++) {
+			if (ae9_other_boards[i].subsys != pdev->subsystem_device)
+				continue;
+			name = ae9_other_boards[i].name;
+			why = ae9_other_boards[i].why;
+			known = true;
+			break;
+		}
+	}
+	if (known)
+		dev_info(&pdev->dev, AE9_REFUSED, name, pdev->vendor, pdev->device,
+			 pdev->subsystem_vendor, pdev->subsystem_device, why);
+	else
+		dev_warn(&pdev->dev, AE9_REFUSED, name, pdev->vendor, pdev->device,
+			 pdev->subsystem_vendor, pdev->subsystem_device, why);
+	return NULL;
+}
 
 /* ------------------------------------------------------------------ */
 /* Hardware reset sequence					  */
@@ -2169,6 +2247,10 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 /* Commands written to /sys/kernel/debug/creative_ae9/cmd:	  */
 /*   w2 <off> <val>  - write BAR2[off] = val			  */
 /*   r2 <off>        - read BAR2[off]				  */
+/*   (not 0x840, 0x854 or 0x860: the DAC I2C status registers clear  */
+/*   on read, and r2 doesn't take ca0113_mutex: it races the driver  */
+/*   and steals a DAC command's NACK; "dacabrt 1" and debugfs state  */
+/*   show them instead)						  */
 /*   w0 <off> <val>  - write BAR0[off] = val			  */
 /*   r0 <off>        - read BAR0[off]				  */
 /* Result readable from the same file.				  */
@@ -2251,26 +2333,63 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 	}
 
 	/* "dacr 48 1d": one DAC (CA0113 I2C) register read, Windows' read
-	 * sequence; "dacw 48 19 0": one DAC register write. Groups 0x48
-	 * (ES9038Q2M) and 0x49 (SABRE9006A) only. */
+	 * sequence, checked (dsp.c: the three reads' 0x208 values, "not
+	 * acknowledged" for an I2C NACK); "dacw 48 19 0": one DAC register
+	 * write. Groups 0x48 (ES9038Q2M) and 0x49 (SABRE9006A) only. Also in
+	 * the result (cat cmd). */
 	if (!strncmp(buf, "dacr ", 5) || !strncmp(buf, "dacw ", 5)) {
-		unsigned int grp, reg, v = 0;
-		bool wr = buf[3] == 'w';
-		u32 raw[2] = { 0, 0 };
+		unsigned int grp = 0, reg = 0, v = 0;
+		bool wr = buf[3] == 'w', ok;
+		u32 raw[3] = { 0, 0, 0 };
+		int r;
 
-		if (sscanf(buf + 5, "%x %x %x", &grp, &reg, &v) != (wr ? 3 : 2) ||
-		    (grp != 0x48 && grp != 0x49) || reg > 0xff || v > 0xff)
+		n = sscanf(buf + 5, "%x %x %x", &grp, &reg, &v);
+		ok = grp == 0x48 || grp == 0x49;
+#ifdef AE9_TEST
+		/* a test build also reads (never writes) any other 7-bit
+		 * address but 0x57 (likely an EEPROM) and the AE-7's 0x30:
+		 * an absent device's NACK, for "dacabrt 1" (0.12.16) */
+		ok |= !wr && grp >= 0x08 && grp <= 0x77 && grp != 0x57 && grp != 0x30;
+#endif
+		if (n != (wr ? 3 : 2) || !ok || reg > 0xff || v > 0xff)
 			return -EINVAL;
 		if (wr) {
 			const u8 cmd[1][3] = { { grp, reg, v } };
 
-			creative_dsp_ca0113_list_quiet(g_dbg_chip, cmd, 1);
-			dev_info(g_dbg_chip->dev, "dbg dacw 0x%02x/0x%02x = 0x%02x\n", grp, reg, v);
+			r = creative_dsp_ca0113_list_quiet(g_dbg_chip, cmd, 1);
+			dev_info(g_dbg_chip->dev, "dbg dacw 0x%02x/0x%02x = 0x%02x%s\n", grp, reg, v,
+				 r ? " (not acknowledged)" : "");
 		} else {
-			v = creative_dsp_ca0113_read(g_dbg_chip, grp, reg, raw);
-			dev_info(g_dbg_chip->dev, "dbg dacr 0x%02x/0x%02x = 0x%02x (0x208 0x%08x 0x%08x)\n",
-				 grp, reg, v, raw[0], raw[1]);
+			r = creative_dsp_ca0113_read_checked(g_dbg_chip, grp, reg, raw);
+			if (r >= 0)
+				scnprintf(g_dbg_result, sizeof(g_dbg_result),
+					  "dacr 0x%02x/0x%02x = 0x%02x (0x208 0x%08x 0x%08x 0x%08x)\n",
+					  grp, reg, r, raw[0], raw[1], raw[2]);
+			else
+				scnprintf(g_dbg_result, sizeof(g_dbg_result),
+					  "dacr 0x%02x/0x%02x: %s (0x208 0x%08x 0x%08x 0x%08x)\n",
+					  grp, reg, r == -ENODEV ? "card off the bus" :
+					  "not acknowledged (I2C NACK)", raw[0], raw[1], raw[2]);
+			dev_info(g_dbg_chip->dev, "dbg %s", g_dbg_result);
 		}
+		return len;
+	}
+
+	/* "dacabrt 1" / "dacabrt 0" (default): with each DAC command's status
+	 * also read the I2C block's TX_ABRT_SOURCE (BAR2 0x880), before the
+	 * reads that clear it: a NACK's cause (bit 0 address, bit 3 data) in
+	 * debugfs state. Windows never reads it, so off by default (dsp.c). */
+	if (!strncmp(buf, "dacabrt ", 8)) {
+		unsigned int on;
+
+		if (kstrtouint(buf + 8, 0, &on) || on > 1)
+			return -EINVAL;
+		mutex_lock(&g_dbg_chip->ca0113_mutex);
+		g_dbg_chip->dac_i2c.abrt_src = on;
+		mutex_unlock(&g_dbg_chip->ca0113_mutex);
+		scnprintf(g_dbg_result, sizeof(g_dbg_result), "dacabrt %u\n", on);
+		dev_info(g_dbg_chip->dev, "dbg dacabrt %u: TX_ABRT_SOURCE (0x880) %s\n", on,
+			 on ? "read with each DAC command's status" : "not read (as Windows)");
 		return len;
 	}
 
@@ -2555,6 +2674,28 @@ void creative_ae9_hu_frame_note(struct creative_chip *chip, int ret, u8 cmd, u8 
 	chip->hu_miss_ring[k].b = b;
 }
 
+/* the DACs' I2C status counters (dsp.c ca0113_status(); no card access) */
+static void creative_ae9_dac_i2c_show(struct seq_file *m, struct creative_chip *chip)
+{
+	const struct ae9_dac_i2c *s = &chip->dac_i2c;
+
+	seq_printf(m, "DAC I2C: 0x48 %u/%u not acknowledged, 0x49 %u/%u, 0x30 %u/%u, other %u/%u; after the bring-up %u; retried %u (got through %u); unfinished %u; card off the bus %u; reads not acknowledged %u",
+		   s->nack[0], s->cmds[0], s->nack[1], s->cmds[1], s->nack[2], s->cmds[2],
+		   s->nack[3], s->cmds[3], s->late, s->retried, s->recovered, s->unfinished,
+		   s->gone, s->read_bad);
+	if (s->last_at && s->last_rd)
+		seq_printf(m, "; last NACK read %02x/%02x %lu s ago",
+			   s->last_grp, s->last_reg, (jiffies - s->last_at) / HZ);
+	else if (s->last_at)
+		seq_printf(m, "; last NACK write %02x/%02x = 0x%02x %lu s ago",
+			   s->last_grp, s->last_reg, s->last_val, (jiffies - s->last_at) / HZ);
+	if (s->last_at && s->last_src)
+		seq_printf(m, ", 0x880 = 0x%x", s->last_src);
+	if (s->abrt_src)
+		seq_puts(m, "; dacabrt on");
+	seq_putc(m, '\n');
+}
+
 static void creative_ae9_hu_miss_show(struct seq_file *m, struct creative_chip *chip)
 {
 	static const char *const why[] = { "transmit FIFO full", "no reply", "no f0", "short" };
@@ -2650,6 +2791,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			   chip->hung_verb);
 	seq_printf(m, "DSP output unmute: resent %u, stayed muted %u\n",
 		   chip->unmute_resends, chip->unmute_stuck);
+	creative_ae9_dac_i2c_show(m, chip);
 	seq_printf(m, "RIRB entries that landed late: %u (longest wait %u us), never landed %u, other codec %u, unreadable write pointer %u\n",
 		   chip->rirb_late, chip->rirb_late_max_us, chip->rirb_never, chip->rirb_stray,
 		   chip->rirb_badwp);
@@ -2885,6 +3027,7 @@ MODULE_PARM_DESC(hu_auto_switch, "Start with \"Head Unit Auto Switch\" on: plugg
 #define HU_PLUG_SETTLE_MS	1500	/* plug must hold still this long */
 #define HU_AMP_SETTLE_MS	1000	/* amp bit must disagree this long (2+ full polls) */
 #define HU_AMP_TRIES		3	/* jack frame resends before giving up */
+#define HU_VOL_RESENDS		3	/* volume lists the DACs refused: resends */
 
 unsigned int ae9_debug;
 module_param_named(debug, ae9_debug, uint, 0644);
@@ -2899,9 +3042,19 @@ MODULE_PARM_DESC(debug, "Log detail: 0 startup, actions and problems (default), 
 #define HU_ATT_DEFAULT	0x48	/* Windows' boot volume, -36.0 dB */
 #define HU_SP_TICKS	10	/* Windows shows "-SP-" ~5 s, then the volume */
 
-/* Volume = the same attenuation on six registers of the card's DACs
+/*
+ * Volume = the same attenuation on six registers of the card's DACs
  * (front 0x48 ES9038Q2M, rear 0x49 SABRE9006A), in the
- * order Windows writes them on a volume change; 0xff mutes. */
+ * order Windows writes them on a volume change; 0xff mutes.
+ *
+ * 0.12.16: a command the DACs didn't acknowledge (I2C NACK) was already
+ * sent once more (dsp.c); still refused, the heartbeat sends the volume
+ * again, up to HU_VOL_RESENDS times (creative_ae9_hu_vol_resend()), then
+ * warns and leaves it until a volume list gets through. (After a switch
+ * to headphones that would leave the speakers' louder attenuation; turning
+ * the head unit's headphone amp off over the UART then is possible but
+ * not done: not agreed yet.)
+ */
 static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 {
 	static const u8 regs[6][2] = {
@@ -2917,7 +3070,11 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 		cmds[i][1] = regs[i][1];
 		cmds[i][2] = att;
 	}
-	creative_dsp_ca0113_list_quiet(chip, cmds, 6);
+	if (!creative_dsp_ca0113_list_quiet(chip, cmds, 6))
+		chip->hu_vol_fails = 0;
+	else if (chip->hu_vol_fails <= HU_VOL_RESENDS && ++chip->hu_vol_fails > HU_VOL_RESENDS)
+		dev_warn(chip->dev, "head unit: the DACs did not acknowledge volume att 0x%02x (I2C NACK), %u resends; left until a volume change gets through\n",
+			 att, HU_VOL_RESENDS);
 	/* mute changes always; each volume step only with debug=1 */
 	if (chip->hu_mute != chip->hu_mute_logged) {
 		chip->hu_mute_logged = chip->hu_mute;
@@ -2925,6 +3082,17 @@ static void creative_ae9_hu_apply_volume(struct creative_chip *chip)
 	}
 	ae9_dbg(chip, "head unit: volume att 0x%02x (%s)\n", att,
 		 chip->hu_mute ? "muted" : "on");
+}
+
+/* the heartbeat: the last volume list refused, sent again (above); not to a
+ * card that is gone or stopped answering (not a NACK: nothing to resend) */
+static void creative_ae9_hu_vol_resend(struct creative_chip *chip)
+{
+	if (!chip->hu_vol_fails || chip->hu_vol_fails > HU_VOL_RESENDS || creative_ae9_dead(chip))
+		return;
+	ae9_dbg(chip, "head unit: volume not acknowledged by the DACs: sent again (%u of %u)\n",
+		chip->hu_vol_fails, HU_VOL_RESENDS);
+	creative_ae9_hu_apply_volume(chip);
 }
 
 /*
@@ -3463,8 +3631,10 @@ static void creative_ae9_hu_update(struct creative_chip *chip, int steps,
 				       &chip->hu_mute_ctl->id);
 		chip->hu_dirty = 1;
 	}
-	if (!chip->hu_dirty)
+	if (!chip->hu_dirty) {
+		creative_ae9_hu_vol_resend(chip);
 		return;
+	}
 	chip->hu_dirty = 0;
 	chip->hu_name_until = 0;
 	creative_ae9_hu_label(chip);
@@ -4874,13 +5044,10 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	struct creative_chip *chip;
 	int ret;
 
-	/* Look up BAR layout for this device variant */
-	if (ent->driver_data >= ARRAY_SIZE(creative_ae9_bar_layouts)) {
-		dev_err(&pdev->dev, "Unknown device variant %lu\n",
-			(unsigned long)ent->driver_data);
+	/* the AE-9 only, before anything is enabled or mapped */
+	layout = ae9_board_lookup(pdev);
+	if (!layout)
 		return -ENODEV;
-	}
-	layout = &creative_ae9_bar_layouts[ent->driver_data];
 
 	ret = pcim_enable_device(pdev);
 	if (ret < 0) {
@@ -5032,21 +5199,13 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 
 	strscpy(chip->card->driver, CREATIVE_AE9_DRV_NAME,
 		sizeof(chip->card->driver));
-	if (pdev->subsystem_device == CREATIVE_SUBSYS_AE9) {
-		strscpy(chip->card->shortname, "Sound Blaster AE-9",
-			sizeof(chip->card->shortname));
-		snprintf(chip->card->longname, sizeof(chip->card->longname),
-			 "Creative Labs Sound Blaster AE-9 at 0x%llx irq %d",
-			 (unsigned long long)pci_resource_start(pdev, 0),
-			 pdev->irq);
-	} else {
-		strscpy(chip->card->shortname, "HDA Creative",
-			sizeof(chip->card->shortname));
-		snprintf(chip->card->longname, sizeof(chip->card->longname),
-			 "Creative Sound Blaster AE-9 at 0x%llx irq %d",
-			 (unsigned long long)pci_resource_start(pdev, 0),
-			 pdev->irq);
-	}
+	/* an AE-9: ae9_board_lookup() let nothing else through */
+	strscpy(chip->card->shortname, "Sound Blaster AE-9",
+		sizeof(chip->card->shortname));
+	snprintf(chip->card->longname, sizeof(chip->card->longname),
+		 "Creative Labs Sound Blaster AE-9 at 0x%llx irq %d",
+		 (unsigned long long)pci_resource_start(pdev, 0),
+		 pdev->irq);
 
 	/* PCM playback device (no interrupts — Windows-style) */
 	ret = creative_ae9_pcm_init(chip);

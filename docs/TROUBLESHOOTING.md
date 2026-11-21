@@ -78,6 +78,28 @@ and `systemctl --user restart wireplumber`. Optical in only takes PCM: a
 Dolby Digital or DTS bitstream (a console set to "Bitstream") comes in as
 noise, so set the source to Linear PCM.
 
+**"... Leaving it alone; if a driver_override or new_id sent it here, remove
+that" in the kernel log** (0.12.16+): the driver was pointed at a card that
+isn't an AE-9, usually by a copy of `00-ae9-override.rules` or
+`ae9-override.conf` edited for another card, or by hand through sysfs. The
+line names the card. The driver refuses it before touching it (nothing
+enabled, nothing written), but the override still keeps the card's own
+driver away. The AE-5, AE-5 Plus, Z, ZxR and Recon3D belong to the kernel's
+`snd_hda_intel` with its ca0132 codec driver; the AE-7 isn't supported by
+this driver. To give the card back, remove the edited rule from
+`/etc/udev/rules.d/` or `/etc/modprobe.d/`, then (the address is the one in
+the log line):
+
+```sh
+echo | sudo tee /sys/bus/pci/devices/0000:05:00.0/driver_override
+echo 0000:05:00.0 | sudo tee /sys/bus/pci/drivers_probe
+```
+
+A `new_id` entry goes away when the driver is unloaded
+(`sudo modprobe -r snd-hda-codec-creative-ae9`). Before 0.12.16 the driver
+didn't check and ran its AE-9 start-up on such a card, writing to the wrong
+registers: if that happened, power off fully once (quick fix 2).
+
 **SBX/EQ do nothing:** they work with Direct Mode off, at 48 or 96 kHz. A
 44.1 kHz stream keeps playing direct; `pw-metadata -n settings 0
 clock.force-rate 48000` and play again (see [USING.md](USING.md#playback)).

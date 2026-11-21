@@ -3003,8 +3003,32 @@ static bool dspload_is_loaded(struct creative_chip *chip)
 #define SR_48_000			0x09
 #define MEM_CONNID_WUH			10
 
-static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
-		       unsigned int settle_us);
+/*
+ * The DACs' I2C bus: BAR2 0x800 is a Synopsys DW_apb_i2c (0x8fc =
+ * 0x44570140, v1.10a; .tmp/notes/31 §1). The CA0113 front end (0x204-0x210)
+ * drives it; after each phase of a DAC command Windows reads three of its
+ * read-to-clear registers, STOP_DET, TX_ABRT, then all interrupts, in that
+ * order. 0x854 bit 0 = the transfer was aborted, on the AE-9 an I2C NACK:
+ * 75 of Windows' 10186 cold-boot commands read 1, all sent while GPIO pin
+ * 0 (the DACs' reset) was low, and no other; AE-7: 53 of 53 in its
+ * pre-clock window. 0x860 and 0x840 always read 1 (no STOP yet would read
+ * 0). TX_ABRT_SOURCE (0x880, the abort's cause: bit 0 address NACK, 3
+ * data NACK, 11 master disabled, 12 arbitration lost) is cleared by the
+ * 0x854 and 0x840 reads; Windows never reads it, so we read it, first,
+ * only after debugfs "dacabrt 1" (dac_i2c.abrt_src).
+ */
+#define DW_I2C_CLR_INTR		0x840
+#define DW_I2C_CLR_TX_ABRT	0x854
+#define DW_I2C_CLR_STOP_DET	0x860
+#define DW_I2C_TX_ABRT_SOURCE	0x880
+/* ca0113_status() */
+#define CA0113_ACK		0
+#define CA0113_NACK		1	/* 0x854 bit 0: the DAC didn't acknowledge */
+#define CA0113_UNFINISHED	2	/* 0x860 bit 0 clear: no STOP yet */
+#define CA0113_GONE		3	/* all-ones: the card is off the bus, not a NACK */
+
+static int ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
+		      unsigned int settle_us);
 
 /*
  * Send a list of {group, reg, value} CA0113 commands, Windows protocol.
@@ -3013,42 +3037,127 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
  * "replaying" flag and settle time, so one path could drop the rest of the
  * other's list (output select included) or land a command between the
  * other's register write and commit.
+ *
+ * A command the DAC didn't acknowledge (NACK) is sent once more, 2 ms
+ * later (a register write is idempotent); not in the AE-7's pre-clock
+ * window (dac_i2c.expect), where the NACKs are Windows' too and it never
+ * retries. Never on the card off the bus or no STOP yet.
+ *
+ * Returns the number of commands not acknowledged in the end
+ * (ca0113_status(): a NACK, the card off the bus, no STOP yet). A NACK
+ * after the bring-up (dsp_done) is a warning; before it (the board-D0 step)
+ * and in the pre-clock window a debug line: debugfs state counts them all.
  */
-static void ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
-			size_t n, unsigned int settle_us)
+static int ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
+		       size_t n, unsigned int settle_us)
 {
+	struct ae9_dac_i2c *s = &chip->dac_i2c;
+	const char *again;
+	int res, bad = 0;
 	size_t i;
 
 	mutex_lock(&chip->ca0113_mutex);
 	for (i = 0; i < n; i++) {
-		u8 val = cmds[i][2];
+		u8 grp = cmds[i][0], reg = cmds[i][1], val = cmds[i][2];
 
 		/* DAC 48/07: bits 7:5 filter, bit 0 mute. Keep the user's
 		 * "DAC Filter" choice through every replayed table. */
-		if (cmds[i][0] == 0x48 && cmds[i][1] == 0x07) {
+		if (grp == 0x48 && reg == 0x07) {
 			val = (val & 0x1f) | chip->dac_filter_bits;
 			chip->dac48_07 = val;
 		}
-		ca0113_cmd(chip, cmds[i][0], cmds[i][1], val, settle_us);
+		res = ca0113_cmd(chip, grp, reg, val, settle_us);
+		if (res != CA0113_NACK) {
+			again = NULL;
+		} else if (s->expect) {
+			again = "";
+		} else {
+			s->retried++;
+			usleep_range(2000, 2500);
+			res = ca0113_cmd(chip, grp, reg, val, settle_us);
+			s->recovered += res == CA0113_ACK;
+			again = res == CA0113_ACK ? "; sent again: got through" :
+						    "; sent again: not acknowledged either";
+		}
+		if (grp == 0x48 && reg == 0x07)
+			s->d07_bad = res != CA0113_ACK;
+		bad += res != CA0113_ACK;
+		if (!again)
+			continue;
+		if (chip->dsp_done && !s->expect) {
+			s->late++;
+			dev_warn_ratelimited(chip->dev, "DAC %02x/%02x = 0x%02x not acknowledged (I2C NACK)%s\n",
+					     grp, reg, val, again);
+		} else {
+			ae9_dbg(chip, "DAC %02x/%02x = 0x%02x not acknowledged (I2C NACK) %s%s\n",
+				grp, reg, val, s->expect ? "(expected)" : "during the bring-up",
+				again);
+		}
 	}
 	mutex_unlock(&chip->ca0113_mutex);
+	return bad;
 }
 
-void creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
-			      size_t n, const char *what)
+int creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
+			     size_t n, const char *what)
 {
-	ca0113_list(chip, cmds, n, CA0113_SETTLE_US);
+	int bad = ca0113_list(chip, cmds, n, CA0113_SETTLE_US);
+
 	if (chip->dsp_done)
 		ae9_dbg(chip, "ca0113_windows: %s, %zu commands\n", what, n);
 	else
 		dev_info(chip->dev, "ca0113_windows: %s, %zu commands\n", what, n);
+	return bad;
 }
 
 /* Same without the log line and with the short settle time (volume). */
-void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
-				    const u8 (*cmds)[3], size_t n)
+int creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
+				   const u8 (*cmds)[3], size_t n)
 {
-	ca0113_list(chip, cmds, n, CA0113_VOL_SETTLE_US);
+	return ca0113_list(chip, cmds, n, CA0113_VOL_SETTLE_US);
+}
+
+/*
+ * The I2C block's status after a DAC command's phase, Windows' three reads
+ * in its order (they clear it for the next command): what became of the
+ * transfer. *src = TX_ABRT_SOURCE, read before them with dacabrt on, else 0.
+ */
+static int ca0113_status(struct creative_chip *chip, u32 *src)
+{
+	u32 stop, abrt;
+
+	*src = chip->dac_i2c.abrt_src ? creative_ext_readl(chip, DW_I2C_TX_ABRT_SOURCE) : 0;
+	stop = creative_ext_readl(chip, DW_I2C_CLR_STOP_DET);
+	abrt = creative_ext_readl(chip, DW_I2C_CLR_TX_ABRT);
+	creative_ext_readl(chip, DW_I2C_CLR_INTR);
+	if (stop == ~0U || abrt == ~0U)
+		return CA0113_GONE;
+	if (abrt & 1)
+		return CA0113_NACK;
+	return (stop & 1) ? CA0113_ACK : CA0113_UNFINISHED;
+}
+
+/* a DAC command's status, counted per group (debugfs state) */
+static void ca0113_count(struct creative_chip *chip, u8 grp, u8 reg, u8 val,
+			 bool rd, int res, u32 src)
+{
+	struct ae9_dac_i2c *s = &chip->dac_i2c;
+	unsigned int g = grp == 0x48 ? 0 : grp == 0x49 ? 1 : grp == 0x30 ? 2 : 3;
+
+	s->cmds[g]++;
+	if (res == CA0113_GONE) {
+		s->gone++;
+	} else if (res == CA0113_UNFINISHED) {
+		s->unfinished++;
+	} else if (res == CA0113_NACK) {
+		s->nack[g]++;
+		s->last_at = jiffies | 1;
+		s->last_grp = grp;
+		s->last_reg = reg;
+		s->last_val = val;
+		s->last_rd = rd;
+		s->last_src = src;
+	}
 }
 
 /*
@@ -3057,11 +3166,15 @@ void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
  * unlock (0x210 = 0x7e, 0x5a), 0x20c = 0x800005 around the group (0x804)
  * and the register + value (0x204), a settle, three status reads, then
  * 0x20c = 0x800004 and lock (0x210 = 0). A read puts 0x800003 before 0x204
- * instead (ca0113_read_once, below; docs/DECODED-SEQUENCES.md).
+ * instead (ca0113_read_once, below; docs/DECODED-SEQUENCES.md). Returns the
+ * status reads' verdict (ca0113_status()), counted.
  */
-static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
-		       unsigned int settle_us)
+static int ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
+		      unsigned int settle_us)
 {
+	u32 src;
+	int res;
+
 	chip->dac_start_key = 0;	/* DAC touched: next start sends all */
 	creative_ext_writel(chip, 0x210, 0x0000007e);
 	creative_ext_readl(chip, 0x210);
@@ -3072,12 +3185,12 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
 	creative_ext_writel(chip, 0x20c, 0x00800005);
 	creative_ext_writel(chip, 0x204, (reg & 0xff) | (val << 8));
 	usleep_range(settle_us, settle_us + 500);
-	creative_ext_readl(chip, 0x860);
-	creative_ext_readl(chip, 0x854);
-	creative_ext_readl(chip, 0x840);
+	res = ca0113_status(chip, &src);
+	ca0113_count(chip, group, reg, val, false, res, src);
 	creative_ext_writel(chip, 0x20c, 0x00800004);
 	creative_ext_writel(chip, 0x210, 0x00000000);
 	creative_ext_readl(chip, 0x210);
+	return res;
 }
 
 /*
@@ -3094,10 +3207,20 @@ static void ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
  * our fixed 0x800005 is what it sends after a write. Bits 2:1 are the byte
  * count: 1 (0x...3) for a read, 2 (0x...5) for a write. 28 coldboot
  * captures, 329 reads (.tmp/ca0113-readstart).
+ *
+ * After each phase Windows reads the I2C status as after a write (0x860,
+ * 0x854, 0x840: after the register phase's wait, and before the last 0x208
+ * read; capture 20261108_001026 04:10:49.385, .401); since 0.12.16 so do
+ * we. A NACKed read leaves 0x208 at an older read's byte (Windows' 25 of
+ * 25, AE-7's 5 of 5), and without the reads it left TX_ABRT pending for the
+ * next write to be blamed for. Returns the first status of the two phases
+ * that isn't an ACK (counted as a read); *val = the last 0x208 read.
  */
-static u32 ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *first)
+static int ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *first,
+			    u32 *val)
 {
-	u32 v;
+	u32 src, src2;
+	int res, res2;
 
 	creative_ext_writel(chip, 0x210, 0x0000007e);
 	creative_ext_readl(chip, 0x210);
@@ -3108,33 +3231,63 @@ static u32 ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *f
 	creative_ext_writel(chip, 0x20c, 0x00800003);
 	creative_ext_writel(chip, 0x204, reg);
 	usleep_range(5000, 6000);		/* Windows: ~4 ms here */
+	res = ca0113_status(chip, &src);
 	creative_ext_writel(chip, 0x20c, 0x00800003);
 	creative_ext_writel(chip, 0x208, 0x0000ffff);
 	*first = creative_ext_readl(chip, 0x208);
 	usleep_range(20000, 21000);
-	v = creative_ext_readl(chip, 0x208);
+	res2 = ca0113_status(chip, &src2);
+	*val = creative_ext_readl(chip, 0x208);
 	creative_ext_writel(chip, 0x20c, 0x00800002);
 	creative_ext_writel(chip, 0x210, 0x00000000);
 	creative_ext_readl(chip, 0x210);
-	return v;
+	if (res == CA0113_ACK) {
+		res = res2;
+		src = src2;
+	}
+	ca0113_count(chip, group, reg, 0, true, res, src);
+	chip->dac_i2c.read_bad += res == CA0113_NACK;
+	return res;
 }
 
 /*
  * uv34 (2026-11-12, no settle after 0x204): each read returned the
  * previous read's result, and the first after a pause returned junk; the
  * value was right from the third read of a register on. So: the same
- * register three times, the last one counts (raw[] = the 2nd and 3rd).
+ * register three times, the last one counts (raw[] = the three reads' last
+ * 0x208 values). (Whether the status reads above cure that lag is for a
+ * card test to show; until then the three reads stay.)
+ *
+ * Checked: the byte, or -EIO when the DAC didn't acknowledge the 2nd or
+ * 3rd read (whose bytes count: 0x208 then holds an older read's), -ENODEV
+ * when the card is off the bus. A NACKed first read only shows in debugfs
+ * state.
  */
-u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
+int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[3])
 {
+	int res[3], i;
 	u32 first;
 
 	mutex_lock(&chip->ca0113_mutex);
-	ca0113_read_once(chip, group, reg, &first);
-	raw[0] = ca0113_read_once(chip, group, reg, &first);
-	raw[1] = ca0113_read_once(chip, group, reg, &first);
+	for (i = 0; i < 3; i++)
+		res[i] = ca0113_read_once(chip, group, reg, &first, &raw[i]);
 	mutex_unlock(&chip->ca0113_mutex);
-	return raw[1] & 0xff;
+	if (res[0] == CA0113_GONE || res[1] == CA0113_GONE || res[2] == CA0113_GONE)
+		return -ENODEV;
+	if (res[1] != CA0113_ACK || res[2] != CA0113_ACK)
+		return -EIO;
+	return raw[2] & 0xff;
+}
+
+/* the same, unchecked: the last read's byte, raw[] = the 2nd and 3rd 0x208 values */
+u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
+{
+	u32 r[3];
+
+	creative_dsp_ca0113_read_checked(chip, group, reg, r);
+	raw[0] = r[1];
+	raw[1] = r[2];
+	return r[2] & 0xff;
 }
 
 /* worth a re-download: not a missing card, firmware file or memory */

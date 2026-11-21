@@ -481,14 +481,16 @@ bool creative_ae9_recovery_pass(struct creative_chip *chip, int ramp[AE9_RAMP_N]
  * pin 0 because Windows set it here. Without it, on a card behind an
  * ASM1083 rev 03 bridge neither DAC device answered (every read 0xff,
  * every DAC command lost, analog outputs silent) until pin 0 was pulsed
- * (2026-11-10). Then whether the DAC answers.
+ * (2026-11-10). Then whether the DAC answers: its chip-ID read checked
+ * (0.12.16), a read it didn't acknowledge tried once more 10 ms later, a
+ * wrong ID told apart from no acknowledge.
  */
 static void creative_ae9_board_d0(struct creative_chip *chip)
 {
 	static const u8 mute[][3] = { { 0x48, 0x07, 0x81 }, { 0x49, 0x0a, 0x07 } };
 	static const u8 front[][3] = { { 0x48, 0x1d, 0x40 } };
-	u32 raw[2];
-	u8 id;
+	u32 raw[3];
+	int id;
 
 	creative_ext_writel(chip, 0x100, creative_ext_readl(chip, 0x100) & ~0x0fU);
 	creative_ext_writeb(chip, 0x304, 0xff);
@@ -496,17 +498,32 @@ static void creative_ae9_board_d0(struct creative_chip *chip)
 	creative_ext_writew(chip, 0x320, 0x0000);	/* pin 0 = 0 */
 	msleep(16);	/* Windows' 1 ms wait comes out at ~16 ms (its timer tick) */
 	creative_ext_writew(chip, 0x320, 0x0100);	/* pin 0 = 1 */
+	/*
+	 * The DACs leave reset: our first command came 9 us after this and was
+	 * never acknowledged (48/07, 0x854 = 1 on every load, 10 of 10
+	 * --mmio logs); Windows' first comes 0.26-1.4 ms after it (median
+	 * 0.56 ms, 29 captures) and always gets through (0.12.16).
+	 */
+	usleep_range(1000, 2000);
 	creative_dsp_ca0113_list_quiet(chip, mute, ARRAY_SIZE(mute));
 	creative_ext_writew(chip, 0x320, 0x0002);	/* pin 2 = 0 */
 	creative_dsp_ca0113_list_quiet(chip, front, ARRAY_SIZE(front));
 	creative_ext_writew(chip, 0x320, 0x0103);	/* pin 3 = 1 */
-	id = creative_dsp_ca0113_read(chip, 0x48, 0x40, raw);	/* ES9038 chip ID, bits 7:2 */
-	if (id >> 2 == 0x1c)
+	id = creative_dsp_ca0113_read_checked(chip, 0x48, 0x40, raw);	/* ES9038 chip ID, bits 7:2 */
+	if (id == -EIO) {
+		msleep(10);
+		id = creative_dsp_ca0113_read_checked(chip, 0x48, 0x40, raw);
+	}
+	if (id >= 0 && id >> 2 == 0x1c)
 		dev_info(chip->dev, "board D0: GPIO pin 0 pulsed, the DAC answers (48/40 = 0x%02x)\n",
 			 id);
-	else
-		dev_warn(chip->dev, "board D0: GPIO pin 0 pulsed, but the DAC does not answer (48/40 = 0x%02x): the analog outputs will be silent\n",
+	else if (id >= 0)
+		dev_warn(chip->dev, "board D0: GPIO pin 0 pulsed, but the DAC answers with the wrong chip ID (48/40 = 0x%02x): the analog outputs will be silent\n",
 			 id);
+	else if (id == -EIO)
+		dev_warn(chip->dev, "board D0: GPIO pin 0 pulsed, but the DAC does not acknowledge its chip-ID read (48/40, I2C NACK, twice): the analog outputs will be silent\n");
+	else
+		dev_warn(chip->dev, "board D0: the card is off the bus (the DAC's chip-ID read all-ones)\n");
 }
 
 /*

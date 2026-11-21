@@ -60,7 +60,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.15"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.16"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -117,10 +117,10 @@ struct creative_rirb_entry {
 /* ------------------------------------------------------------------ */
 #define PCI_VENDOR_ID_CREATIVE		0x1102
 
-enum { DEVICE_AE7_AE9 = 0x0010,	  /* AE-7 / AE-9 (CA0132 Sound Core3D) */
-       DEVICE_RECON3D = 0x0012,	  /* Recon3D				  */
-       DEVICE_AE9_0013 = 0x0013,  /* AE-9 (standalone)		  */
-        DEVICE_AE9_0014 = 0x0014,  /* AE-9 (PCIe variant)		  */ };
+enum { DEVICE_AE7_AE9 = 0x0010,	/* every AE-9 and AE-7 seen (CA0132) */
+       DEVICE_Z_AE5 = 0x0012 };	/* Recon3D, Z, ZxR, AE-5, AE-5 Plus */
+/* Creative's INF also lists 0x0012 for the AE-9/AE-7 (never seen); its
+ * DEV_0011/0013/0015 are HD-Audio codec IDs, not PCI (core.c PCI table) */
 
 /* SD_CTL is 24 bits; byte 3 of the same dword is SD_STS, whose bits clear
  * when written with 1. Mask it out of every SD_CTL read-modify-write, or
@@ -533,6 +533,37 @@ struct creative_chip {
 	struct snd_kcontrol	*hu_auto_ctl;
 	bool			overlay_sent;	/* overlay transfer ran this bring-up */
 	unsigned long		hu_next_full;
+	/*
+	 * The DACs' I2C bus (0.12.16; dsp.c ca0113_status(), under
+	 * ca0113_mutex; debugfs state). BAR2 0x800 is a Synopsys DW_apb_i2c
+	 * (0x8fc = 0x44570140, v1.10a); the three status reads after each DAC
+	 * command are its read-to-clear registers, and 0x854 (CLR_TX_ABRT)
+	 * bit 0 = the transfer was aborted: on the AE-9 an I2C NACK (Windows'
+	 * 10186 cold-boot commands: 1 exactly on the 75 sent while GPIO pin 0,
+	 * the DACs' reset, was low). Counters only; nothing here touches the
+	 * card.
+	 */
+	struct ae9_dac_i2c {
+		u32		cmds[4], nack[4]; /* [0] 0x48, [1] 0x49, [2] 0x30 (AE-7), [3] other */
+		u32		late;		/* write commands NACKed after the bring-up (dsp_done): 0 when healthy */
+		u32		retried, recovered; /* NACKed writes sent again, and got through then */
+		u32		unfinished;	/* 0x860 bit 0 clear: no STOP yet at the status read */
+		u32		gone;		/* status read all-ones: card off the bus, not a NACK */
+		u32		read_bad;	/* register reads NACKed in either phase */
+		bool		expect;		/* AE-7 pre-clock window: count, no retry, no warning */
+		bool		abrt_src;	/* debugfs "dacabrt 1": also read 0x880 (TX_ABRT_SOURCE) */
+		bool		d07_bad;	/* last 48/07 write not acknowledged: dac48_07 unsure */
+		bool		last_rd;	/* the last NACK was a read (no value) */
+		u8		last_grp, last_reg, last_val;
+		u32		last_src;	/* its 0x880, with abrt_src */
+		unsigned long	last_at;	/* jiffies | 1 of the last NACK, 0 = none yet */
+	} dac_i2c;
+	/* a DAC command of the last switch to DSD not acknowledged (pcm.c,
+	 * under dsd_mutex): the DAC stays muted, warned once per start */
+	bool			dsd_dac_bad, dsd_dac_warned;
+	/* volume lists not acknowledged in a row (core.c): the heartbeat
+	 * sends the volume again up to HU_VOL_RESENDS times */
+	unsigned int		hu_vol_fails;
 };
 
 /*
@@ -761,11 +792,12 @@ int creative_ae9_streams_drain(struct creative_chip *chip, const char *why);
 void creative_ae9_hu_ae9_hold(struct creative_chip *chip);
 /* the audio router (ChipIO 0x190000..): 1 here applies the table after route changes */
 #define AE9_RT_APPLY		0x19042c
-void creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
-			      size_t n, const char *what);
-void creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
-				    const u8 (*cmds)[3], size_t n);
+int creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
+			     size_t n, const char *what);
+int creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
+				   const u8 (*cmds)[3], size_t n);
 u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
+int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[3]);
 
 /* ------------------------------------------------------------------ */
 /* MMIO accessor helpers (with mandated memory barriers)		  */

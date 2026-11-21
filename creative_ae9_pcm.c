@@ -1304,21 +1304,49 @@ static void ae9_i2s_map(struct creative_chip *chip, unsigned int ch, u8 tag, u8 
 	ae9_i2s_rmw(chip, AE9_I2S_MAP, 0xffU << (8 * ch), (u32)(tag << 4 | slot) << (8 * ch));
 }
 
-/* one front-DAC command (dsp.c's list: ca0113_mutex, settle; clears dac_start_key) */
-static void ae9_dsd_dac(struct creative_chip *chip, u8 reg, u8 val, const char *what)
+/*
+ * one front-DAC command (dsp.c's list: ca0113_mutex, settle, a NACKed
+ * command sent once more; clears dac_start_key): 0 = acknowledged
+ */
+static int ae9_dsd_dac(struct creative_chip *chip, u8 reg, u8 val, const char *what)
 {
 	const u8 cmd[1][3] = { { AE9_DSD_DAC, reg, val } };
 
-	creative_dsp_ca0113_list(chip, cmd, 1, what);
+	return creative_dsp_ca0113_list(chip, cmd, 1, what);
 }
 
-/* DAC 48/07 bit 0 (the filter bits stay: dsp.c puts the user's in) */
-static void ae9_dsd_dac_mute(struct creative_chip *chip, bool mute)
+/*
+ * DAC 48/07 bit 0 (the filter bits stay: dsp.c puts the user's in); sent
+ * also when dac48_07 already says so but the last 48/07 write wasn't
+ * acknowledged (dac_i2c.d07_bad: the DAC may not have it)
+ */
+static int ae9_dsd_dac_mute(struct creative_chip *chip, bool mute)
 {
-	if (!!(chip->dac48_07 & 1) == mute)
-		return;
-	ae9_dsd_dac(chip, ES9038_REG_MUTE, (chip->dac48_07 & ~1) | mute,
-		    mute ? "DSD64: DAC muted" : "DSD64: DAC unmuted");
+	if (!!(chip->dac48_07 & 1) == mute && !chip->dac_i2c.d07_bad)
+		return 0;
+	return ae9_dsd_dac(chip, ES9038_REG_MUTE, (chip->dac48_07 & ~1) | mute,
+			   mute ? "DSD64: DAC muted" : "DSD64: DAC unmuted");
+}
+
+/*
+ * The DAC's mute for the stream's state (the work below, under dsd_mutex):
+ * unmuted while the stream runs, unless it was muted before DSD or a DAC
+ * command of the switch to DSD wasn't acknowledged (dsd_dac_bad, 0.12.16:
+ * a refused 48/01 = 0xc3 leaves the DAC on its PCM input, which would play
+ * the DSD bit stream as noise). Then it stays muted, warned once per start.
+ */
+static void ae9_dsd_mute_sync(struct creative_chip *chip)
+{
+	bool mute = !READ_ONCE(chip->dsd_running) || chip->dsd_dac_muted;
+
+	if (!mute && chip->dsd_dac_bad) {
+		mute = true;
+		if (!chip->dsd_dac_warned) {
+			chip->dsd_dac_warned = true;
+			dev_warn(chip->dev, "DSD64: the DAC did not acknowledge its switch to DSD (I2C NACK): kept muted; stop and start playback to try again\n");
+		}
+	}
+	ae9_dsd_dac_mute(chip, mute);
 }
 
 /*
@@ -1343,7 +1371,7 @@ void creative_ae9_dsd_mute_work(struct work_struct *w)
 
 	mutex_lock(&chip->dsd_mutex);
 	if (chip->dsd_active && !creative_ae9_dead(chip) && !chip->suspended)
-		ae9_dsd_dac_mute(chip, !READ_ONCE(chip->dsd_running) || chip->dsd_dac_muted);
+		ae9_dsd_mute_sync(chip);
 	mutex_unlock(&chip->dsd_mutex);
 }
 
@@ -1359,6 +1387,7 @@ static void ae9_dsd_enter(struct creative_chip *chip)
 	bool hp = chip->hu_output;
 	u8 tag = chip->playback_stream_tag;
 	unsigned long flags;
+	int bad;
 
 	/* a PCM start on this open (hw_params again without hw_free): its
 	 * stop block first; on Windows a DSD stream is a stream of its own */
@@ -1384,12 +1413,12 @@ static void ae9_dsd_enter(struct creative_chip *chip)
 	 * on from CtxHdb's init.
 	 */
 	chip->dsd_dac_muted = chip->dac48_07 & 1;
-	ae9_dsd_dac_mute(chip, true);
+	bad = ae9_dsd_dac_mute(chip, true);
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_OUT, 0);
 
 	/* SetFormat, isDSD = 1: the ES9038 to DSD input (FUN_00032460 ->
 	 * FUN_000325c8(1, 0xc3)), GPIO pin 1 high (CtxHdb FUN_00013d10) */
-	ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
+	bad += ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
 	creative_ae9_gpio_set(chip, 1, true);
 
 	/* stage 2, the format and bind, stage 3's clocks */
@@ -1399,7 +1428,7 @@ static void ae9_dsd_enter(struct creative_chip *chip)
 	 * 48/0b; 48/0a = 0x02 (FUN_00032260); the I2S block at 16-bit words
 	 * (FUN_0001506c) and rate code 88.2 kHz (FUN_000150b8). (Windows skips
 	 * these two when its last stream was 88.2 kHz PCM; here always.) */
-	ae9_dsd_dac(chip, ES9038_REG_SYNC, 0x02, "DSD64: DAC sync");
+	bad += ae9_dsd_dac(chip, ES9038_REG_SYNC, 0x02, "DSD64: DAC sync");
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_24BIT, 0);
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, AE9_I2S_CTL_RATE,
 		    FIELD_PREP(AE9_I2S_CTL_RATE, AE9_I2S_RATE_88K2));
@@ -1421,11 +1450,15 @@ static void ae9_dsd_enter(struct creative_chip *chip)
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_A(AE9_DSD_CH_R));
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_B(AE9_DSD_CH_L));
 	ae9_i2s_rmw(chip, AE9_I2S_CTL, 0, AE9_I2S_CTL_CH_B(AE9_DSD_CH_R));
-	ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
+	bad += ae9_dsd_dac(chip, ES9038_REG_INPUT, 0xc3, "DSD64: DAC input DSD");
 
 	/* stage 3's end: no stream 0x14 enable in DSD, ASI 0x0f */
 	creative_ae9_dsd_asi_block(chip);
 
+	/* any of the DAC's commands above not acknowledged: no unmute
+	 * (ae9_dsd_mute_sync()) */
+	chip->dsd_dac_bad = bad > 0;
+	chip->dsd_dac_warned = false;
 	WRITE_ONCE(chip->dsd_active, true);	/* the trigger reads it */
 	chip->dsd_running = false;
 	chip->pcm_start_sent = 1;

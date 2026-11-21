@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.15
+Version:        0.12.16
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -102,6 +102,17 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_datadir}/%{name}/
 
 %changelog
+* Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.16-1
+- Driver 0.12.16: every card but the AE-9 is refused before it is touched,
+  even through a driver_override or new_id, with one log line naming it.
+  DAC I2C NACK detection: a 1-2 ms wait after the DACs leave reset (the
+  start-up mute lost on every load now gets through); a refused DAC
+  command is sent once more, a refused volume write again, the playback
+  setup redone, DSD stays muted if its DAC switch failed; checked DAC
+  reads (the one-behind read lag is gone); the shutdown's expected NACKs
+  counted, not retried; debugfs "DAC I2C" line and dacabrt. 21 module
+  options, no default changes.
+
 * Fri Nov 20 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.15-1
 - Driver 0.12.15: native DSD64 on by default (pcm_dsd=0 turns it off; a
   file with pcm_dsd=1 keeps it on). MPD on hw:AE9,0 no longer crackles at

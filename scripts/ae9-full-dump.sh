@@ -208,6 +208,10 @@ for a in 0x189030 0x18902c 0x18b030 0x18b0a4 0x18b008; do
 	esac
 	printf '%-9s %-12s %s\n' "$a" "$v" "$note"
 done
+# BAR2 0x800 is the DACs' I2C controller (a DW_apb_i2c). Never add 0x840,
+# 0x854 or 0x860 here: they clear on read, and r2 doesn't take the driver's
+# DAC lock, so such a read races the driver and steals a DAC command's NACK
+# (0.12.16: the driver state's "DAC I2C" line counts them).
 echo "--- BAR2 0x800 block (codec 2): 0x86c bit 0 enable, 0x89c bit 0 ack, 0x800 mode"
 for o in 0x800 0x804 0x86c 0x89c; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
 

@@ -632,8 +632,9 @@ static void pb_dac(u8 (*cmds)[3], unsigned int *n, u8 reg, u8 val)
  * played garbled or silent. Windows READS 48/0b first (0x20c = 0x800003);
  * that read was decoded as "48/0b = 0x00" and sent as a write until
  * 2026-11-08 (25 of 25 captures: never a 0x00 write); it isn't sent.
+ * Returns the number of commands the DAC didn't acknowledge (dsp.c).
  */
-static void ae9_pb_dac_start(struct creative_chip *chip, bool hp, bool fam441, u8 sync)
+static int ae9_pb_dac_start(struct creative_chip *chip, bool hp, bool fam441, u8 sync)
 {
 	bool hp_mode = hp && !chip->lo_virt_phys;
 	u8 cmds[13][3];	/* 12, 13 for the 44.1 kHz family */
@@ -654,9 +655,9 @@ static void ae9_pb_dac_start(struct creative_chip *chip, bool hp, bool fam441, u
 	if (fam441)
 		pb_dac(cmds, &n, ES9038_SPDIF_SELECT, 0x20);
 	pb_dac(cmds, &n, ES9038_SYNC_CONFIG, sync);
-	creative_dsp_ca0113_list(chip, cmds, n,
-				 fam441 ? "playback-start commands (44.1 kHz family)" :
-					  "playback-start commands");
+	return creative_dsp_ca0113_list(chip, cmds, n,
+					fam441 ? "playback-start commands (44.1 kHz family)" :
+						 "playback-start commands");
 }
 
 /*
@@ -733,8 +734,10 @@ static void ae9_pb_start(struct creative_chip *chip, unsigned int rate, u16 form
 		ae9_dbg(chip, "dac_start_skip: DAC already set for %u Hz, start commands skipped\n",
 			row->rate);
 	} else {
-		ae9_pb_dac_start(chip, hp, row->route == AE9_ROUTE_SRC, row->dac0a);
-		chip->dac_start_key = (r + 1) | hp << 8;
+		/* the key only when every command got through (dsp.c sent a
+		 * refused one once more): else the next start sends them all */
+		if (!ae9_pb_dac_start(chip, hp, row->route == AE9_ROUTE_SRC, row->dac0a))
+			chip->dac_start_key = (r + 1) | hp << 8;
 	}
 	six = (format & 0xf) == 5 && row->ports <= 8 && chip->fx.direct;
 	if (chip->fx.direct && !chip->rt_direct_swept) {
@@ -1456,7 +1459,15 @@ static void pd_codecs_d3(struct creative_chip *chip, bool cold)
 	blk_send(&b, AE9_NID_AFG, AE9_VERB_SET_NODE_WORD_LO, 0x00);
 	blk_send(&b, AE9_NID_AFG, AE9_VERB_SET_NODE_WORD_HI, 0x53);
 	blk_end(&b, what);
+	/*
+	 * GPIO pin 0 has been low since pd_power_down(): the DACs are in reset
+	 * and don't acknowledge this pair, in Windows' stop too (0x854 = 1 in
+	 * every capture; 0.12.16-rc1 on the card). Expected NACKs: counted, not
+	 * retried (the stop's traffic stays Windows'), no warning.
+	 */
+	chip->dac_i2c.expect = true;
 	pd_dacs_mute(chip);
+	chip->dac_i2c.expect = false;
 	blk_begin(&b, chip);
 	blk_send(&b, AE9_NID_AFG, AC_VERB_SET_POWER_STATE, d3);
 	blk_end(&b, what);
