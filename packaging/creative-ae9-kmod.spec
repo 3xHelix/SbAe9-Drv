@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.16
+Version:        0.12.17
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -55,6 +55,17 @@ done
 %{?akmod_install}
 
 %changelog
+* Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.17-1
+- Driver 0.12.17: DAC register reads are single (0.12.16's status checks
+  made the triple read unnecessary); Driver Health has a 9th value, late
+  DAC I2C NACKs (0 on a healthy card); stream and command-ring DMA stopped
+  before a bus reset on retry and resume; the bridge log shows the
+  discard-timer and AER secondary status, decoded, once and on change; a
+  "card alive" check of the controller's ID registers after the bus
+  reset refuses a card that didn't come back; debugfs "DMA FIFO" line and
+  "readahead" sampler. A read-ahead pointer was tried and dropped. 21
+  module options, no default changes.
+
 * Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.16-1
 - Driver 0.12.16: every card but the AE-9 is refused before it is touched,
   even through a driver_override or new_id, with one log line naming it.

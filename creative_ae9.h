@@ -60,7 +60,7 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.16"
+#define CREATIVE_AE9_DRV_VERSION	"0.12.17"
 #define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
 
 /* ------------------------------------------------------------------ */
@@ -85,10 +85,17 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define CREATIVE_REG_STREAM_RESET	0x305	/* stream reset bitmask */
 #define CREATIVE_REG_STREAM_INT_BASE	0x454	/* per-stream int base addr */
 
-/* ------------------------------------------------------------------ */
-/* CA0132 extended stream descriptor registers				  */
-/* ------------------------------------------------------------------ */
-#define CA0132_SD_FIFOS		0x20	/* FIFO size (bytes consumed) */
+/*
+ * A playback stream's DMA FIFO, for debugfs (creative_ae9_pcm.c): SDnFIFOS
+ * (AZX_REG_SD_FIFOSIZE, 0x10; the old CA0132_SD_FIFOS 0x20 here was the
+ * next descriptor and unused) read at the start, with RUN set.
+ */
+struct ae9_fifo {
+	u16		fifos_run;	/* read at the start (RUN set); 0 = not read */
+	u16		fmt;		/* the SDnFMT it was read for */
+	u16		frame_bytes;	/* bytes per frame in the DMA buffer (DSD: 12) */
+	unsigned int	rate;
+};
 
 /* ------------------------------------------------------------------ */
 /* CORB / RIRB constants						  */
@@ -158,6 +165,11 @@ struct creative_chip {
 						 * (the PCMs and card go away) */
 	atomic_t		bdl_leaks;	/* BDLs kept: their stream didn't stop */
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
+	u8			br_discards;	/* bridge log lines that found its discard timer
+						 * expired (core.c; stops at 255) */
+	bool			br_aer_seen;	/* br_aer holds a reading (core.c) */
+	u32			br_aer;		/* the bridge's AER secondary uncorrectable
+						 * status at the last bring-up log line */
 	size_t			dma_pad;	/* spare bytes after every DMA buffer */
 	void __iomem		*ext_regs;	/* BAR2 */
 
@@ -564,6 +576,12 @@ struct creative_chip {
 	/* volume lists not acknowledged in a row (core.c): the heartbeat
 	 * sends the volume again up to HU_VOL_RESENDS times */
 	unsigned int		hu_vol_fails;
+	/* the DMA FIFOs of main playback (SD4) and optical out (SD6), pcm.c
+	 * (last, so no field above moves) */
+	struct ae9_fifo		pb_fifo, opt_fifo;
+	/* the card's BAR2 ID registers at the last bring-up (core.c
+	 * ae9_bar2_alive(): 0x8fc, 0xcfc, 0x4; last, so no field above moves) */
+	u32			bar2_id[3];
 };
 
 /*
@@ -576,6 +594,7 @@ struct creative_chip {
 void creative_ae9_dead_notify(struct creative_chip *chip);
 void creative_ae9_dma_dump(struct creative_chip *chip, const char *why);
 void creative_ae9_dma_quiesce(struct creative_chip *chip);
+unsigned int creative_ae9_dma_stop_all(struct creative_chip *chip);
 void creative_ae9_dead_work(struct work_struct *w);
 void creative_ae9_health_notify(struct creative_chip *chip);
 void creative_ae9_r51_reset(struct creative_chip *chip);
@@ -652,6 +671,10 @@ int creative_ae9_pcm_init(struct creative_chip *chip);
  * off, output switch, suspend, unload); the DAC mute after a trigger */
 void creative_ae9_dsd_abort(struct creative_chip *chip, const char *why);
 void creative_ae9_dsd_mute_work(struct work_struct *w);
+/* the playback DMA FIFOs: debugfs state's line, debugfs "readahead" */
+struct seq_file;
+void creative_ae9_pcm_fifo_show(struct seq_file *m, struct creative_chip *chip);
+void creative_ae9_pcm_debugfs(struct creative_chip *chip);
 
 /* creative_ae9_core.c */
 /* IRQ handler is static in core.c — not exported */
@@ -797,7 +820,7 @@ int creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 int creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
 				   const u8 (*cmds)[3], size_t n);
 u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
-int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[3]);
+int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 
 /* ------------------------------------------------------------------ */
 /* MMIO accessor helpers (with mandated memory barriers)		  */

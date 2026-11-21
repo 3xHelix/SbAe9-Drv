@@ -489,7 +489,7 @@ static void creative_ae9_board_d0(struct creative_chip *chip)
 {
 	static const u8 mute[][3] = { { 0x48, 0x07, 0x81 }, { 0x49, 0x0a, 0x07 } };
 	static const u8 front[][3] = { { 0x48, 0x1d, 0x40 } };
-	u32 raw[3];
+	u32 raw[2];
 	int id;
 
 	creative_ext_writel(chip, 0x100, creative_ext_readl(chip, 0x100) & ~0x0fU);

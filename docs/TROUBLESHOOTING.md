@@ -144,10 +144,11 @@ files to read in `~/ae9-dumps/ae9-report-<time>/` and one
   those off at the next Direct Mode start.
 
 A quick health check any user can run, any time (0.12.11+):
-`amixer -c AE9 cget name='Driver Health'`. The first five of its eight
+`amixer -c AE9 cget name='Driver Health'`. The first five of its nine
 numbers (command timeouts, answers that never landed, answers from the wrong
-codec, unreadable ring pointer, DMA buffers kept) should be 0; if one isn't,
-include that line in your report.
+codec, unreadable ring pointer, DMA buffers kept) should be 0, and so should
+the ninth (late DAC I2C NACKs: DAC commands the DAC didn't acknowledge after
+start-up, 0.12.17+); if one isn't, include that line in your report.
 
 Two more tools for volunteers (read-only):
 

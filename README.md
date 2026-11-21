@@ -7,27 +7,28 @@ An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 `snd_hda_intel` + `snd_hda_codec_ca0132` drivers don't support this card;
 this one does, by doing what Creative's Windows driver does, step by step.
 
-**Latest: v0.12.16** (2026-11-21) · [Changelog](CHANGELOG.md) ·
+**Latest: v0.12.17** (2026-11-21) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
 Pre-releases, tested on two cards.
 
-## New in v0.12.16: every DAC command checked
+## New in v0.12.17: sturdier card resets
 
-A quiet release, the kind you don't hear. The AE-9's two DACs take their
-orders over a small I2C bus, and until now the driver never checked whether
-they got them. Now it does:
+Another quiet one. It's mostly about the moments the driver resets the card
+(a start-up retry, a resume from sleep), and what it can tell you:
 
-- **Every DAC command is checked,** and a missed one is sent again: the
-  volume, the playback setup, the switch to DSD (which stays muted rather
-  than play noise).
-- **The start-up mute every load lost now gets through:** a 1-2 ms wait
-  after the DACs leave reset, as Windows does.
-- **Other cards are left alone.** Point the driver at an AE-7, an AE-5 or
-  anything else and it refuses before touching it, with one log line that
-  says how to give the card back.
+- **Nothing in flight during a bus reset:** any stream or command DMA still
+  running is stopped first.
+- **A card that didn't come back is refused cleanly:** after the reset the
+  driver reads the controller's ID registers before it trusts the card.
+- **Driver Health has a 9th number:** DAC commands a DAC refused after
+  start-up. 0 on a healthy card; SbAe9-AudioMon v0.4.11 shows it.
+- **DAC reads are single** now that every DAC command is checked.
 
-On our cards: 0 missed commands in about 1,100. Nothing to set up, nothing
-changes in how you use it.
+Plus a clearer bridge log and new debugfs readouts for the card's DMA FIFO.
+We also tried letting the playback pointer run ahead to cover the DMA's
+read-ahead, and dropped it: on this card it can't be made safe (details in
+the [changelog](CHANGELOG.md)). Nothing to set up, nothing changes in how
+you use it.
 
 ## 💣 Native DSD64, on by default
 
@@ -83,7 +84,7 @@ Creative stops at DSD64 too. Those files still play, as PCM.
 - **[SbAe9-AudioMon](https://github.com/3xHelix/SbAe9-AudioMon)**: level
   meters for every AE-9 input and output, with a debug log.
 
-Driver v0.12.16 works with SbAe9-SBC v0.23.0 and SbAe9-AudioMon v0.4.11. Older
+Driver v0.12.17 works with SbAe9-SBC v0.23.0 and SbAe9-AudioMon v0.4.11. Older
 app versions still work, with fewer controls. Earlier pairings are in the
 [changelog](CHANGELOG.md).
 
@@ -149,7 +150,7 @@ Download `creative-ae9-dkms_<version>-1_all.deb` from the
 [latest release](https://github.com/3xHelix/SbAe9-Drv/releases), then:
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.16-1_all.deb innoextract
+sudo apt install ./creative-ae9-dkms_0.12.17-1_all.deb innoextract
 ```
 
 Secure Boot: `sudo mokutil --import /var/lib/dkms/mok.pub` once, then

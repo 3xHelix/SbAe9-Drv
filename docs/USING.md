@@ -469,12 +469,15 @@ column); 128 or more is fine.
 - **If the DSP misses its boot handshake** (at load or on resume), the driver
   runs that shutdown and tries again: 3 attempts, 2 s apart.
 - **"Driver Health"** (read-only, any user): `amixer -c AE9 cget
-  name='Driver Health'` gives 8 numbers: command timeouts, command-ring
+  name='Driver Health'` gives 9 numbers: command timeouts, command-ring
   answers that never landed, answers from the wrong codec, unreadable ring
   pointer reads, DMA buffers kept because a stream didn't stop (all 0 on a
   healthy card), then late ring answers, the longest wait for one (µs) and
-  the router's free slots (information). Apps can follow it with `amixer
-  events` (SbAe9-AudioMon does). Since 0.12.11.
+  the router's free slots (information), then late DAC I2C NACKs: DAC
+  commands the DAC didn't acknowledge after start-up (0 on a healthy
+  card; 0.12.17). Apps can follow it with `amixer events` (SbAe9-AudioMon
+  0.4.11 shows all 9; older versions expect exactly 8 and show n/a).
+  Since 0.12.11.
 - **Reloading the driver:** `ae9-reload` stops what holds the card,
   reloads the driver and starts everything again; Sound Blaster Command
   and AudioMon let go of the card while it runs (see

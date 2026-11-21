@@ -3045,8 +3045,9 @@ static int ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
  *
  * Returns the number of commands not acknowledged in the end
  * (ca0113_status(): a NACK, the card off the bus, no STOP yet). A NACK
- * after the bring-up (dsp_done) is a warning; before it (the board-D0 step)
- * and in the pre-clock window a debug line: debugfs state counts them all.
+ * after the bring-up (dsp_done) is a warning, counted as late (Driver
+ * Health [8], with a change event); before it (the board-D0 step) and in
+ * the pre-clock window a debug line: debugfs state counts them all.
  */
 static int ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 		       size_t n, unsigned int settle_us)
@@ -3054,9 +3055,12 @@ static int ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 	struct ae9_dac_i2c *s = &chip->dac_i2c;
 	const char *again;
 	int res, bad = 0;
+	bool late;
+	u32 late0;
 	size_t i;
 
 	mutex_lock(&chip->ca0113_mutex);
+	late0 = s->late;
 	for (i = 0; i < n; i++) {
 		u8 grp = cmds[i][0], reg = cmds[i][1], val = cmds[i][2];
 
@@ -3094,7 +3098,10 @@ static int ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 				again);
 		}
 	}
+	late = s->late != late0;
 	mutex_unlock(&chip->ca0113_mutex);
+	if (late)	/* Driver Health [8] (core.c) */
+		creative_ae9_health_notify(chip);
 	return bad;
 }
 
@@ -3251,43 +3258,38 @@ static int ca0113_read_once(struct creative_chip *chip, u8 group, u8 reg, u32 *f
 }
 
 /*
- * uv34 (2026-11-12, no settle after 0x204): each read returned the
- * previous read's result, and the first after a pause returned junk; the
- * value was right from the third read of a register on. So: the same
- * register three times, the last one counts (raw[] = the three reads' last
- * 0x208 values). (Whether the status reads above cure that lag is for a
- * card test to show; until then the three reads stay.)
+ * One read, checked. uv34 (2026-11-12, no settle after 0x204, no status
+ * reads) had each read return the previous read's result and the first
+ * after a pause junk, so until 0.12.16 every register was read three times
+ * and the last counted. With the status reads after each phase (0.12.16)
+ * the card gave the same byte on all three reads on every line (rc2,
+ * 2026-11-21: dacr 48/40 = 0x71 three times, alternating registers too),
+ * so since 0.12.17 one read, as Windows reads (raw[] = its two 0x208
+ * values: the first, then the one that counts).
  *
- * Checked: the byte, or -EIO when the DAC didn't acknowledge the 2nd or
- * 3rd read (whose bytes count: 0x208 then holds an older read's), -ENODEV
- * when the card is off the bus. A NACKed first read only shows in debugfs
- * state.
+ * Checked: the byte, or -EIO when the DAC didn't acknowledge either phase
+ * (0x208 then holds an older read's byte), -ENODEV when the card is off
+ * the bus.
  */
-int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[3])
+int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
 {
-	int res[3], i;
-	u32 first;
+	int res;
 
 	mutex_lock(&chip->ca0113_mutex);
-	for (i = 0; i < 3; i++)
-		res[i] = ca0113_read_once(chip, group, reg, &first, &raw[i]);
+	res = ca0113_read_once(chip, group, reg, &raw[0], &raw[1]);
 	mutex_unlock(&chip->ca0113_mutex);
-	if (res[0] == CA0113_GONE || res[1] == CA0113_GONE || res[2] == CA0113_GONE)
+	if (res == CA0113_GONE)
 		return -ENODEV;
-	if (res[1] != CA0113_ACK || res[2] != CA0113_ACK)
+	if (res != CA0113_ACK)
 		return -EIO;
-	return raw[2] & 0xff;
+	return raw[1] & 0xff;
 }
 
-/* the same, unchecked: the last read's byte, raw[] = the 2nd and 3rd 0x208 values */
+/* the same, unchecked: the byte, raw[] = the read's two 0x208 values */
 u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
 {
-	u32 r[3];
-
-	creative_dsp_ca0113_read_checked(chip, group, reg, r);
-	raw[0] = r[1];
-	raw[1] = r[2];
-	return r[2] & 0xff;
+	creative_dsp_ca0113_read_checked(chip, group, reg, raw);
+	return raw[1] & 0xff;
 }
 
 /* worth a re-download: not a missing card, firmware file or memory */

@@ -10,9 +10,12 @@
 //
 
 #include <linux/bitfield.h>
+#include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/hrtimer.h>
 #include <linux/math64.h>
+#include <linux/seq_file.h>
 #include <linux/uio.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
@@ -241,6 +244,62 @@ void creative_ae9_dma_quiesce(struct creative_chip *chip)
 	writel(readl(chip->hda_regs + AZX_REG_INTCTL) & 0xc0000000,
 	       chip->hda_regs + AZX_REG_INTCTL);
 	dev_err(chip->dev, "card stopped answering: stream DMA stopped (descriptors 0x%x)\n", stopped);
+}
+
+/*
+ * Before a secondary bus reset (core.c, the bring-up): the Tsi381 manual
+ * (10.1.2) wants no request pending when the reset bit is set, and a
+ * running DMA engine keeps making them. So every stream descriptor that
+ * runs and the CORB/RIRB DMA are stopped first, each waited for (HD-Audio
+ * spec 3.3.35: stopped once RUN reads back 0; 4.4.1.3, 4.4.2 for the
+ * rings), and the interrupts switched off. Nothing to do with the
+ * controller in reset (GCTL CRST = 0 resets every DMA engine; Windows'
+ * shutdown, win_shutdown(), leaves it so) or off the bus. Returns what it
+ * stopped: bit n = stream descriptor n, bit 16 the CORB, bit 17 the RIRB.
+ */
+unsigned int creative_ae9_dma_stop_all(struct creative_chip *chip)
+{
+	u32 gctl = creative_hda_readl(chip, AZX_REG_GCTL);
+	unsigned int n, i, t, stopped = 0;
+	u32 ctl;
+
+	if (gctl == ~0U || !(gctl & AZX_GCTL_RESET))
+		return 0;
+	n = ae9_sd_count(creative_hda_readw(chip, AZX_REG_GCAP));
+	for (i = 0; i < n; i++) {
+		unsigned int base = 0x80 + i * 0x20;
+
+		ctl = creative_hda_readl(chip, base + AZX_REG_SD_CTL);
+		if (!(ctl & SD_CTL_DMA_START))
+			continue;
+		/* RUN, IOCE, FEIE, DEIE off */
+		creative_hda_writel(chip, base + AZX_REG_SD_CTL,
+				    ctl & SD_CTL_WMASK & ~(SD_CTL_DMA_START | 0x1c));
+		ae9_sd_wait_stopped(chip, base, "before the bus reset");
+		stopped |= BIT(i);
+	}
+	if (creative_hda_readb(chip, AZX_REG_CORBCTL) & AZX_CORBCTL_RUN) {
+		creative_hda_writeb(chip, AZX_REG_CORBCTL, 0);
+		stopped |= BIT(16);
+	}
+	if (creative_hda_readb(chip, AZX_REG_RIRBCTL) & AZX_RBCTL_DMA_EN) {
+		creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0);
+		stopped |= BIT(17);
+	}
+	/* up to 1 ms for both rings to report stopped (as corb_init) */
+	for (t = 0; t < 100 && (stopped & (BIT(16) | BIT(17))); t++) {
+		u8 corb = creative_hda_readb(chip, AZX_REG_CORBCTL);
+		u8 rirb = creative_hda_readb(chip, AZX_REG_RIRBCTL);
+
+		if (!(corb & AZX_CORBCTL_RUN) && !(rirb & AZX_RBCTL_DMA_EN))
+			break;
+		if (t == 99)
+			dev_warn(chip->dev, "before the bus reset: the command rings didn't stop in 1 ms (CORBCTL 0x%02x, RIRBCTL 0x%02x)\n",
+				 corb, rirb);
+		udelay(10);
+	}
+	creative_hda_writel(chip, AZX_REG_INTCTL, 0);
+	return stopped;
 }
 
 static void ae9_pcm_track(struct creative_chip *chip, struct snd_pcm *pcm)
@@ -1884,6 +1943,57 @@ static int creative_ae9_pcm_hw_free(struct snd_pcm_substream *substream)
 }
 
 /* ------------------------------------------------------------------ */
+/* DMA FIFO: SDnFIFOS per playback stream (debugfs only)		  */
+/* ------------------------------------------------------------------ */
+/*
+ * The card's DMA reads a playback stream into the stream's FIFO before the
+ * link sends it out; LPIB, which the pointer reports, is the link's
+ * position. SDnFIFOS (HD-Audio spec 3.3.40) is the most bytes fetched but
+ * not yet sent, less one. It depends on the format, and it holds the
+ * format's value only while RUN is set: read after the format and before
+ * RUN it was 0x107, the register's reset value, at all 31 formats measured
+ * on the card (2026-11-21). So it's read right after RUN, for debugfs
+ * state's "DMA FIFO" line and "readahead" (below): 264 bytes at 44.1/48 kHz
+ * 24/32-bit stereo, 392 at 88.2/96 kHz 24-bit, 520 at 88.2/96 kHz 32-bit,
+ * 776 at 176.4/192 kHz 24-bit and for DSD's 6 x 16 bit, 1544 at 384 kHz
+ * (192 kHz x 4 ch), 3080 at 5.1 192 kHz 32-bit, 264 for 16-bit optical up
+ * to 96 kHz (176.4 kHz reads as 192 kHz).
+ *
+ * Counting part of that FIFO into the pointer (0.12.17's pcm_fifo option,
+ * card-tested and dropped: docs/dev/DMA-READAHEAD-0.12.17.md) isn't safe on
+ * this card: behind its PCI bridge the DMA position moves when a read is
+ * requested, before the data arrives, so nothing says how much is really
+ * fetched. Even a quarter of the FIFO spliced stale audio. The pointer stays
+ * LPIB; the 4-period buffer rule (above) and the WirePlumber headroom rule
+ * (config/) cover the read-ahead.
+ */
+
+/* SDnFIFOS (16 bits at descriptor + 0x10); 0 = unreadable */
+static u16 ae9_fifo_read(struct creative_chip *chip, unsigned int base)
+{
+	u16 v = creative_hda_readw(chip, base + AZX_REG_SD_FIFOSIZE);
+
+	return v == 0xffff ? 0 : v;
+}
+
+/* prepare, after the format is set: what debugfs shows the reading for
+ * (no card access: SDnFIFOS before RUN is the register's reset value) */
+static void ae9_fifo_prepare(struct ae9_fifo *f, u16 fmt, unsigned int frame_bytes,
+			     unsigned int rate)
+{
+	f->fifos_run = 0;
+	f->fmt = fmt;
+	f->frame_bytes = frame_bytes;
+	f->rate = rate;
+}
+
+/* trigger START, RUN just set: SDnFIFOS for the format (valid while RUN) */
+static void ae9_fifo_start(struct creative_chip *chip, struct ae9_fifo *f, unsigned int base)
+{
+	f->fifos_run = ae9_fifo_read(chip, base);
+}
+
+/* ------------------------------------------------------------------ */
 /* prepare — program BDL and stream registers			  */
 /* ------------------------------------------------------------------ */
 
@@ -1978,6 +2088,8 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 		format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
 						    runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
+	ae9_fifo_prepare(&chip->pb_fifo, format,
+			 dsd ? AE9_DSD_HW_FRAME : frames_to_bytes(runtime, 1), runtime->rate);
 
 	/* Write BDL pointer as fallback */
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL,
@@ -2047,6 +2159,8 @@ static int creative_ae9_pcm_trigger(struct snd_pcm_substream *substream,
 	case SNDRV_PCM_TRIGGER_RESUME:
 		/* stream only; the start block went out at prepare */
 		creative_ae9_stream_start(chip, base);
+		if (cmd == SNDRV_PCM_TRIGGER_START)
+			ae9_fifo_start(chip, &chip->pb_fifo, base);
 		if (dsd)
 			ae9_dsd_run(chip, true);
 		creative_ae9_dsp_switch_kick(chip);
@@ -2270,6 +2384,7 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 			runtime->format == SNDRV_PCM_FORMAT_S16_LE ? 16 : 24,
 			runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
+	ae9_fifo_prepare(&chip->opt_fifo, format, frames_to_bytes(runtime, 1), runtime->rate);
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPL,
 			    lower_32_bits(chip->opt_bdl_dma));
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
@@ -2293,6 +2408,8 @@ static int creative_ae9_opt_trigger(struct snd_pcm_substream *substream, int cmd
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
 		creative_ae9_stream_start(chip, base);
+		if (cmd == SNDRV_PCM_TRIGGER_START)
+			ae9_fifo_start(chip, &chip->opt_fifo, base);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
@@ -3207,6 +3324,198 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 /* ------------------------------------------------------------------ */
 /* PCM device init / free						  */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* debugfs: the playback DMA FIFOs					  */
+/* ------------------------------------------------------------------ */
+
+/* one stream for state's line: SDnFIFOS read at the last start (RUN set) in
+ * bytes, frames and time (no card access) */
+static void ae9_fifo_show_one(struct seq_file *m, const char *name, const struct ae9_fifo *f)
+{
+	unsigned int fb = f->frame_bytes, size = f->fifos_run + 1U;
+
+	if (!fb || !f->rate) {
+		seq_printf(m, "%s none prepared", name);
+		return;
+	}
+	seq_printf(m, "%s fmt 0x%04x: ", name, f->fmt);
+	if (f->fifos_run)
+		seq_printf(m, "FIFOS 0x%03x at RUN = %u bytes = %u.%u frames = %llu us",
+			   f->fifos_run, size, size / fb, size * 10 / fb % 10,
+			   div_u64((u64)size * 1000000, fb * f->rate));
+	else
+		seq_puts(m, "FIFOS not read yet (at the start)");
+}
+
+void creative_ae9_pcm_fifo_show(struct seq_file *m, struct creative_chip *chip)
+{
+	seq_puts(m, "DMA FIFO: ");
+	ae9_fifo_show_one(m, "playback", &chip->pb_fifo);
+	ae9_fifo_show_one(m, "; optical out", &chip->opt_fifo);
+	seq_putc(m, '\n');
+}
+
+/*
+ * debugfs "readahead": how far the DMA is ahead of LPIB right now on the
+ * playback streams that run, from the DMA position buffer (HD-Audio spec
+ * 3.3.32: the controller writes each stream's DMA position to memory),
+ * switched on for the ~30 ms this takes and off again. On demand only (the
+ * pcm_posbuf option measured it until 0.12.12): it checks SDnFIFOS against
+ * the read-ahead at any format. Per stream: the least, mean and most bytes
+ * ahead (samples where LPIB moved during the sample are left out), how many
+ * samples were above FIFOS + 1, and how the DMA position moves (by how much
+ * at a time, and how far LPIB went between). Behind the card's bridge the
+ * DMA position counts reads requested, not data arrived (above), so this is
+ * an upper bound of what's fetched.
+ */
+#define AE9_RA_SAMPLES	4000
+
+struct ae9_ra {
+	unsigned int base, cbl, idx, size;
+	const struct ae9_fifo *f;
+	bool run;
+	unsigned int n, steady, above, moves;
+	u32 gmin, gmax, smin, smax, lmin, lmax, last_d, last_l;
+	u64 gsum;
+};
+
+static void ae9_ra_sample(struct creative_chip *chip, struct ae9_ra *r, const __le32 *posbuf)
+{
+	u32 l1, l2, d, gap, step, lmove;
+
+	l1 = readl(chip->hda_regs + r->base + AZX_REG_SD_LPIB);
+	d = le32_to_cpu(READ_ONCE(posbuf[r->idx * 2]));
+	l2 = readl(chip->hda_regs + r->base + AZX_REG_SD_LPIB);
+	r->n++;
+	if (l1 != l2 || l1 >= r->cbl || d >= r->cbl)
+		return;
+	r->steady++;
+	gap = (d + r->cbl - l1) % r->cbl;
+	r->gmin = min(r->gmin, gap);
+	r->gmax = max(r->gmax, gap);
+	r->gsum += gap;
+	if (gap > r->size)
+		r->above++;
+	if (d == r->last_d)
+		return;
+	if (r->moves) {
+		step = (d + r->cbl - r->last_d) % r->cbl;
+		lmove = (l1 + r->cbl - r->last_l) % r->cbl;
+		r->smin = min(r->smin, step);
+		r->smax = max(r->smax, step);
+		r->lmin = min(r->lmin, lmove);
+		r->lmax = max(r->lmax, lmove);
+	}
+	r->moves++;
+	r->last_d = d;
+	r->last_l = l1;
+}
+
+static void ae9_ra_report(struct seq_file *m, const char *name, const struct ae9_ra *r)
+{
+	unsigned int fb = r->f->frame_bytes ?: 1;
+
+	if (!r->run) {
+		seq_printf(m, "%s: not running\n", name);
+		return;
+	}
+	seq_printf(m, "%s: fmt 0x%04x, %u bytes/frame, buffer %u bytes; FIFOS + 1 = %u bytes (%u.%u frames)\n",
+		   name, r->f->fmt, fb, r->cbl, r->size, r->size / fb, r->size * 10 / fb % 10);
+	if (!r->steady) {
+		seq_printf(m, "  no steady sample of %u (DMA position %s)\n", r->n,
+			   r->last_d == U32_MAX ? "never written" : "outside the buffer");
+		return;
+	}
+	seq_printf(m, "  DMA ahead of LPIB: least %u, mean %llu, most %u bytes = %u.%u / %llu / %u.%u frames (%u of %u samples steady)\n",
+		   r->gmin, div_u64(r->gsum, r->steady), r->gmax,
+		   r->gmin / fb, r->gmin * 10 / fb % 10, div_u64(r->gsum, r->steady * fb),
+		   r->gmax / fb, r->gmax * 10 / fb % 10, r->steady, r->n);
+	seq_printf(m, "  above FIFOS + 1: %u samples\n", r->above);
+	if (r->moves > 1)
+		seq_printf(m, "  DMA position moved %u times, by %u-%u bytes; LPIB moved %u-%u bytes between\n",
+			   r->moves, r->smin, r->smax, r->lmin, r->lmax);
+	else
+		seq_printf(m, "  DMA position moved %u times\n", r->moves);
+}
+
+static int ae9_readahead_show(struct seq_file *m, void *v)
+{
+	static DEFINE_MUTEX(ra_mutex);	/* one reader at a time: DPLBASE is global */
+	struct creative_chip *chip = m->private;
+	struct ae9_ra r[2] = {
+		{ .base = chip->playback_stream_base, .f = &chip->pb_fifo },
+		{ .base = CREATIVE_OPT_STREAM_BASE, .f = &chip->opt_fifo },
+	};
+	size_t sz = ae9_dma_size(chip, PAGE_SIZE);
+	dma_addr_t dma;
+	__le32 *posbuf;
+	unsigned int i, k;
+	int ret = 0;
+
+	if (chip->suspended || chip->card_gone || chip->card_hung || !chip->corb_buf) {
+		seq_puts(m, "card not readable now (suspended, gone or not up)\n");
+		return 0;
+	}
+	mutex_lock(&ra_mutex);
+	if (readl(chip->hda_regs + AZX_REG_DPLBASE) & AZX_DPLBASE_ENABLE) {
+		seq_puts(m, "the DMA position buffer is on already: not touched\n");
+		goto out;
+	}
+	for (k = 0; k < 2; k++) {
+		const struct ae9_fifo *f = r[k].f;
+
+		r[k].run = readl(chip->hda_regs + r[k].base + AZX_REG_SD_CTL) & SD_CTL_DMA_START;
+		r[k].cbl = readl(chip->hda_regs + r[k].base + AZX_REG_SD_CBL);
+		r[k].idx = (r[k].base - 0x80) / 0x20;
+		r[k].size = f->fifos_run + 1U;
+		r[k].gmin = U32_MAX;
+		r[k].smin = U32_MAX;
+		r[k].lmin = U32_MAX;
+		r[k].last_d = U32_MAX;
+		if (!r[k].cbl || r[k].cbl == U32_MAX || !f->fifos_run)
+			r[k].run = false;
+	}
+	if (!r[0].run && !r[1].run) {
+		seq_puts(m, "no playback stream runs: start one, then read this again\n");
+		goto out;
+	}
+	posbuf = dma_alloc_coherent(chip->dev, sz, &dma, GFP_KERNEL);
+	if (!posbuf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	memset(posbuf, 0xff, PAGE_SIZE);
+	creative_hda_writel(chip, AZX_REG_DPUBASE, upper_32_bits(dma));
+	creative_hda_writel(chip, AZX_REG_DPLBASE, lower_32_bits(dma) | AZX_DPLBASE_ENABLE);
+	usleep_range(2000, 3000);
+	for (i = 0; i < AE9_RA_SAMPLES; i++) {
+		for (k = 0; k < 2; k++)
+			if (r[k].run)
+				ae9_ra_sample(chip, &r[k], posbuf);
+		udelay(4);
+		if (!(i % 128))
+			cond_resched();
+	}
+	/* off before the memory goes: the read-back completes after any
+	 * position write the controller made before it (PCI ordering) */
+	creative_hda_writel(chip, AZX_REG_DPLBASE, 0);
+	creative_hda_writel(chip, AZX_REG_DPUBASE, 0);
+	creative_hda_readl(chip, AZX_REG_DPLBASE);
+	usleep_range(1000, 2000);
+	dma_free_coherent(chip->dev, sz, posbuf, dma);
+	ae9_ra_report(m, "playback", &r[0]);
+	ae9_ra_report(m, "optical out", &r[1]);
+out:
+	mutex_unlock(&ra_mutex);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(ae9_readahead);
+
+void creative_ae9_pcm_debugfs(struct creative_chip *chip)
+{
+	debugfs_create_file("readahead", 0400, chip->dbg_dir, chip, &ae9_readahead_fops);
+}
 
 static void creative_ae9_pcm_free(struct snd_pcm *pcm);
 

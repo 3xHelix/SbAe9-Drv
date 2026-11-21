@@ -3,6 +3,51 @@
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
 
+## 0.12.17 (2026-11-21)
+Under the hood again: sturdier card resets, and a few new readouts. 🔧
+
+Works with SbAe9-SBC v0.23.0 and SbAe9-AudioMon v0.4.11.
+
+- **DAC register reads are single.** Each read used to go out three times,
+  to get past a lag where a read returned the one before. 0.12.16's status
+  checks made that lag go away, so one read is enough now, as Windows does
+  it. debugfs `dacr` prints that one read.
+- **Driver Health has a 9th value: late DAC I2C NACKs,** the DAC commands
+  a DAC didn't acknowledge after start-up. 0 on a healthy card.
+  SbAe9-AudioMon v0.4.11 shows it (older versions show n/a).
+- **Nothing in flight during a bus reset.** When the driver resets the
+  card's bus on a retry or after resume, it first stops any stream and
+  command-ring DMA still running, as the bridge's manual asks. A normal
+  load has nothing running and does nothing new.
+- **A clearer bridge log.** The bridge lines in the kernel log now show the
+  bridge's discard-timer status and its AER secondary error status,
+  decoded into words, once and then only when it changes (no more of the
+  same line at every start-up step).
+- **"Card alive" check.** After the bus reset the driver reads the
+  controller's ID registers before it trusts the card. A card that didn't
+  come back is refused cleanly with a log line, instead of being driven
+  blind.
+- **New debugfs readouts:** `state` has a "DMA FIFO" line (the DMA FIFO
+  size of main playback and optical out, for the format playing), and
+  `readahead` (read while playing) measures how far the card's DMA reads
+  ahead of the playback position.
+- **Tried and dropped: a read-ahead pointer.** The test builds let the
+  playback pointer count audio the DMA had already fetched, so an app that
+  refills late would get an xrun instead of a crackle. On the card it
+  still let stale audio through, even when counting only a quarter of the
+  FIFO. Our best explanation: behind the card's PCI bridge, the DMA
+  position moves when a read is asked for, before the data arrives, so
+  there's no safe count. The pointer stays as it was; the 4-period buffer
+  rule (0.12.15) and the PipeWire headroom rule stay the protection.
+- **Nothing else changes:** 21 module options, the same defaults and
+  controls, card id `AE9`.
+- Tested: every command compared with 0.12.16 (the same); the only
+  register difference is the start-up DAC chip-ID read, 3 reads down to 1;
+  the card-alive check read 0x44570140 / 0x44570110 / 0x7172000a; Driver
+  Health gave 9 values with the new one 0; single `dacr` reads correct; the
+  DMA FIFO size read at all 31 playback formats, matching the sizes Windows
+  reads; the AER status logged once.
+
 ## 0.12.16 (2026-11-21)
 Under the hood: the driver now hears when a DAC misses a command, and
 leaves other cards alone. 🔧

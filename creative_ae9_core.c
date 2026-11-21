@@ -2333,14 +2333,14 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 	}
 
 	/* "dacr 48 1d": one DAC (CA0113 I2C) register read, Windows' read
-	 * sequence, checked (dsp.c: the three reads' 0x208 values, "not
+	 * sequence, checked (dsp.c: the read's two 0x208 values, "not
 	 * acknowledged" for an I2C NACK); "dacw 48 19 0": one DAC register
 	 * write. Groups 0x48 (ES9038Q2M) and 0x49 (SABRE9006A) only. Also in
 	 * the result (cat cmd). */
 	if (!strncmp(buf, "dacr ", 5) || !strncmp(buf, "dacw ", 5)) {
 		unsigned int grp = 0, reg = 0, v = 0;
 		bool wr = buf[3] == 'w', ok;
-		u32 raw[3] = { 0, 0, 0 };
+		u32 raw[2] = { 0, 0 };
 		int r;
 
 		n = sscanf(buf + 5, "%x %x %x", &grp, &reg, &v);
@@ -2363,13 +2363,13 @@ static ssize_t creative_dbg_write(struct file *f, const char __user *ubuf,
 			r = creative_dsp_ca0113_read_checked(g_dbg_chip, grp, reg, raw);
 			if (r >= 0)
 				scnprintf(g_dbg_result, sizeof(g_dbg_result),
-					  "dacr 0x%02x/0x%02x = 0x%02x (0x208 0x%08x 0x%08x 0x%08x)\n",
-					  grp, reg, r, raw[0], raw[1], raw[2]);
+					  "dacr 0x%02x/0x%02x = 0x%02x (0x208 0x%08x, then 0x%08x)\n",
+					  grp, reg, r, raw[0], raw[1]);
 			else
 				scnprintf(g_dbg_result, sizeof(g_dbg_result),
-					  "dacr 0x%02x/0x%02x: %s (0x208 0x%08x 0x%08x 0x%08x)\n",
+					  "dacr 0x%02x/0x%02x: %s (0x208 0x%08x, then 0x%08x)\n",
 					  grp, reg, r == -ENODEV ? "card off the bus" :
-					  "not acknowledged (I2C NACK)", raw[0], raw[1], raw[2]);
+					  "not acknowledged (I2C NACK)", raw[0], raw[1]);
 			dev_info(g_dbg_chip->dev, "dbg %s", g_dbg_result);
 		}
 		return len;
@@ -2722,6 +2722,66 @@ static void creative_ae9_hu_miss_show(struct seq_file *m, struct creative_chip *
 }
 
 /*
+ * The bridge's discard timer (both bridges' manuals: Tsi381 p154 and 14.9.12,
+ * ASM1083 p20 and p37): the card's delayed read whose completion
+ * the bridge threw away because the card didn't come back for it in time
+ * (Tsi381: 2^15 PCI clocks, ~1 ms). Bridge Control (0x3e) bit 10,
+ * DISCARD_STAT, write-1-to-clear; and in a PCIe-to-PCI bridge's AER
+ * capability the secondary uncorrectable error status (+0x2c), bit 10
+ * "Delayed Transaction Discard Timer Expired" (ASM1083 0x22c, Tsi381
+ * 0x12c). An expired discard timer means a DMA read of the card's that
+ * never got its data.
+ */
+#define AE9_BRIDGE_CTL_DISCARD_STAT	0x0400
+#define AE9_AER_SEC_UNCOR_STATUS	0x2c
+#define AE9_AER_SEC_DISCARD		BIT(10)
+
+/* the bridge's AER secondary uncorrectable status; false without one */
+static bool ae9_bridge_aer_sec(struct pci_dev *br, u32 *val)
+{
+	int pos;
+
+	if (!br || !pci_is_pcie(br) || pci_pcie_type(br) != PCI_EXP_TYPE_PCI_BRIDGE)
+		return false;
+	pos = pci_find_ext_capability(br, PCI_EXT_CAP_ID_ERR);
+	if (!pos)
+		return false;
+	return !pci_read_config_dword(br, pos + AE9_AER_SEC_UNCOR_STATUS, val);
+}
+
+/* that status's bits (PCI Express to PCI/PCI-X Bridge spec, secondary
+ * uncorrectable error status; bit 4 reserved) */
+static const char *const ae9_aer_sec_names[] = {
+	"target abort on a split completion", "master abort on a split completion",
+	"received target abort", "received master abort", NULL,
+	"unexpected split completion", "split completion data error",
+	"data error", "attribute error", "address error", "discard timer expired",
+	"PERR#", "SERR#", "internal bridge error",
+};
+
+/* @val's set bits by name into @buf, ", " between them */
+static void ae9_aer_sec_decode(u32 val, char *buf, size_t len)
+{
+	unsigned int b;
+	size_t n = 0;
+
+	buf[0] = '\0';
+	if (val == U32_MAX) {
+		strscpy(buf, "all ones: the bridge doesn't answer", len);
+		return;
+	}
+	for (b = 0; b < 32; b++) {
+		if (!(val & BIT(b)))
+			continue;
+		if (b < ARRAY_SIZE(ae9_aer_sec_names) && ae9_aer_sec_names[b])
+			n += scnprintf(buf + n, len - n, "%s%s", n ? ", " : "",
+				       ae9_aer_sec_names[b]);
+		else
+			n += scnprintf(buf + n, len - n, "%sbit %u", n ? ", " : "", b);
+	}
+}
+
+/*
  * The PCIe-to-PCI bridge on the card, by its PCI ID: a Tundra Tsi381
  * (10e3:8111; Tundra was bought by IDT, so "the IDT bridge" in older notes)
  * or an ASMedia ASM1083/1085 (1b21:1080).
@@ -2752,6 +2812,30 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		   ae9_bridge_name(chip),
 		   chip->pci->bus->self ? chip->pci->bus->self->vendor : 0,
 		   chip->pci->bus->self ? chip->pci->bus->self->device : 0);
+	/* the bridge's discard timer (config space only; the bring-up's log
+	 * lines clear DISCARD_STAT and count it here) */
+	if (chip->pci->bus->self) {
+		struct pci_dev *br = chip->pci->bus->self;
+		u16 ctl = 0;
+
+		pci_read_config_word(br, PCI_BRIDGE_CONTROL, &ctl);
+		seq_printf(m, "bridge discard timer: control 0x%04x (expired: %s), seen by %u bring-up log line(s)",
+			   ctl, ctl & AE9_BRIDGE_CTL_DISCARD_STAT ? "YES" : "no", chip->br_discards);
+		if (ae9_bridge_aer_sec(br, &val)) {
+			char bits[160];
+
+			/* bit 10 has its own words below */
+			ae9_aer_sec_decode(val == U32_MAX ? val : val & ~AE9_AER_SEC_DISCARD,
+					   bits, sizeof(bits));
+			seq_printf(m, "; AER secondary uncorrectable 0x%08x (%s%sdiscard timer expired: %s)\n",
+				   val, bits, bits[0] ? "; " : "",
+				   val != U32_MAX && (val & AE9_AER_SEC_DISCARD) ? "YES" : "no");
+		} else {
+			seq_puts(m, "; no AER capability\n");
+		}
+	}
+	seq_printf(m, "BAR2 IDs at the bring-up: 0x8fc=0x%08x (DAC I2C, want 0x44570140), 0xcfc=0x%08x (UART, 0x44570110), 0x4=0x%08x (board, revision 0x%02x)\n",
+		   chip->bar2_id[0], chip->bar2_id[1], chip->bar2_id[2], chip->bar2_id[2] & 0xff);
 	seq_printf(m, "mode: %s, SBX %s, DSP routing %s, primed %d, halted %d, handshake %s\n",
 		   chip->fx.direct ? "Direct" : "DSP", chip->fx.sbx ? "on" : "off",
 		   chip->dsp_active ? "up" : "down", chip->dsp_primed,
@@ -2777,6 +2861,7 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	seq_printf(m, "start: rate %u fmt 0x%04x, DAC key 0x%x, stream 0x05 channels %u\n",
 		   chip->pcm_start_rate, chip->pcm_start_fmt, chip->dac_start_key,
 		   chip->in05_ch);
+	creative_ae9_pcm_fifo_show(m, chip);	/* pcm.c: SDnFIFOS */
 	seq_printf(m, "output: %s, headphone profile %u (DSP holds %u), Voice Clarity %s, monitor %s\n",
 		   chip->hu_output ? "headphones" : "speakers", chip->fx.hp_profile,
 		   chip->fx.hp_loaded, chip->cv.on ? "on" : "off",
@@ -4233,19 +4318,23 @@ static int ae9_rt_true_free(struct creative_chip *chip, bool force)
 }
 
 /*
- * "Driver Health" (read-only, 8 integers), for apps that can't read
+ * "Driver Health" (read-only, 9 integers), for apps that can't read
  * debugfs (root only), e.g. AudioMon: [0] verb timeouts, [1] RIRB entries
  * never landed, [2] answers from the other codec, [3] unreadable RIRB
  * write pointer, [4] BDLs kept (stream didn't stop) — all 0 on a healthy
  * card, a change event when one moves; [5] RIRB entries that landed late,
  * [6] the longest wait for one (us) — information, no events; [7] router
  * slots in no router-chip list (-1 = not measured; the heartbeat measures
- * it every 30 s, an event when it changes).
+ * it every 30 s, an event when it changes); [8] DAC writes the DAC didn't
+ * acknowledge after the bring-up (I2C NACK, dac_i2c.late; dsp.c: each
+ * counted once, whether its resend got through or not): 0 on a healthy
+ * card, an event when it rises (0.12.17; AudioMon 0.4.11+ takes 8 or more
+ * values, older AudioMon shows n/a).
  */
 static int health_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 {
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
-	ui->count = 8;
+	ui->count = 9;
 	ui->value.integer.min = -1;
 	ui->value.integer.max = INT_MAX - 1;	/* max - min fits a 32-bit long */
 	return 0;
@@ -4264,6 +4353,7 @@ static int health_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	v[5] = chip->rirb_late;
 	v[6] = chip->rirb_late_max_us;
 	v[7] = READ_ONCE(chip->rt_free_true);	/* the heartbeat measures it */
+	v[8] = READ_ONCE(chip->dac_i2c.late);
 	return 0;
 }
 
@@ -4681,6 +4771,8 @@ static void creative_ae9_bridge_log(struct creative_chip *chip, const char *step
 {
 	struct pci_dev *br = chip->pci->bus->self;
 	u16 st = 0, sec = 0, ctl = 0, cmd = 0;
+	u32 aer = 0;
+	bool has_aer;
 	const u16 errs = PCI_STATUS_DETECTED_PARITY | PCI_STATUS_SIG_SYSTEM_ERROR |
 			 PCI_STATUS_REC_MASTER_ABORT | PCI_STATUS_REC_TARGET_ABORT |
 			 PCI_STATUS_SIG_TARGET_ABORT | PCI_STATUS_PARITY;
@@ -4691,19 +4783,59 @@ static void creative_ae9_bridge_log(struct creative_chip *chip, const char *step
 	pci_read_config_word(br, PCI_SEC_STATUS, &sec);
 	pci_read_config_word(br, PCI_BRIDGE_CONTROL, &ctl);
 	pci_read_config_word(chip->pci, PCI_COMMAND, &cmd);
+	has_aer = ae9_bridge_aer_sec(br, &aer);
 	dev_info(chip->dev,
-		 "bridge %s %04x:%04x %s: status 0x%04x, secondary 0x%04x%s%s%s%s%s, control 0x%04x; card command 0x%04x\n",
+		 "bridge %s %04x:%04x %s: status 0x%04x, secondary 0x%04x%s%s%s%s%s, control 0x%04x%s; card command 0x%04x%s\n",
 		 pci_name(br), br->vendor, br->device, step, st, sec,
 		 sec & PCI_STATUS_REC_MASTER_ABORT ? " <MAbort" : "",
 		 sec & PCI_STATUS_REC_TARGET_ABORT ? " <TAbort" : "",
 		 sec & PCI_STATUS_SIG_TARGET_ABORT ? " >TAbort" : "",
 		 sec & PCI_STATUS_SIG_SYSTEM_ERROR ? " <SERR" : "",
 		 sec & (PCI_STATUS_DETECTED_PARITY | PCI_STATUS_PARITY) ? " parity" : "",
-		 ctl, cmd);
+		 ctl, ctl & AE9_BRIDGE_CTL_DISCARD_STAT ? " <discard timer expired" : "", cmd,
+		 has_aer && aer != U32_MAX && (aer & AE9_AER_SEC_DISCARD) ?
+		 "; AER: secondary discard timer expired" : "");
+	/*
+	 * The whole AER secondary status: sticky, and left to the kernel's AER
+	 * driver, so a bit set before the load (an AE-9's bridge had received
+	 * master abort, 0x00000008, already set) would repeat at every step.
+	 * Logged at the first reading that has a bit other than the discard
+	 * timer's (that one has its own words above), then only when it
+	 * changes, with what it was.
+	 */
+	if (has_aer && (chip->br_aer_seen ? aer != chip->br_aer : aer & ~AE9_AER_SEC_DISCARD)) {
+		char bits[160];
+
+		ae9_aer_sec_decode(aer, bits, sizeof(bits));
+		if (chip->br_aer_seen)
+			dev_info(chip->dev, "bridge %s %s: AER secondary uncorrectable status now 0x%08x (%s), was 0x%08x\n",
+				 pci_name(br), step, aer, aer ? bits : "clear", chip->br_aer);
+		else
+			dev_info(chip->dev, "bridge %s %s: AER secondary uncorrectable status 0x%08x (%s; sticky: logged again only when it changes)\n",
+				 pci_name(br), step, aer, bits);
+	}
+	if (has_aer) {
+		chip->br_aer = aer;
+		chip->br_aer_seen = true;
+	}
 	if (st & errs)
 		pci_write_config_word(br, PCI_STATUS, st & errs);
 	if (sec & errs)
 		pci_write_config_word(br, PCI_SEC_STATUS, sec & errs);
+	/*
+	 * DISCARD_STAT cleared like the status bits above, so each line shows
+	 * only what happened since the one before: written back with the rest
+	 * of the register as read (nothing else changes; bit 6, the bus reset,
+	 * reads 0 here), and only when set, so a normal load writes nothing.
+	 * Never when the read came back all-ones (bridge unreachable): that
+	 * would set the bus-reset bit and every enable; bit 6 masked anyway.
+	 * The AER status is left alone: the kernel's AER driver owns it.
+	 */
+	if (ctl != 0xffff && (ctl & AE9_BRIDGE_CTL_DISCARD_STAT)) {
+		if (chip->br_discards < U8_MAX)
+			chip->br_discards++;
+		pci_write_config_word(br, PCI_BRIDGE_CONTROL, ctl & ~PCI_BRIDGE_CTL_BUS_RESET);
+	}
 }
 
 static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
@@ -4714,6 +4846,82 @@ static bool creative_ae9_alone_on_bus(struct pci_dev *pdev)
 		if (PCI_SLOT(d->devfn) != PCI_SLOT(pdev->devfn))
 			return false;
 	return true;
+}
+
+/*
+ * Before the secondary bus reset: the Tsi381 manual (10.1.2) wants no
+ * request pending when the reset bit is set (pcm.c,
+ * creative_ae9_dma_stop_all()). At the first probe nothing of ours has run
+ * (no rings yet) and nothing is read: the card's first access stays
+ * Windows' (the state log, then the BAR2 init). On a bring-up retry or a
+ * resume something may run, unless the shutdown before it left the
+ * controller in reset.
+ */
+static void ae9_bus_reset_quiesce(struct creative_chip *chip)
+{
+	unsigned int st;
+
+	if (!chip->corb_buf && !chip->corb_keep)
+		return;
+	st = creative_ae9_dma_stop_all(chip);
+	if (st)
+		dev_info(chip->dev, "before the bus reset: DMA stopped (streams 0x%x%s%s)\n",
+			 st & 0xffff, st & BIT(16) ? ", CORB" : "", st & BIT(17) ? ", RIRB" : "");
+}
+
+/*
+ * "Card alive": after the bus reset, before the BAR2 init, the card's
+ * read-only ID registers (BAR2 is a Synopsys DesignWare APB cluster, notes
+ * 31): 0x8fc the DAC I2C block's IC_COMP_TYPE, "DW" + 0x0140 (DW_apb_i2c
+ * v1.10a); 0xcfc the head-unit UART's CTR, 0x44570110 (DW_apb_uart); 0x4
+ * the board ID, 0x7172 in the high half on the AE-9, its low byte the
+ * board revision (0x0a, 0x0b on an ASMedia-bridged card). No side effects.
+ * The I2C ID decides: read up to 10 times 10 ms apart until it's right; a
+ * card whose BAR2 reads all-ones is off the bus (as creative_ae9_gone()),
+ * one with another value isn't driven (-EIO: no BAR2 writes to registers
+ * that aren't the ones we know). The UART and board IDs are logged.
+ */
+#define AE9_BAR2_I2C_COMP_TYPE	0x8fc
+#define AE9_BAR2_UART_CTR	0xcfc
+#define AE9_BAR2_BOARD_ID	0x004
+#define AE9_DW_I2C_ID		0x44570140
+#define AE9_DW_UART_ID		0x44570110
+#define AE9_BOARD_ID_AE9	0x7172
+
+static int ae9_bar2_alive(struct creative_chip *chip)
+{
+	u32 *id = chip->bar2_id;
+	unsigned int tries = 1;
+
+	id[0] = creative_ext_readl(chip, AE9_BAR2_I2C_COMP_TYPE);
+	while (id[0] != AE9_DW_I2C_ID && tries < 10) {
+		msleep(10);
+		id[0] = creative_ext_readl(chip, AE9_BAR2_I2C_COMP_TYPE);
+		tries++;
+	}
+	id[1] = creative_ext_readl(chip, AE9_BAR2_UART_CTR);
+	id[2] = creative_ext_readl(chip, AE9_BAR2_BOARD_ID);
+	if (id[0] == ~0U && id[1] == ~0U && id[2] == ~0U) {
+		chip->card_gone = true;
+		creative_ae9_dead_notify(chip);
+		dev_err(chip->dev, "card dropped off the bus (BAR2 ID check after the bus reset): its registers read all-ones %u times; stopping\n",
+			tries);
+		return -ENODEV;
+	}
+	if (id[0] != AE9_DW_I2C_ID) {
+		dev_err(chip->dev, "BAR2 ID check: 0x8fc = 0x%08x %u times, not the DAC I2C block's 0x%08x (0xcfc = 0x%08x, 0x4 = 0x%08x): the card's registers don't read right; not driving it\n",
+			id[0], tries, AE9_DW_I2C_ID, id[1], id[2]);
+		return -EIO;
+	}
+	dev_info(chip->dev, "BAR2 alive: 0x8fc = 0x%08x (DW_apb_i2c)%s, 0xcfc = 0x%08x, board ID 0x4 = 0x%08x (revision 0x%02x)\n",
+		 id[0], tries > 1 ? " after a wait" : "", id[1], id[2], id[2] & 0xff);
+	if (id[1] != AE9_DW_UART_ID)
+		dev_warn(chip->dev, "BAR2 ID check: 0xcfc = 0x%08x, not the head-unit UART's 0x%08x\n",
+			 id[1], AE9_DW_UART_ID);
+	if (id[2] >> 16 != AE9_BOARD_ID_AE9)
+		dev_warn(chip->dev, "BAR2 ID check: board ID 0x%08x, not an AE-9's (0x%04x....)\n",
+			 id[2], AE9_BOARD_ID_AE9);
+	return 0;
 }
 
 static int creative_ae9_hw_bringup(struct creative_chip *chip)
@@ -4751,6 +4959,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		u32 id = ~0U;
 		int waited;
 
+		ae9_bus_reset_quiesce(chip);
 		pci_save_state(pdev);
 		/*
 		 * The PCI core's own bus resets (pci_bus_lock()) hold the config
@@ -4810,6 +5019,9 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	creative_ae9_bridge_log(chip, "after bus reset");
 	if (creative_ae9_gone(chip, "after the bus reset"))
 		return -ENODEV;
+	ret = ae9_bar2_alive(chip);
+	if (ret < 0)
+		return ret;
 
 	/* Windows' BAR2 init, before the controller reset as in its cold boot */
 	creative_ae9_bar2_init_windows(chip);
@@ -5259,6 +5471,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 			    &creative_dbg_fops);
 	debugfs_create_file("state", 0400, chip->dbg_dir, NULL,
 			    &creative_dbg_state_fops);
+	creative_ae9_pcm_debugfs(chip);	/* "readahead" (pcm.c) */
 	if (vlog_buf)
 		debugfs_create_file("verblog", 0400, chip->dbg_dir, NULL,
 				    &vlog_seq_fops);
