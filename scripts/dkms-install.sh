@@ -67,10 +67,23 @@ fi
 # The command-line tools the packages put in /usr/bin (SbAe9-SBC looks for
 # ae9-hp-profile on the PATH); a source install puts them in /usr/local/bin.
 TOOLS=(ae9-get-firmware.sh ae9-full-dump.sh ae9-dsp-snapshot.sh ae9-read-stress.sh
-       ae9-optical-passthrough ae9-hp-profile ae9-reload.sh)
+       ae9-optical-passthrough ae9-hp-profile ae9-reload.sh ae9-ae7-enable)
 BIN=/usr/local/bin
-tools_install() { local t; for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done; }
-tools_remove() { local t; for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done; }
+# the Sound Blaster AE-7's opt-in pair (experimental), where ae9-ae7-enable
+# in /usr/local/bin finds it (the packages: /usr/share/creative-ae9/ae7)
+AE7SHARE=/usr/local/share/creative-ae9/ae7
+tools_install() {
+	local t
+	for t in "${TOOLS[@]}"; do install -Dm755 "$SRC/scripts/$t" "$BIN/${t%.sh}"; done
+	install -Dm644 "$SRC/config/ae7/00-ae7-override.rules" "$AE7SHARE/00-ae7-override.rules"
+	install -Dm644 "$SRC/config/ae7/ae7-override.conf" "$AE7SHARE/ae7-override.conf"
+}
+tools_remove() {
+	local t
+	for t in "${TOOLS[@]}"; do rm -f "$BIN/${t%.sh}"; done
+	rm -f /usr/local/share/creative-ae9/ae7/00-ae7-override.rules /usr/local/share/creative-ae9/ae7/ae7-override.conf
+	rmdir /usr/local/share/creative-ae9/ae7 /usr/local/share/creative-ae9 2>/dev/null || true
+}
 
 # Early load at boot (systemd-modules-load), as every package does from
 # /usr/lib/modules-load.d: loaded by udev alone, the DSP's first start
@@ -106,7 +119,17 @@ drop() {
 
 if [ "${1:-}" = "--remove" ]; then
 	for v in $(registered); do drop "$v"; done
-	for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
+	for d in /usr/src/"$NAME"-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done
+	# the AE-7 opt-in on: turn it off, as the packages' removal does (an
+	# AE-7 not behind a Tsi381 bridge, or not visible right now, is parked;
+	# a Tsi381 one goes back to the in-tree driver). This tree's copy of
+	# ae9-ae7-enable. If it fails, the opt-in files stay: they name a driver
+	# that's gone, so the AE-7 is left with no driver rather than handed to
+	# snd_hda_intel.
+	if [ -e /etc/modprobe.d/ae7-override.conf ] || [ -e /etc/udev/rules.d/00-ae7-override.rules ]; then
+		bash "$SRC/scripts/ae9-ae7-enable" --disable ||
+			echo "warning: ae9-ae7-enable --disable failed: the AE-7's files in /etc are left as they are (the card stays without a driver); see docs/AE7.md" >&2
+	fi
 	tools_remove
 	early_remove
 	echo "removed from DKMS (and its tools from $BIN); build and copy the module by hand again if you still want it"
@@ -121,10 +144,11 @@ VER=$(sed -n 's/^#define CREATIVE_AE9_DRV_VERSION[[:space:]]*"\(.*\)"/\1/p' "$SR
 # Drop every registered version (including this one, so a re-run picks up
 # changed source), then copy the source to /usr/src.
 for v in $(registered); do drop "$v"; done
-for d in /usr/src/$NAME-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done	# leftovers
+for d in /usr/src/"$NAME"-*; do if [ -d "$d" ]; then rm -rf "$d"; fi; done	# leftovers
 DEST=/usr/src/$NAME-$VER
 mkdir -p "$DEST"
-cp "$SRC"/Makefile "$SRC"/creative_ae9*.c "$SRC"/creative_ae9*.h "$SRC"/ca0132_regs.h "$DEST"/
+# creative_ae7*: the AE-7 (experimental) is part of every build since 0.13.0
+cp "$SRC"/Makefile "$SRC"/creative_ae[79]*.c "$SRC"/creative_ae[79]*.h "$SRC"/ca0132_regs.h "$DEST"/
 sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$VER\"/" "$SRC/dkms.conf" > "$DEST/dkms.conf"
 dkms add -m "$NAME" -v "$VER"
 
@@ -163,7 +187,7 @@ if ! modinfo -k "$(uname -r)" -n "$NAME" >/dev/null 2>&1; then
 	echo "note: not installed for the running kernel $(uname -r) (no headers?); built for: ${kernels[*]}" >&2
 fi
 tools_install
-echo "tools: $(printf '%s ' "${TOOLS[@]%.sh}")in $BIN"
+echo "tools: $(printf '%s ' "${TOOLS[@]%.sh}")in $BIN (AE-7 opt-in files: $AE7SHARE)"
 early_install
 echo "done: $NAME $VER is in DKMS, built for $built kernel(s);"
 echo "new kernels get it built automatically. Reboot to load it."

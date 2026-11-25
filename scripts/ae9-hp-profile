@@ -473,7 +473,17 @@ def add(model, key, name=None):
         install(binp, key, name or model)
 
 
+def ae7_only():
+    """A Sound Blaster AE-7 (experimental) and no AE-9: custom profiles are
+    made and tested for the AE-9 only."""
+    return (not os.path.exists('/proc/asound/AE9')
+            and os.path.exists('/proc/asound/AE7'))
+
+
 def main(a):
+    if a[:1] in (['add'], ['install']) and ae7_only():
+        sys.exit("ae9-hp-profile: installing a profile is for the AE-9 only; this "
+                 "PC's card is a Sound Blaster AE-7 (experimental)")
     if len(a) >= 2 and a[0] == 'fetch':
         fetch(a[1], a[2] if len(a) > 2 else None)
     elif len(a) == 3 and a[0] == 'make':

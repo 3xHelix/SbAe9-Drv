@@ -18,6 +18,12 @@
 # so listen from the second loop on. Saves a router dump to
 # ~/ae9-surround-router.txt while the stream plays.
 set -u
+# the AE-9 only: its steps (the surround option, the AE-9's jacks) aren't a
+# Sound Blaster AE-7's (experimental)
+if [ ! -e /proc/asound/AE9 ] && [ -e /proc/asound/AE7 ]; then
+	echo "ae9-surround-test.sh: for the AE-9 only; this PC's card is a Sound Blaster AE-7" >&2
+	exit 1
+fi
 DIRECT=off
 if [ "${1:-}" = "--direct" ]; then DIRECT=on; shift; fi
 LOOPS=${1:-4}

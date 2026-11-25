@@ -18,7 +18,7 @@
 %endif
 
 Name:           creative-ae9-dkms
-Version:        0.12.17
+Version:        0.13.0
 Release:        1
 Summary:        Creative Sound Blaster AE-9 driver (DKMS)
 License:        GPL-2.0-or-later
@@ -38,13 +38,15 @@ Conflicts:      akmod-creative-ae9
 Out-of-tree Linux driver for the Creative Sound Blaster AE-9: playback up to
 384 kHz, 5.1, SBX/DSP effects and EQ, speaker setup, headphone profiles,
 recording, optical in and out, What U Hear and the ACM head unit. Both card
-versions (IDT and ASMedia bridge).
+versions (IDT and ASMedia bridge). Sound Blaster AE-7 support
+(experimental, opt-in: ae9-ae7-enable).
 
 DKMS builds the module for every installed kernel that has its headers
 (openSUSE: kernel-default-devel; RHEL family: kernel-devel). Also installs
 the boot setup that hands the card to this driver, the PipeWire profile set,
-ae9-get-firmware, ae9-full-dump, ae9-dsp-snapshot and ae9-read-stress. The DSP firmware is Creative's and not
-included: run ae9-get-firmware with Creative's AE-9 installer afterwards.
+ae9-get-firmware, ae9-full-dump, ae9-dsp-snapshot, ae9-read-stress and
+ae9-ae7-enable. The DSP firmware is Creative's and not included: run
+ae9-get-firmware with Creative's AE-9 installer afterwards.
 
 %prep
 %setup -q -n %{srcname}-%{version}
@@ -62,6 +64,12 @@ install -D -m 644 config/ae9-override.conf %{buildroot}/usr/lib/modprobe.d/ae9-o
 install -D -m 644 config/ae9-omit.conf %{buildroot}/usr/lib/dracut/dracut.conf.d/ae9-omit.conf
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}/usr/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+# the Sound Blaster AE-7 (experimental): its profile set, active for an AE-7
+# this driver runs; the opt-in pair inactive until ae9-ae7-enable
+install -D -m 644 config/89-ae7-pipewire.rules %{buildroot}/usr/lib/udev/rules.d/89-ae7-pipewire.rules
+install -D -m 644 config/creative-ae7.conf %{buildroot}/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae7.conf
+install -D -m 644 config/ae7/00-ae7-override.rules %{buildroot}/usr/share/creative-ae9/ae7/00-ae7-override.rules
+install -D -m 644 config/ae7/ae7-override.conf %{buildroot}/usr/share/creative-ae9/ae7/ae7-override.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 %if %{wp04}
 install -D -m 644 config/51-ae9-safe-volume.lua %{buildroot}/usr/share/wireplumber/main.lua.d/51-ae9-safe-volume.lua
@@ -73,6 +81,7 @@ install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}/usr/bin/ae9-read-stres
 install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}/usr/bin/ae9-optical-passthrough
 install -D -m 755 scripts/ae9-reload.sh %{buildroot}/usr/bin/ae9-reload
 install -D -m 755 scripts/ae9-hp-profile %{buildroot}/usr/bin/ae9-hp-profile
+install -D -m 755 scripts/ae9-ae7-enable %{buildroot}/usr/bin/ae9-ae7-enable
 install -d %{buildroot}/usr/share/creative-ae9/examples
 install -m 644 extract_firmware.py extract_overlay.py extract_hpeq.py %{buildroot}/usr/share/creative-ae9/
 for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf ae9-clean-mic.conf; do
@@ -97,6 +106,13 @@ fi
 %preun
 # this version leaves DKMS on removal and on upgrade (the new one adds itself)
 dkms remove -m %{modname} -v %{version} --all >/dev/null 2>&1 || :
+# removal, not upgrade, with the AE-7 opt-in on: turn it off. An AE-7 not
+# behind a Tsi381 bridge (ASMedia: the in-tree driver hangs it), or one not
+# visible right now, is parked; a Tsi381 one goes back to the in-tree driver.
+# The /etc files are ae9-ae7-enable's, not ours: the park files stay.
+if [ "$1" -eq 0 ] && { [ -e /etc/modprobe.d/ae7-override.conf ] || [ -e /etc/udev/rules.d/00-ae7-override.rules ]; }; then
+	/usr/bin/ae9-ae7-enable --disable || :
+fi
 
 %postun
 udevadm control --reload >/dev/null 2>&1 || :
@@ -107,6 +123,7 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/src/%{modname}-%{version}/
 /usr/lib/udev/rules.d/00-ae9-override.rules
 /usr/lib/udev/rules.d/89-ae9-pipewire.rules
+/usr/lib/udev/rules.d/89-ae7-pipewire.rules
 /usr/lib/modprobe.d/ae9-override.conf
 %dir /usr/lib/dracut
 %dir /usr/lib/dracut/dracut.conf.d
@@ -116,6 +133,7 @@ udevadm control --reload >/dev/null 2>&1 || :
 %dir /usr/share/alsa-card-profile/mixer
 %dir /usr/share/alsa-card-profile/mixer/profile-sets
 /usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae7.conf
 %dir /usr/share/wireplumber
 %dir /usr/share/wireplumber/wireplumber.conf.d
 /usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
@@ -130,9 +148,25 @@ udevadm control --reload >/dev/null 2>&1 || :
 /usr/bin/ae9-optical-passthrough
 /usr/bin/ae9-reload
 /usr/bin/ae9-hp-profile
+/usr/bin/ae9-ae7-enable
 /usr/share/creative-ae9/
 
 %changelog
+* Wed Nov 25 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.13.0-1
+- Driver 0.13.0 "AE-7 experimental": Sound Blaster AE-7 support
+  (experimental, opt-in: ae9-ae7-enable). With it on, the driver runs an
+  AE-7 (ae7=1): stereo and 5.1 playback, DSP mode at 48 kHz, Direct Mode
+  at 44.1-384 kHz, mic, What U Hear, SBX and CrystalVoice. Off by default:
+  an AE-7 stays with the in-tree driver until ae9-ae7-enable is run. Off
+  again (--disable, or package removal with it on), an AE-7 with an ASMedia
+  bridge, or one the script doesn't recognise, is left with no driver
+  (parked): the in-tree driver hangs ASMedia AE-7s at boot. New read-only
+  "Card Model" control on every card. The AE-7's PipeWire
+  profile set and udev rule are installed for everyone (they match only
+  an AE-7 this driver runs); its opt-in files go to
+  /usr/share/creative-ae9/ae7/. ae9-reload and ae9-full-dump work on
+  either card; the AE-9-only tools leave an AE-7 alone.
+
 * Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.17-1
 - Driver 0.12.17: DAC register reads are single (0.12.16's status checks
   made the triple read unnecessary); Driver Health has a 9th value, late

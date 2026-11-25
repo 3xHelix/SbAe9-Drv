@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 3xHelix
-// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+// Contains code adapted from the Linux kernel's CA0132 driver
+// (sound/hda/codecs/ca0132.c, sound/pci/hda/patch_ca0132.c in older kernels):
 //   Copyright (c) 2011, Creative Technology Ltd.
 //   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 //
@@ -733,6 +734,13 @@ static void fx_apply_all_locked(struct creative_chip *chip)
 
 	bool on;
 
+	/* a board with its own output block (the AE-7's: its select's preset
+	 * and block in the same bracket), then the effects as here */
+	if (ae9_has_op(chip, fx_out_block)) {
+		fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
+		chip->board->ops->fx_out_block(chip);
+		goto effects;
+	}
 	if (fx_hp_virt(chip)) {
 		fx_send(chip, FX_MID_OUT, 0x3a, fx_f32(1, 1), false);
 		/* Windows sends 8+8; the DSP rejects channels 7/8 (0x27/0x28/
@@ -799,16 +807,19 @@ effects:
 		fx_send(chip, FX_MID_OUT, 0x0a, fx_pregain(fx), false);
 	fx_send(chip, FX_MID_OUT, 0x09, fx_f32(on, 1), false);
 	fx_unmute_verify(chip);
+	AE9_CALL(chip, fx_out_done, chip);
 }
 
 static void fx_apply_all(struct creative_chip *chip)
 {
 	if (!fx_ready(chip))
 		return;
+	AE9_CALL(chip, fx_lock, chip, true);
 	mutex_lock(&chip->replay_mutex);
 	fx_apply_all_locked(chip);
 	creative_dsp_chipio_addr_invalidate();
 	mutex_unlock(&chip->replay_mutex);
+	AE9_CALL(chip, fx_lock, chip, false);
 	dev_info(chip->dev, "Direct Mode %s, SBX %s%s (Surround %d, Dialog+ %d, Smart Volume %d, Crystalizer %d, Bass %d, EQ %d%s)\n",
 		 chip->fx.direct ? "on" : "off", chip->fx.sbx ? "on" : "off",
 		 fx_hp_virt(chip) ? ", headphone virtualization" : "",
@@ -905,6 +916,7 @@ static void fx_apply_spk(struct creative_chip *chip)
 
 	if (!fx_ready(chip))
 		return;
+	AE9_CALL(chip, fx_lock, chip, true);
 	mutex_lock(&chip->replay_mutex);
 	if (!fx_hp_virt(chip)) {
 		fx_apply_all_locked(chip);
@@ -912,6 +924,7 @@ static void fx_apply_spk(struct creative_chip *chip)
 		sent = true;
 	}
 	mutex_unlock(&chip->replay_mutex);
+	AE9_CALL(chip, fx_lock, chip, false);
 	if (!sent)
 		dev_info(chip->dev, "Speaker Config stored; sent when the output is speakers\n");
 }
@@ -983,7 +996,7 @@ void creative_ae9_fx_init(struct creative_chip *chip)
 	fx->direct = true;
 	fx->spk = 1;	/* 2.1, as Windows (the fx_spk_cfg option until 0.12.15) */
 	fx->xover = XOVER_DEF;
-	fx->hp_virt = true;	/* Windows: always on with headphones, DSP mode */
+	fx->hp_virt = true;	/* Windows: the headphone block in DSP mode */
 	for (i = 0; i < FX_COUNT; i++) {
 		fx->on[i] = fx_def_on[i];
 		fx->level[i] = fx_def_lvl[i];
@@ -1557,7 +1570,7 @@ static int hp_virt_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
 
-	uv->value.integer.value[0] = chip->fx.hp_virt;
+	uv->value.integer.value[0] = chip->fx.hp_virt || !ae9_has(chip, AE9_CAP_HP_VIRT_OFF);
 	return 0;
 }
 
@@ -1569,6 +1582,22 @@ static int hp_virt_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 	if (creative_ae9_dead(chip))
 		return -ENODEV;
 
+	/*
+	 * A board without the AE-9's speaker block on its headphones (the
+	 * AE-7): the switch stays on. Windows has no such switch there: it
+	 * sends its headphone block in DSP mode, always, and turns it off with
+	 * SBX Surround or Direct Mode; off would put the speakers' layout
+	 * (80/04 = 8.0) and the effects under the headphones' preset,
+	 * a state no Windows capture has. That state with SBX and X-Bass on
+	 * is the suspected cause (not yet proven on the card) of the silence
+	 * the 0.13.0 RC1 tester heard. Off: no change, and a notify so
+	 * mixers snap back (as SBX Switch under Direct Mode).
+	 */
+	if (!ae9_has(chip, AE9_CAP_HP_VIRT_OFF)) {
+		if (!on)
+			snd_ctl_notify(chip->card, SNDRV_CTL_EVENT_MASK_VALUE, &kc->id);
+		return 0;
+	}
 	if (on == chip->fx.hp_virt)
 		return 0;
 	chip->fx.hp_virt = on;
@@ -1594,7 +1623,9 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	unsigned int i;
 	int err;
 
-	err = fx_add(chip, "Direct Mode Switch", K_DIRECT, 0);
+	/* a board without the AE-9's Direct Mode (the AE-7: its own switch,
+	 * level 4, or none) gets no such control from here */
+	err = ae9_has(chip, AE9_CAP_DIRECT) ? fx_add(chip, "Direct Mode Switch", K_DIRECT, 0) : 0;
 	if (!err)
 		err = fx_add(chip, "SBX Switch", K_SBX, 0);
 	if (!err)
@@ -1620,13 +1651,13 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	if (!err)
 		err = fx_add(chip, "Scout Mode Switch", K_SCOUT, 0);
 	/* speaker setup; names stay clear of PipeWire's path elements */
-	if (!err)
+	if (!err && ae9_has(chip, AE9_CAP_SPK_SETUP))
 		err = fx_add(chip, "Bass Redirect Switch", K_REDIR, 0);
-	if (!err)
+	if (!err && ae9_has(chip, AE9_CAP_SPK_SETUP))
 		err = fx_add(chip, "Bass Redirect Crossover", K_XOVER, 0);
-	if (!err)
+	if (!err && ae9_has(chip, AE9_CAP_SPK_SETUP))
 		err = fx_add(chip, "Bass Redirect Sub Boost Switch", K_SUBGAIN, 0);
-	for (i = 0; !err && i < ARRAY_SIZE(spk_ch_names); i++) {
+	for (i = 0; !err && ae9_has(chip, AE9_CAP_SPK_SETUP) && i < ARRAY_SIZE(spk_ch_names); i++) {
 		snprintf(name, sizeof(name), "Speaker Level %s Volume", spk_ch_names[i]);
 		err = fx_add(chip, name, K_SPKLVL, i);
 		if (err)
@@ -1639,3 +1670,6 @@ int creative_ae9_fx_controls_add(struct creative_chip *chip)
 	fx_update_active(chip);
 	return err;
 }
+
+/* the AE-7 (experimental): SBX and the output block, on this file's helpers */
+#include "creative_ae7_fx.c"

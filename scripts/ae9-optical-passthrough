@@ -14,6 +14,11 @@
 # the ALSA device and the raw hw device rejects them.
 # Needs ffmpeg, ffprobe, aplay, iecset (alsa-utils).
 set -u
+# the AE-9 only: on a Sound Blaster AE-7 (experimental) it has nothing to work on
+if [ ! -e /proc/asound/AE9 ] && [ -e /proc/asound/AE7 ]; then
+	echo "ae9-optical-passthrough: for the AE-9 only; this PC's card is a Sound Blaster AE-7 (it has no optical out on this driver)" >&2
+	exit 1
+fi
 file=${1:?usage: ae9-optical-passthrough FILE [hw:AE9,4]}
 dev=${2:-hw:AE9,4}
 card=${dev#hw:}; card=${card%%,*}

@@ -816,7 +816,7 @@ static const struct snd_kcontrol_new spdif_out_control = {
 /*
  * How Creative's Windows driver plays DSD64 (its DSD ASIO driver
  * CtxDsd64.dll with CtxHda.sys 6.0.105.0065's DSD stream class, decompiled;
- * .tmp/notes/dsd-windows.md): natively, not as DoP, and never through the
+ * project notes, not published): natively, not as DoP, and never through the
  * DSP or the CA0132's I2S. The HDA playback stream runs at 88.2 kHz with
  * six 16-bit channels (format 0x4815) and the CA0113's own I2S block in
  * BAR2 takes it from the stream: its channel 2 the stream's channels 0-1
@@ -3526,6 +3526,8 @@ int creative_ae9_pcm_init(struct creative_chip *chip)
 
 	chip->playback_stream_tag = CREATIVE_PCM_STREAM_TAG;
 	chip->playback_stream_base = CREATIVE_PCM_STREAM_BASE;
+	if (ae9_has_op(chip, pcm_init))
+		return chip->board->ops->pcm_init(chip);
 
 	ret = snd_pcm_new(chip->card, "AE-9 Analog", 0, 1, 1, &pcm);
 	if (ret < 0) {
@@ -3602,3 +3604,6 @@ static void creative_ae9_pcm_free(struct snd_pcm *pcm)
 	creative_ae9_cap_bdl_free(chip);
 	chip->pcm = NULL;
 }
+
+/* the AE-7 (experimental): its pcm part, on this file's helpers */
+#include "creative_ae7_pcm.c"

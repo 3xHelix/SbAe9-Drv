@@ -37,7 +37,8 @@ python3 extract_hpeq.py tmp/AE9HPEQ hp/
 sudo mkdir -p /lib/firmware/creative-ae9/hp && sudo cp hp/*.bin /lib/firmware/creative-ae9/hp/
 ```
 
-The scripts refuse a different image unless you pass `--force`.
+The scripts refuse a different image unless you pass `--force`. The AE-7
+uses the same two files ([AE7.md](AE7.md#turning-it-on)).
 
 ## 2. Build and install the driver
 
@@ -53,13 +54,16 @@ Run the script again after updating the driver source (it replaces the old
 version). It also:
 
 - puts the command-line tools (`ae9-reload`, `ae9-hp-profile`,
-  `ae9-full-dump`, `ae9-get-firmware` and the others the packages install) in
+  `ae9-full-dump`, `ae9-get-firmware`, `ae9-ae7-enable` and the others the packages install) in
   `/usr/local/bin`; SbAe9-SBC's "Make custom profile…" needs `ae9-hp-profile`;
 - installs `/etc/modules-load.d/creative-ae9.conf` (since 0.12.10), so the
   driver loads early at boot as with the packages (an existing file is left
   alone).
 
-`sudo scripts/dkms-install.sh --remove` takes it all out of DKMS.
+`sudo scripts/dkms-install.sh --remove` takes it all out of DKMS. With the
+AE-7 support on, it first turns it off as the packages' removal does: an
+AE-7 with an ASMedia bridge, or one the script doesn't recognise, is parked
+([AE7.md](AE7.md#going-back)).
 `dkms status` shows what's built for which kernel, and
 `scripts/dkms-install.sh --check` (no root needed) shows what's installed for
 the running kernel, every copy of the module, which one loads and whether it
@@ -71,6 +75,13 @@ loads early.
 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 sudo cp snd-hda-codec-creative-ae9.ko /lib/modules/$(uname -r)/extra/ && sudo depmod -a
 ```
+
+On a clang-built kernel (XanMod, CachyOS...; `grep CONFIG_CC_IS_CLANG
+/lib/modules/$(uname -r)/build/.config` prints `=y`) build with `make` in the
+source folder instead of the first line: it picks the clang the kernel needs
+(see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#quick-fixes), "DKMS fails on a
+clang-built kernel"). The kernel's own make needs `LLVM=1` added (or
+`LLVM=-21` for a clang only installed as `clang-21`).
 
 Redo both after every code change and kernel update. For the tools:
 `sudo install -m755 scripts/ae9-hp-profile /usr/local/bin/` (and the same for
@@ -110,6 +121,29 @@ sudo dracut -f
 - The module must load from the root filesystem (after `/lib/firmware` is
   available), which is what the dracut omit is for.
 
+### The Sound Blaster AE-7 (experimental)
+
+The files above hand over the AE-9 only. An AE-7 needs two more, which the
+driver ships inactive: `00-ae7-override.rules` (hands the AE-7 to this
+driver) and `ae7-override.conf` (the `ae7=1` option, plus the same
+fallback as `ae9-override.conf`). `ae9-ae7-enable` puts them in
+`/etc/udev/rules.d/` and `/etc/modprobe.d/`:
+
+```sh
+sudo ae9-ae7-enable            # then reboot; --status shows what's installed, --disable takes them out
+```
+
+`--disable` hands an AE-7 back to the kernel's driver only behind a Tsi381
+bridge. Behind an ASMedia bridge that driver hangs the PC at boot, so the
+card is parked instead (no driver), as is one behind a bridge the script
+doesn't recognise, by two files the script writes:
+`/etc/udev/rules.d/00-ae7-park.rules` and `/etc/modprobe.d/ae7-park.conf`
+([AE7.md](AE7.md#going-back)).
+
+Everything about the AE-7 (what works, checking it, going back):
+[AE7.md](AE7.md). One Creative card per PC is the supported setup in
+0.13.0.
+
 ## 4. PipeWire profiles (stereo and 5.1)
 
 Without this PipeWire only gives the card its stereo fallback profiles. The
@@ -121,13 +155,20 @@ sudo cp config/creative-ae9.conf /usr/share/alsa-card-profile/mixer/profile-sets
 sudo cp config/89-ae9-pipewire.rules /etc/udev/rules.d/
 ```
 
-The packages also start the AE-9's outputs at -36 dB when WirePlumber has no
-saved volume for them: `config/50-ae9-safe-volume.conf` (WirePlumber 0.5,
+The AE-7 has its own pair, `creative-ae7.conf` and `89-ae7-pipewire.rules`
+(stereo, 5.1 with Direct Mode off, the mic and What U Hear), copied the
+same way; the rule only acts on an AE-7 this driver runs, so it's safe to
+install on any PC.
+
+The packages also start the AE-9's outputs (and the AE-7's, since 0.13.0) at
+-36 dB when WirePlumber has no saved volume for them: `config/50-ae9-safe-volume.conf` (WirePlumber 0.5,
 into `/usr/share/wireplumber/wireplumber.conf.d/`) or
 `config/51-ae9-safe-volume.lua` (WirePlumber 0.4's `main.lua.d`).
 
 `scripts/restore-stock-audio.sh` removes the driver and restores stock
-`snd_hda_intel` (and removes these files too).
+`snd_hda_intel` (and removes these files too, the AE-7's opt-in included;
+an AE-7 with an ASMedia bridge, or one the script doesn't recognise, is
+parked, `--stock` hands it to the stock driver).
 
 ## Testing a new build
 

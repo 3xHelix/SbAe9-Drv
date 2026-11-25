@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# Sound Blaster AE-7 (experimental, opt-in): hand the AE-7 (PCI 1102:0010,
+# subsystem 1102:0081) to snd-hda-codec-creative-ae9 instead of
+# snd_hda_intel. Shipped inactive in /usr/share/creative-ae9/ae7/;
+# "sudo ae9-ae7-enable" copies it to /etc/udev/rules.d/ together with
+# ae7-override.conf (the driver takes an AE-7 only with ae7=1), and
+# "sudo ae9-ae7-enable --disable" removes both. Reboot after either.
+# At boot the module (loaded early by modules-load.d/creative-ae9.conf) and
+# this rule race: a driver already registered isn't offered a device whose
+# driver_override is set later, so the rule then asks for a probe
+# (drivers_probe: nothing binds while the module isn't loaded; a bound card
+# is left as it is).
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1102", ATTR{device}=="0x0010", ATTR{subsystem_device}=="0x0081", ATTR{driver_override}="snd-hda-codec-creative-ae9", RUN+="/bin/sh -c 'echo $kernel > /sys/bus/pci/drivers_probe'"

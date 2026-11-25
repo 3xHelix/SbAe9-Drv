@@ -1,0 +1,614 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# ae9-ae7-enable: turn the driver's Sound Blaster AE-7 support (experimental)
+# on or off. Packaged as /usr/bin/ae9-ae7-enable.
+#
+#   sudo ae9-ae7-enable                    on: hand the AE-7 to this driver
+#                                          from the next boot
+#   sudo ae9-ae7-enable --disable          off: from the next boot the AE-7
+#                                          has no driver (parked), unless it
+#                                          sits behind a Tsi381 bridge: then
+#                                          the in-tree driver takes it
+#   sudo ae9-ae7-enable --disable --stock  off, and the in-tree driver takes
+#                                          any AE-7 (it hangs the PC at boot
+#                                          on one with an ASMedia bridge)
+#   ae9-ae7-enable --status                what is installed, whether an AE-7
+#                                          is there, its bridge, which driver
+#                                          runs it and what --disable does
+#   sudo ae9-ae7-enable --remove-kit-files remove the AE-7 test kit's files
+#                                          (its hand-copied module after a
+#                                          yes, or with --yes)
+#   --force                                with on: also without an AE-7 in
+#                                          the PC, or with kit files left
+#   -h, --help                             this text
+#
+# "On" copies two files from /usr/share/creative-ae9/ae7/ (a source install:
+# /usr/local/share/creative-ae9/ae7/, or config/ae7/ next to this script):
+#   /etc/udev/rules.d/00-ae7-override.rules  hands the AE-7 (PCI 1102:0010,
+#                                            subsystem 1102:0081) to the driver
+#   /etc/modprobe.d/ae7-override.conf        ae7=1, and a fallback for when
+#                                            snd_hda_intel loads first
+# and reloads udev's rules. "Off" removes them. Either takes effect at the
+# next boot. An AE-9 needs neither: nothing here changes how an AE-9 runs.
+# Running it again is harmless (each step checks first).
+#
+# The in-tree driver (snd_hda_intel) has hung the PC at boot on every AE-7
+# with an ASMedia PCIe bridge (1b21:1080, most cards from 2022 on) reported
+# so far. So "off" hands the AE-7 back to it only when every AE-7 in the PC
+# sits behind an IDT/Tundra Tsi381 bridge (10e3:8111), which it is reported
+# to run. Any other AE-7 is parked instead, by two files this script writes
+# (the only copy: package removal, dkms-install.sh --remove and
+# restore-stock-audio.sh run it):
+#   /etc/udev/rules.d/00-ae7-park.rules  mark the AE-7 for this driver, which
+#   /etc/modprobe.d/ae7-park.conf        leaves it alone without ae7=1 (with
+#                                        the driver removed, nothing takes it)
+# Also parked: with no AE-7 visible but the opt-in files there (one was set
+# up here), and with no PCI device visible at all. "On" removes the park
+# files, and so does "off" when it hands the AE-7 to the in-tree driver (a
+# Tsi381, or --stock). With no AE-7 and no opt-in, "off" leaves them alone.
+#
+# The test kits installed their own files (ae7-kit.conf and others): they
+# would run next to these, so "on" stops while any is there, and
+# --remove-kit-files takes them out.
+set -euo pipefail
+
+# For tests only: AE7_ENABLE_ROOT=<dir> works on a fake root (<dir>/etc,
+# <dir>/sys/bus/pci/devices, ...), needs no root and runs no udevadm.
+ROOT=${AE7_ENABLE_ROOT:-}
+if [ -n "$ROOT" ]; then
+	case $ROOT in /*) ;; *) echo "AE7_ENABLE_ROOT must be an absolute path" >&2; exit 2 ;; esac
+	if [ "$ROOT" = / ] || [ ! -d "$ROOT" ]; then
+		echo "AE7_ENABLE_ROOT: not a test directory: $ROOT" >&2; exit 2
+	fi
+fi
+
+ME=ae9-ae7-enable
+MOD=snd-hda-codec-creative-ae9
+SYSMOD=$ROOT/sys/module/snd_hda_codec_creative_ae9
+# the opt-in pair ("on", copied from the packaged copies) and the park pair
+# ("off" on an AE-7 the in-tree driver would hang, written by park_rules and
+# park_conf below)
+OPT_RULES=/etc/udev/rules.d/00-ae7-override.rules
+OPT_CONF=/etc/modprobe.d/ae7-override.conf
+PARK_RULES=/etc/udev/rules.d/00-ae7-park.rules
+PARK_CONF=/etc/modprobe.d/ae7-park.conf
+
+# the header above, from its 4th line to the first line that isn't a comment
+usage() { awk 'NR < 4 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
+
+ACTION=enable FORCE=0 YES=0 STOCK=0
+for a in "$@"; do
+	case $a in
+	--disable) ACTION=disable ;;
+	--stock) STOCK=1 ;;
+	--status) ACTION=status ;;
+	--remove-kit-files) ACTION=kit ;;
+	--force) FORCE=1 ;;
+	--yes) YES=1 ;;
+	-h|--help) usage; exit 0 ;;
+	*) echo "$ME: unknown option: $a (see --help)" >&2; exit 2 ;;
+	esac
+done
+if [ "$STOCK" = 1 ] && [ "$ACTION" != disable ]; then
+	echo "$ME: --stock goes with --disable (see --help)" >&2; exit 2
+fi
+
+need_root() {
+	[ -n "$ROOT" ] && return 0
+	[ "$(id -u)" = 0 ] || { echo "$ME: needs root: sudo $ME $*" >&2; exit 1; }
+}
+
+# where the packaged opt-in files are
+src_dir() {
+	local d here
+	here=$(cd "$(dirname "$0")" && pwd)
+	for d in "$ROOT/usr/share/creative-ae9/ae7" "$ROOT/usr/local/share/creative-ae9/ae7" "$here/../config/ae7"; do
+		if [ -f "$d/00-ae7-override.rules" ] && [ -f "$d/ae7-override.conf" ]; then
+			(cd "$d" && pwd)
+			return 0
+		fi
+	done
+	return 1
+}
+
+# The PCI device right above an AE-7 (its PCIe-to-PCI bridge), from the
+# card's place in /sys/devices: "<address> <vendor:device>", "<address> -"
+# when its IDs can't be read, "- -" when the path shows no PCI device there.
+bridge_of() {
+	local p v dv
+	p=$(readlink -f "$1" 2>/dev/null) || p=""
+	p=${p%/*}
+	case $p in "$ROOT"/sys/devices/*) ;; *) echo "- -"; return 0 ;; esac
+	case ${p##*/} in *:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]) ;; *) echo "- -"; return 0 ;; esac
+	v=$(cat "$p/vendor" 2>/dev/null) || v=""
+	dv=$(cat "$p/device" 2>/dev/null) || dv=""
+	case $v$dv in
+	0x????0x????) echo "${p##*/} ${v#0x}:${dv#0x}" ;;
+	*) echo "${p##*/} -" ;;
+	esac
+}
+# Tsi381: the in-tree driver runs an AE-7 behind it (the only bridge "off"
+# hands back); ASMedia: it hangs the PC at boot; unknown: anything else
+bridge_name() {
+	case $1 in
+	10e3:8111) echo Tsi381 ;;
+	1b21:*) echo ASMedia ;;
+	*) echo unknown ;;
+	esac
+}
+
+# the AE-7s in the PC, one per line: "<pci address> <driver or -> <driver_override>
+# <bridge address or -> <bridge vendor:device or -> <Tsi381|ASMedia|unknown>"
+ae7_cards() {
+	local d drv ovr br
+	for d in "$ROOT"/sys/bus/pci/devices/*; do
+		[ -r "$d/subsystem_device" ] || continue
+		if [ "$(cat "$d/vendor")" != 0x1102 ] || [ "$(cat "$d/device")" != 0x0010 ] ||
+		   [ "$(cat "$d/subsystem_device")" != 0x0081 ]; then
+			continue
+		fi
+		drv=-
+		[ -L "$d/driver" ] && drv=$(basename "$(readlink "$d/driver")")
+		ovr=$(cat "$d/driver_override" 2>/dev/null || echo "(null)")
+		[ -n "$ovr" ] || ovr="(null)"
+		br=$(bridge_of "$d")
+		echo "${d##*/} $drv $ovr $br $(bridge_name "${br#* }")"
+	done
+	return 0
+}
+# any PCI device to be seen? (not in a container or chroot without /sys:
+# there an AE-7 can't be ruled out)
+pci_visible() {
+	local d
+	for d in "$ROOT"/sys/bus/pci/devices/*; do
+		if [ -e "$d" ]; then return 0; fi
+	done
+	return 1
+}
+# What "off" does here: "park" with an AE-7 whose bridge isn't a Tsi381;
+# "park-nopci" with no PCI device in sight; "park-unseen" with no AE-7 in
+# sight but the opt-in files there (an AE-7 was set up here: it may be out
+# of the PC or not answering now, and removing the opt-in would leave it to
+# snd_hda_intel when it's back); "stock" when every AE-7 sits behind a
+# Tsi381; "none" with no AE-7 and no opt-in.
+off_plan() {
+	local cards bn plan=stock
+	if ! pci_visible; then echo park-nopci; return 0; fi
+	cards=$(ae7_cards)
+	if [ -z "$cards" ]; then
+		if [ -e "$ROOT$OPT_RULES" ] || [ -e "$ROOT$OPT_CONF" ]; then echo park-unseen
+		else echo none; fi
+		return 0
+	fi
+	while read -r _ _ _ _ _ bn; do
+		[ "$bn" = Tsi381 ] || plan=park
+	done <<< "$cards"
+	echo "$plan"
+}
+
+# The park pair. Written here only (package removal and
+# restore-stock-audio.sh run this script). The opt-in pair's mechanism
+# (config/ae7/) without ae7=1: the driver's probe refuses an AE-7 then
+# (one notice, -ENODEV) and a driver_override keeps every other driver
+# away, so the card stays unbound; with the driver gone, the override names
+# a driver that doesn't exist and nothing binds either.
+park_head() {
+	cat <<'EOF'
+# Sound Blaster AE-7 parked: no driver for the AE-7 (PCI 1102:0010,
+# subsystem 1102:0081). Written by "ae9-ae7-enable --disable", which the
+# creative-ae9 packages' removal, dkms-install.sh --remove and
+# restore-stock-audio.sh also run. Not a package file: it stays when the
+# driver is removed.
+#
+# It keeps the AE-7 away from the kernel's snd_hda_intel, which has hung the
+# PC at boot on every AE-7 with an ASMedia PCIe bridge reported so far (most
+# cards from 2022 on). It marks the card for snd-hda-codec-creative-ae9,
+# which leaves an AE-7 alone without its ae7=1 option; with that driver
+# removed, nothing takes the card at all.
+#
+# To remove it: "sudo ae9-ae7-enable" (this driver runs the AE-7), or
+# "sudo ae9-ae7-enable --disable --stock" (snd_hda_intel takes it). With the
+# driver removed: "sudo bash scripts/ae9-ae7-enable --disable --stock" from
+# its source, or delete /etc/udev/rules.d/00-ae7-park.rules and
+# /etc/modprobe.d/ae7-park.conf and reboot. Those hand the AE-7 to
+# snd_hda_intel: only for a Tsi381 bridge (10e3:8111).
+EOF
+}
+park_rules() {
+	park_head
+	cat <<'EOF'
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1102", ATTR{device}=="0x0010", ATTR{subsystem_device}=="0x0081", ATTR{driver_override}="snd-hda-codec-creative-ae9"
+EOF
+}
+park_conf() {
+	park_head
+	cat <<'EOF'
+#
+# The fallback for 00-ae7-park.rules: if snd_hda_intel loads before udev
+# has seen the AE-7 (for onboard or HDMI audio), mark the AE-7 first.
+# modprobe runs only the first "install" line it reads for a module, and
+# this file is read before ae9-override.conf (the AE-9's own fallback, from
+# the package), so this line marks an AE-9 (subsystem 0x0071) too while the
+# ae9-override.conf modprobe reads has an install line for snd_hda_intel
+# (not commented out), as that would; with it gone or masked, an AE-9 is
+# left alone. No "options": ae7 stays 0. An "install snd_hda_intel" line of
+# your own runs only from a file that sorts before this one (00-*.conf),
+# and then replaces this fallback (the udev rule still marks the AE-7).
+install snd_hda_intel ae9=none; for c in /etc /run /usr/local/lib /usr/lib /lib; do f=$c/modprobe.d/ae9-override.conf; [ -e $f ] || continue; while read -r k m x || [ -n "$k" ]; do [ "$k" = install ] && case $m in snd_hda_intel|snd-hda-intel) ae9=0x0071 ;; esac; done < $f; break; done 2>/dev/null; for d in /sys/bus/pci/devices/*; do [ "$(cat $d/vendor)" = 0x1102 ] && [ "$(cat $d/device)" = 0x0010 ] && case "$(cat $d/subsystem_device)" in 0x0081|$ae9) echo snd-hda-codec-creative-ae9 > $d/driver_override ;; esac; done 2>/dev/null; exec /sbin/modprobe --ignore-install snd_hda_intel $CMDLINE_OPTS
+EOF
+}
+
+# the test kits' files still installed (the profile set the kit put in
+# /usr/share is the package's file now and stays)
+KIT_FILES=(
+	/etc/modprobe.d/ae7-kit.conf
+	/etc/modules-load.d/ae7-kit.conf
+	/etc/modules-load.d/ae7-kit-modules-load.conf
+	/etc/udev/rules.d/00-ae7-kit-override.rules
+	/etc/udev/rules.d/89-ae7-kit-pipewire.rules
+	/etc/alsa/conf.d/ae7-stereo.conf
+	/etc/wireplumber/wireplumber.conf.d/50-ae7-kit-safe-volume.conf
+	/etc/wireplumber/main.lua.d/51-ae7-kit-safe-volume.lua
+)
+kit_left() {
+	local f
+	for f in "${KIT_FILES[@]}"; do
+		if [ -e "$ROOT$f" ] || [ -L "$ROOT$f" ]; then echo "$f"; fi
+	done
+	return 0
+}
+# hand-installed modules (the kits' install step put one in updates/):
+# such a copy wins over the packaged/DKMS one (DKMS uses updates/dkms/ or
+# extra/), so a kit build would keep running. One path per line, any kernel;
+# a file a package owns is not listed.
+kit_module() {
+	local m
+	for m in "$ROOT"/lib/modules/*/updates/"$MOD".ko; do
+		[ -e "$m" ] || continue
+		owned "$m" || echo "${m#"$ROOT"}"
+	done
+	return 0
+}
+owned() {	# does an installed package own this file?
+	{ command -v rpm >/dev/null && rpm -qf "$1" >/dev/null 2>&1; } ||
+	{ command -v dpkg-query >/dev/null && dpkg-query -S "$1" >/dev/null 2>&1; } ||
+	{ command -v pacman >/dev/null && pacman -Qqo "$1" >/dev/null 2>&1; }
+}
+
+udev_reload() {
+	if [ -n "$ROOT" ]; then echo "(test root: udevadm control --reload skipped)"; return 0; fi
+	if ! udevadm control --reload 2>/dev/null; then
+		echo "$ME: couldn't reload udev's rules (udevadm control --reload); they apply after a reboot anyway" >&2
+	fi
+}
+
+# is the driver loaded at boot? (packages: /usr/lib/modules-load.d; source
+# installs: /etc/modules-load.d) Nothing else loads it on an AE-7.
+early_load() {
+	local f
+	for f in /etc/modules-load.d/creative-ae9.conf /usr/lib/modules-load.d/creative-ae9.conf; do
+		if [ -e "$ROOT$f" ]; then echo "$f"; return 0; fi
+	done
+	return 0
+}
+
+state_of() {	# installed / not installed / differs from the packaged copy
+	local dst=$1 src=$2
+	if [ ! -e "$dst" ]; then echo "not installed"
+	elif [ -n "$src" ] && ! cmp -s "$src" "$dst"; then echo "installed (differs from $src)"
+	else echo "installed"; fi
+}
+gen_state() {	# the same for a file this script writes: gen_state <generator> <file>
+	if [ ! -e "$ROOT$2" ]; then echo "not installed"
+	elif "$1" | cmp -s - "$ROOT$2"; then echo "installed"
+	else echo "installed (differs from what $ME writes)"; fi
+}
+
+# on, parked, off, or a mix, from the files in /etc
+state_line() {
+	local o=0 k=0
+	if [ -e "$ROOT$OPT_RULES" ]; then o=$((o + 1)); fi
+	if [ -e "$ROOT$OPT_CONF" ]; then o=$((o + 1)); fi
+	if [ -e "$ROOT$PARK_RULES" ]; then k=$((k + 1)); fi
+	if [ -e "$ROOT$PARK_CONF" ]; then k=$((k + 1)); fi
+	if [ "$k" -gt 0 ] && [ -e "$ROOT$OPT_CONF" ]; then
+		echo "opt-in and park files both installed (the opt-in's win: ae7=1): run sudo $ME, or sudo $ME --disable"
+	elif [ "$k" -gt 0 ] && [ "$o" -gt 0 ]; then
+		echo "parked, with the opt-in's udev rule left over (no ae7=1, so the AE-7 stays without a driver): run sudo $ME, or sudo $ME --disable"
+	elif [ "$o" = 2 ]; then echo "on: this driver runs the AE-7 (ae7=1)"
+	elif [ "$o" = 1 ]; then echo "on, but one opt-in file is missing: sudo $ME"
+	elif [ "$k" = 2 ]; then echo "parked: the AE-7 gets no driver"
+	elif [ "$k" = 1 ]; then echo "parked, but one park file is missing: sudo $ME --disable"
+	else echo "off: no AE-7 files in /etc (nothing keeps an AE-7 from snd_hda_intel)"; fi
+}
+
+# one AE-7's bridge, in words: bridge_words <address> <vendor:device> <name>
+bridge_words() {
+	case $3 in
+	ASMedia) echo "an ASMedia bridge ($2)" ;;
+	Tsi381) echo "a Tsi381 bridge ($2)" ;;
+	*) if [ "$2" = - ]; then echo "a bridge that can't be read"
+	   else echo "a bridge not known to work with the in-tree driver ($2 at $1)"; fi ;;
+	esac
+}
+
+do_status() {
+	local src="" cards kit mod el v pset prule f pci drv ovr ba bid bn plan
+	src=$(src_dir) || src=""
+	echo "AE-7 support (experimental):"
+	echo "  $(state_of "$ROOT$OPT_RULES" "${src:+$src/00-ae7-override.rules}"): $OPT_RULES"
+	echo "  $(state_of "$ROOT$OPT_CONF" "${src:+$src/ae7-override.conf}"): $OPT_CONF"
+	[ -n "$src" ] || echo "  packaged copies: not found (/usr/share/creative-ae9/ae7/)"
+	echo "  park files (the AE-7 left with no driver):"
+	echo "    $(gen_state park_rules "$PARK_RULES"): $PARK_RULES"
+	echo "    $(gen_state park_conf "$PARK_CONF"): $PARK_CONF"
+	echo "  state: $(state_line)"
+	if [ -d "$SYSMOD" ]; then
+		v=$(cat "$SYSMOD/version" 2>/dev/null || echo "?")
+		echo "  driver: $v loaded, ae7=$(cat "$SYSMOD/parameters/ae7" 2>/dev/null || echo "(no such option: driver older than 0.13.0)")"
+	else
+		echo "  driver: not loaded"
+	fi
+	el=$(early_load)
+	echo "  loaded at boot: ${el:-NO (no modules-load.d/creative-ae9.conf: nothing loads the driver for an AE-7)}"
+	cards=$(ae7_cards)
+	if [ -z "$cards" ]; then
+		echo "  Sound Blaster AE-7: none found (PCI 1102:0010, subsystem 1102:0081)"
+	else
+		while read -r pci drv ovr ba bid bn; do
+			case $drv in
+			"$MOD") drv="$MOD (this driver)" ;;
+			snd_hda_intel) drv="snd_hda_intel (the in-tree driver)" ;;
+			-) drv="none" ;;
+			esac
+			echo "  Sound Blaster AE-7 at $pci: driver $drv, driver_override $ovr"
+			case $bn in
+			ASMedia) echo "    bridge: $ba, $bid (ASMedia): the in-tree driver has hung the PC at boot on these" ;;
+			Tsi381) echo "    bridge: $ba, $bid (Tsi381): reported to work with the in-tree driver" ;;
+			*) if [ "$bid" = - ]; then echo "    bridge: can't be read"
+			   else echo "    bridge: $ba, $bid (unknown): not known to work with the in-tree driver"; fi ;;
+			esac
+		done <<< "$cards"
+		if [ -e "$ROOT/proc/asound/AE7" ]; then echo "  card: registered (ALSA id AE7)"
+		else echo "  card: not registered by this driver (no /proc/asound/AE7)"; fi
+	fi
+	plan=$(off_plan)
+	case $plan in
+	park) echo "  off here (--disable): parks the AE-7, no driver (--disable --stock: the in-tree driver anyway, which hangs an ASMedia AE-7)" ;;
+	park-nopci) echo "  off here (--disable): parks the AE-7, no driver: no PCI devices visible, so an AE-7 can't be ruled out" ;;
+	park-unseen) echo "  off here (--disable): parks the AE-7, no driver: none visible now, but the opt-in files show one was set up here" ;;
+	stock) echo "  off here (--disable): the in-tree driver takes the AE-7 (Tsi381 bridge)" ;;
+	none) echo "  off here (--disable): nothing to do (no AE-7 found, no opt-in files; park files stay as they are)" ;;
+	esac
+	[ -n "$cards" ] || return 0	# the rest only matters with an AE-7
+	pset=/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae7.conf
+	prule=""
+	for f in /etc/udev/rules.d/89-ae7-pipewire.rules /usr/lib/udev/rules.d/89-ae7-pipewire.rules; do
+		if [ -e "$ROOT$f" ]; then prule=$f; break; fi
+	done
+	if [ -e "$ROOT$pset" ] && [ -n "$prule" ]; then echo "  PipeWire profile set: $pset ($prule)"
+	else echo "  PipeWire profile set: missing ($pset and 89-ae7-pipewire.rules): stereo fallback only"; fi
+	kit=$(kit_left)
+	if [ -n "$kit" ]; then
+		echo "  test kit files still installed:"
+		while read -r f; do echo "    $f"; done <<< "$kit"
+	fi
+	mod=$(kit_module)
+	if [ -n "$mod" ]; then
+		echo "  hand-installed driver modules (a test kit's?), loaded instead of the packaged one:"
+		while read -r f; do echo "    $f"; done <<< "$mod"
+	fi
+	[ -z "$kit$mod" ] || echo "  remove them with: sudo $ME --remove-kit-files"
+	return 0
+}
+
+do_remove_kit() {
+	local f n=0 mods ans k
+	need_root --remove-kit-files
+	while read -r f; do
+		[ -n "$f" ] || continue
+		rm -f -- "$ROOT$f" && echo "removed $f" && n=$((n + 1))
+	done <<< "$(kit_left)"
+	if [ "$n" = 0 ]; then echo "no test kit config files found"
+	else udev_reload; fi
+	# the kit's hand-copied module: only with an AE-7 in the PC or kit files
+	# found (a developer's own build on an AE-9 machine stays), and only
+	# with a yes (or --yes)
+	mods=""
+	if [ "$n" -gt 0 ] || [ -n "$(ae7_cards)" ]; then mods=$(kit_module); fi
+	if [ -n "$mods" ]; then
+		echo "A hand-installed driver module (a test kit's install step put one here):"
+		while read -r f; do echo "  $f"; done <<< "$mods"
+		echo "It loads instead of the packaged one, so a kit build would keep running."
+		ans=n
+		if [ "$YES" = 1 ]; then
+			ans=y
+		elif [ -t 0 ]; then
+			read -r -p "Remove it and rebuild the module list (depmod)? [y/N] " ans || ans=n
+		else
+			echo "Left alone (no terminal to ask): run again with --yes to remove it."
+		fi
+		case $ans in
+		y|Y|yes|YES)
+			while read -r f; do
+				rm -f -- "$ROOT$f" && echo "removed $f" && n=$((n + 1))
+				k=${f#/lib/modules/}; k=${k%%/*}
+				if [ -n "$ROOT" ]; then echo "(test root: depmod -a $k skipped)"
+				else depmod -a "$k" || echo "$ME: depmod -a $k failed: run it by hand" >&2; fi
+			done <<< "$mods" ;;
+		*) echo "Left alone. To remove it by hand: sudo rm <the file above>; sudo depmod -a" ;;
+		esac
+	fi
+	[ "$n" = 0 ] || echo "Reboot for the change to take effect."
+	return 0
+}
+
+do_enable() {
+	local src cards kit f
+	need_root
+	cards=$(ae7_cards)
+	if [ -z "$cards" ] && [ "$FORCE" = 0 ]; then
+		cat >&2 <<MSG
+$ME: no Sound Blaster AE-7 in this PC (PCI 1102:0010, subsystem 1102:0081).
+Nothing installed. An AE-9 needs nothing from this command. To install the
+files anyway (for a card you are about to fit): sudo $ME --force
+MSG
+		exit 1
+	fi
+	kit=$(kit_left)
+	if [ -n "$kit" ] && [ "$FORCE" = 0 ]; then
+		echo "$ME: the AE-7 test kit's files are still installed:" >&2
+		while read -r f; do echo "  $f"; done <<< "$kit" >&2
+		cat >&2 <<MSG
+They would run next to the released ones. Remove them first, then run
+this again:
+  sudo $ME --remove-kit-files
+  sudo $ME
+(--force installs anyway and leaves them.)
+MSG
+		exit 1
+	fi
+	src=$(src_dir) || { echo "$ME: the opt-in files aren't installed (/usr/share/creative-ae9/ae7/): reinstall the package" >&2; exit 1; }
+	inst "$src/00-ae7-override.rules" "$OPT_RULES"
+	inst "$src/ae7-override.conf" "$OPT_CONF"
+	# a park is replaced by the opt-in (which wins over it anyway: both mark
+	# the card, and ae7-override.conf is read first); out after the opt-in
+	# is in, so the AE-7 is never left to snd_hda_intel in between
+	rm_one "$PARK_RULES" || true
+	rm_one "$PARK_CONF" || true
+	udev_reload
+	if [ -z "$(early_load)" ]; then
+		echo "warning: nothing loads the driver at boot (no modules-load.d/creative-ae9.conf); install the package's or see docs/AE7.md" >&2
+	fi
+	if [ -n "$(kit_module)" ]; then
+		echo "note: a hand-installed module (a test kit's?) loads instead of the packaged one: $ME --status" >&2
+	fi
+	echo "AE-7 support is on from the next boot: reboot now. Then check with: $ME --status"
+	echo "(Off again: sudo $ME --disable)"
+}
+
+inst() {	# copy one file unless it is already the same
+	local src=$1 dst=$2
+	if [ -e "$ROOT$dst" ] && cmp -s "$src" "$ROOT$dst"; then
+		echo "already installed: $dst"
+	else
+		install -D -m 644 "$src" "$ROOT$dst"
+		echo "installed: $dst"
+	fi
+}
+CHANGED=0	# files put or removed in /etc by this run
+PUT_TMP=""	# put()'s temporary file while it is written (removed on any exit)
+trap '[ -z "$PUT_TMP" ] || rm -f -- "$PUT_TMP"' EXIT
+put() {	# write one generated file unless it is already the same: put <generator> <file>
+	local gen=$1 dst=$2
+	if [ -f "$ROOT$dst" ] && "$gen" | cmp -s - "$ROOT$dst"; then
+		echo "already installed: $dst"
+		return 0
+	fi
+	mkdir -p "$ROOT${dst%/*}"
+	# under a name udev and modprobe skip (no .rules/.conf), then renamed
+	PUT_TMP=$ROOT$dst.new.$$
+	"$gen" > "$PUT_TMP"
+	chmod 644 "$PUT_TMP"
+	mv -fT -- "$PUT_TMP" "$ROOT$dst"	# -T: never into a directory of that name
+	PUT_TMP=""
+	echo "installed: $dst"
+	CHANGED=$((CHANGED + 1))
+}
+# how to undo a park, also once the driver (and this script) is gone
+unpark_hint() {
+	echo "Only with a Tsi381 bridge: on an ASMedia bridge the in-tree driver hangs the PC at boot."
+	echo "To hand it to the in-tree driver anyway: sudo $ME --disable --stock"
+	echo "(with the driver removed: sudo bash scripts/ae9-ae7-enable --disable --stock from its source, or delete $PARK_RULES and $PARK_CONF and reboot)"
+}
+rm_one() {	# remove one file from /etc; false if it wasn't there
+	if [ -e "$ROOT$1" ] || [ -L "$ROOT$1" ]; then
+		rm -f -- "$ROOT$1"
+		echo "removed: $1"
+		CHANGED=$((CHANGED + 1))
+		return 0
+	fi
+	return 1
+}
+
+do_disable() {
+	local n=0 plan cards pci ba bid bn
+	if [ "$STOCK" = 1 ]; then need_root --disable --stock; else need_root --disable; fi
+	cards=$(ae7_cards)
+	if [ "$STOCK" = 1 ]; then plan=stock; else plan=$(off_plan); fi
+	# park first, then the opt-in out: the AE-7 is never left to
+	# snd_hda_intel in between (a failed write stops here, with the opt-in
+	# still in place)
+	case $plan in
+	park*)
+		put park_rules "$PARK_RULES"
+		put park_conf "$PARK_CONF" ;;
+	esac
+	if rm_one "$OPT_RULES"; then n=$((n + 1)); fi
+	if rm_one "$OPT_CONF"; then n=$((n + 1)); fi
+	if [ "$plan" = stock ]; then
+		rm_one "$PARK_RULES" || true
+		rm_one "$PARK_CONF" || true
+	fi
+	[ "$CHANGED" = 0 ] || udev_reload
+	case $plan in
+	park*)
+		case $plan in
+		park-nopci) echo "No PCI devices can be seen here, so an AE-7 can't be ruled out: it is parked (left with no driver) to be safe." ;;
+		park-unseen) echo "No AE-7 is visible now, but the opt-in files show one was set up here: it is parked (left with no driver) to be safe." ;;
+		esac
+		while read -r pci _ _ ba bid bn; do
+			[ -n "$pci" ] || continue
+			case $bn in
+			ASMedia) echo "The AE-7 at $pci is behind an ASMedia bridge ($bid): the in-tree driver hangs the PC at boot on these cards, so it's left with no driver (parked)." ;;
+			Tsi381) echo "The AE-7 at $pci (Tsi381 bridge) is parked too: the park files cover every AE-7 in the PC." ;;
+			*) echo "The AE-7 at $pci is behind $(bridge_words "$ba" "$bid" "$bn"), so it's left with no driver (parked)." ;;
+			esac
+		done <<< "$cards"
+		if [ "$n" -gt 0 ]; then echo "AE-7 support is off from the next boot, and the AE-7 is parked: no driver takes it."
+		elif [ "$CHANGED" -gt 0 ]; then echo "The AE-7 is parked from the next boot: no driver takes it."
+		else echo "AE-7 support is already off, and the AE-7 stays parked: no driver takes it."; fi
+		unpark_hint
+		;;
+	stock)
+		if [ -z "$cards" ]; then
+			if [ "$CHANGED" -gt 0 ]; then echo "AE-7 support is off, nothing parked (no AE-7 in this PC)."
+			else echo "AE-7 support is already off (no AE-7 files in /etc)."; fi
+		elif [ "$n" -gt 0 ]; then
+			echo "AE-7 support is off from the next boot: reboot, and the in-tree driver takes the AE-7 again."
+		elif [ "$CHANGED" -gt 0 ]; then
+			echo "The AE-7 is no longer parked: from the next boot the in-tree driver takes it."
+		else
+			echo "AE-7 support is already off: nothing in /etc keeps the AE-7 from the in-tree driver."
+		fi
+		while read -r pci _ _ ba bid bn; do
+			[ -n "$pci" ] && [ "$bn" != Tsi381 ] || continue
+			cat >&2 <<MSG
+warning: the AE-7 at $pci is behind $(bridge_words "$ba" "$bid" "$bn"), not a
+Tsi381: the in-tree driver can hang the PC at boot on it. If it does, add
+module_blacklist=snd_hda_intel to the kernel's line at the boot menu for one
+boot, then park it: sudo $ME --disable (with the driver removed: sudo bash
+scripts/ae9-ae7-enable --disable from its source; docs/AE7.md).
+MSG
+		done <<< "$cards"
+		;;
+	none)	# no AE-7 and no opt-in files (with them, the plan is park-unseen)
+		echo "AE-7 support is already off (no opt-in files in /etc)."
+		if [ -e "$ROOT$PARK_RULES" ] || [ -e "$ROOT$PARK_CONF" ]; then
+			echo "No AE-7 in this PC: the park files stay as they are ($PARK_RULES, $PARK_CONF). To remove them: sudo $ME --disable --stock (or delete them by hand)"
+		fi
+		;;
+	esac
+	if [ -n "$(kit_left)" ]; then
+		echo "note: test kit files are still installed and still hand the AE-7 over: sudo $ME --remove-kit-files" >&2
+	fi
+	return 0
+}
+
+case $ACTION in
+enable) do_enable ;;
+disable) do_disable ;;
+status) do_status ;;
+kit) do_remove_kit ;;
+esac

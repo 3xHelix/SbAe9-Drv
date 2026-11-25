@@ -7,6 +7,9 @@ gives every control below a Sound Blaster Command-style app (Python 3 +
 PySide6), and follows the knob and alsamixer live. The controls named here
 are also in `alsamixer -c AE9` and `amixer -c AE9`.
 
+This page is about the AE-9. The Sound Blaster AE-7 (experimental, opt-in
+since 0.13.0) has its own page: [AE7.md](AE7.md).
+
 - [The head unit](#the-head-unit)
 - [Playback](#playback)
 - [Native DSD64](#native-dsd64)
@@ -478,6 +481,10 @@ column); 128 or more is fine.
   card; 0.12.17). Apps can follow it with `amixer events` (SbAe9-AudioMon
   0.4.11 shows all 9; older versions expect exactly 8 and show n/a).
   Since 0.12.11.
+- **"Card Model"** (read-only, any user, since 0.13.0): the card's name,
+  "Sound Blaster AE-9" (or "Sound Blaster AE-7"), for apps that show a
+  card's own controls. It's a card control, not a mixer one:
+  `amixer -c AE9 cget iface=CARD,name='Card Model'`.
 - **Reloading the driver:** `ae9-reload` stops what holds the card,
   reloads the driver and starts everything again; Sound Blaster Command
   and AudioMon let go of the card while it runs (see

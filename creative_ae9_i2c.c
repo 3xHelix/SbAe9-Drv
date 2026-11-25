@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 3xHelix
-// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+// Contains code adapted from the Linux kernel's CA0132 driver
+// (sound/hda/codecs/ca0132.c, sound/pci/hda/patch_ca0132.c in older kernels):
 //   Copyright (c) 2011, Creative Technology Ltd.
 //   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 // and from s3boun3t/ae9_build (driver/ca0132/ca0132.c, GPL-2.0-or-later):
@@ -249,15 +250,14 @@ int creative_i2c_raw_tx(struct creative_chip *chip, u8 reg,
 
 int creative_i2c_dsp_init(struct creative_chip *chip)
 {
-	u32 val;
 
 	dev_dbg(chip->dev, "DSP I2C controller init\n");
 
 	/* Read DSP status - expect 0x6 */
-	val = creative_ext_readl(chip, DSP_REG_STS);
+	creative_ext_readl(chip, DSP_REG_STS);
 
 	/* Read I2C control */
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 
 	/* Write 0x80 to CTRL (init mode) */
 	creative_ext_writel(chip, DSP_REG_CTRL, 0x80);
@@ -278,28 +278,28 @@ int creative_i2c_dsp_init(struct creative_chip *chip)
 	creative_ext_readl(chip, DSP_REG_STS);
 
 	/* Read I2C control */
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 
 	/* Write 0x03 to CTRL (FIFO mode) */
 	creative_ext_writel(chip, DSP_REG_CTRL, 0x3);
 
 	/* Read DSP status again */
-	val = creative_ext_readl(chip, DSP_REG_STS);
+	creative_ext_readl(chip, DSP_REG_STS);
 
 	/* Check + re-write 0x03 three times (as seen in capture) */
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 	creative_ext_writel(chip, DSP_REG_CTRL, 0x3);
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 
-	val = creative_ext_readl(chip, DSP_REG_STS);
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_STS);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 	creative_ext_writel(chip, DSP_REG_CTRL, 0x3);
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 
-	val = creative_ext_readl(chip, DSP_REG_STS);
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_STS);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 	creative_ext_writel(chip, DSP_REG_CTRL, 0x3);
-	val = creative_ext_readl(chip, DSP_REG_CTRL);
+	creative_ext_readl(chip, DSP_REG_CTRL);
 
 	/* Write FIFO bytes: 0x1, 0xf1, 0x1, 0xc7, 0xc1 */
 	/*
@@ -323,13 +323,13 @@ int creative_i2c_dsp_init(struct creative_chip *chip)
 	creative_ext_readl(chip, DSP_REG_FIFO);	/* read = 0xc1 */
 
 	/* Read DATA reg = 0x0 */
-	val = creative_ext_readl(chip, DSP_REG_DATA);
+	creative_ext_readl(chip, DSP_REG_DATA);
 
 	/* Write 0x80 to DATA (trigger) */
 	creative_ext_writel(chip, DSP_REG_DATA, 0x80);
 
 	/* Read DATA back to confirm */
-	val = creative_ext_readl(chip, DSP_REG_DATA);
+	creative_ext_readl(chip, DSP_REG_DATA);
 
 	dev_dbg(chip->dev, "DSP I2C controller init done (final STS=0x%x)\n",
 		creative_ext_readl(chip, DSP_REG_STS));

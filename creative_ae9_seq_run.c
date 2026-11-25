@@ -1492,6 +1492,7 @@ static void pd_codecs_d3(struct creative_chip *chip, bool cold)
  */
 void creative_ae9_power_down(struct creative_chip *chip, bool cold)
 {
+	AE9_HOOK(chip, power_down, chip, cold);
 	pd_stop(chip);
 	if (creative_ae9_streams_drain(chip, "shutdown") < 0)
 		pd_stream_0c_off(chip);
@@ -2079,6 +2080,7 @@ void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 {
 	unsigned int ch;
 
+	AE9_HOOK(chip, bar2_init, chip);
 	bar2_init_w(chip, AE9_BAR2_I2S + DW_I2S_IER, 1);
 	for (ch = 0; ch < 4; ch++)
 		bar2_init_w(chip, AE9_BAR2_I2S + DW_I2S_TER(ch), 0);
@@ -2131,8 +2133,8 @@ void creative_ae9_bar2_init_windows(struct creative_chip *chip)
 
 /*
  * Creative's DSD ASIO driver (CtxDsd64.dll) plays DSD64 natively through
- * CtxHda.sys's DSD stream class (FUN_0012fa08; notes
- * .tmp/notes/dsd-windows.md): the HDA stream carries 6 x 16 bit at 88.2 kHz
+ * CtxHda.sys's DSD stream class (FUN_0012fa08; project
+ * notes, not published): the HDA stream carries 6 x 16 bit at 88.2 kHz
  * (format 0x4815) and the CA0113's own I2S block in BAR2 (channels 2 and 3,
  * data on GPIO pins 6/7) takes it straight from the stream, with the ES9038
  * in DSD input (48/01 = 0xc3) and GPIO pin 1 high. pcm.c sends the DAC
@@ -2227,3 +2229,6 @@ void creative_ae9_dsd_stop_block(struct creative_chip *chip)
 	msleep(50);
 	blk_end(&b, "DSD64: stop block (converter 0x02 unbound)");
 }
+
+/* the AE-7 (experimental): its run part, on this file's helpers */
+#include "creative_ae7_run.c"

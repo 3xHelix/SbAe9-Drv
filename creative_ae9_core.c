@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 3xHelix
-// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+// Contains code adapted from the Linux kernel's CA0132 driver
+// (sound/hda/codecs/ca0132.c, sound/pci/hda/patch_ca0132.c in older kernels):
 //   Copyright (c) 2011, Creative Technology Ltd.
 //   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 // and from s3boun3t/ae9_build (driver/ca0132/ca0132.c, GPL-2.0-or-later):
@@ -235,11 +236,13 @@ DEFINE_SEQ_ATTRIBUTE(vlog_seq);
 /* ------------------------------------------------------------------ */
 /*
  * AE-9 only: 1102:0010 with subsystem 1102:0071. The AE-7 shares the device
- * ID (subsystem 0x0081); the AE-5 and AE-5 Plus are 1102:0012 (subsystems
- * 0x0051, 0x0191), as are the Recon3D, Z and ZxR (in-tree snd_hda_intel +
- * ca0132). None of them may get the AE-9 bus reset, BAR2 set-up and Windows
- * replay: ae9_board_lookup() refuses them if a driver_override or new_id
- * sends one here anyway.
+ * ID (subsystem 0x0081) and is not in the table either: it is experimental
+ * and opt-in (a driver_override and ae7=1), so nothing loads or binds this
+ * driver on an AE-7 by itself. The AE-5 and AE-5 Plus are 1102:0012
+ * (subsystems 0x0051, 0x0191), as are the Recon3D, Z and ZxR (in-tree
+ * snd_hda_intel + ca0132). None of them may get the AE-9 bus reset, BAR2
+ * set-up and Windows replay: ae9_board_lookup() refuses them if a
+ * driver_override or new_id sends one here anyway.
  *
  * Creative's CtxHda.inf also lists 1102:0012 with the AE-9 and AE-7
  * subsystems, but every AE-9 and AE-7 seen is 1102:0010. The INF's
@@ -263,7 +266,8 @@ MODULE_DEVICE_TABLE(pci, creative_ae9_pci_tbl);
  * IDs itself now, from the values the PCI core cached at enumeration (no
  * config read, no MMIO, nothing enabled or mapped yet), and takes the BAR
  * layout from here. Anything but the AE-9 gets one log line saying what it
- * is, and -ENODEV.
+ * is, and -ENODEV; the AE-7 (on 0x0010) is let through with ae7=1 (its
+ * board, creative_ae7_core.c), else it gets one notice naming the opt-in.
  *
  * Names: Creative's CtxHda.inf (AE series) and the in-tree ca0132 quirk
  * table (Z, ZxR, Recon3D): subsystem vendor 0x1102, PCI device 0x0010 or
@@ -275,7 +279,6 @@ static const struct {
 	u16 subsys;
 	const char *name, *why;
 } ae9_other_boards[] = {
-	{ 0x0081, "Sound Blaster AE-7", "not supported by this driver" },
 	{ 0x0073, "Sound Blaster AE-9PE", "not tested with this driver; please report it" },
 	{ 0x0051, "Sound BlasterX AE-5", AE9_IN_TREE },
 	{ 0x0191, "Sound BlasterX AE-5 Plus", AE9_IN_TREE },
@@ -310,6 +313,17 @@ static const struct creative_ae9_bar_layout *ae9_board_lookup(struct pci_dev *pd
 			/* in Creative's INF, but no such card seen: not claimed untested */
 			name = "Sound Blaster AE-9";
 			why = "never seen on PCI device 0x0012, so not claimed; please report it";
+		} else if (pdev->subsystem_device == CREATIVE_SUBSYS_AE7) {
+			if (pdev->device != DEVICE_AE7_AE9) {
+				name = "Sound Blaster AE-7";
+				why = "never seen on PCI device 0x0012, so not claimed; please report it";
+			} else if (ae9_ae7_opt > 0) {
+				/* experimental, opt-in: ae7=1 (creative_ae7_core.c) */
+				return &ae9_layout;
+			} else {
+				dev_notice(&pdev->dev, "Sound Blaster AE-7 found: experimental support is off; see docs/AE7.md (run ae9-ae7-enable)\n");
+				return NULL;
+			}
 		} else {
 			name = "Unknown Creative CA0132 board";
 			why = "not an AE-9";
@@ -1091,7 +1105,7 @@ void creative_ae9_rt_dsp_dac_off_all(struct creative_chip *chip, const char *why
  * DSP mode's DSP -> DAC route is the 8051's own: stream 0x18 (DSP output
  * connection point 0x09 -> DAC 0xd0), in its own slot list, head XRAM
  * 0x1590, next XRAM 0x1478 + slot (the 8051 ROM's allocator, C171/C19E;
- * research 2026-11-15, .tmp/research/2026-11-15/dsp-route-8051-stream18.md).
+ * research 2026-11-15, project notes).
  * Windows writes no router entry at all in DSP mode: when the 8051's DAC
  * port allocation works it fills in the destinations itself, c0..c5 -> 40
  * 41 50 51 60 61 and, at 96 kHz, each channel's second sample c6..cb ->
@@ -1545,7 +1559,7 @@ static unsigned int ae9_fmt_ch(u16 format)
  * it only added a second reference. That reference is what kept SRC 90/80
  * busy after Direct Mode on (2026-11-04, fixed then by a host stop there),
  * and what made stream 0x0c leak a reference whenever the last decrement
- * was our host stop instead of the unbind (.tmp/notes/63b, 64b). Not sent
+ * was our host stop instead of the unbind (project notes). Not sent
  * since 0.12.6 (the in05_host option until 0.12.12).
  */
 
@@ -1651,8 +1665,8 @@ static int ae9_8051_xram_byte(struct creative_chip *chip, u16 addr)
  * enabled it at every DSP-mode switch without looking and disabled it
  * once, so it sat at 1 in Direct Mode and 2 in DSP mode, and after a warm
  * restart the new DSP-mode enable never connected: DSP mode and What U
- * Hear silent until a power cut (Kaiba, ASMedia, 0.12.4; .tmp/unicorn/r5/
- * router-8051.md). Windows (FUN_000341e4 / FUN_000343d8) enables only at
+ * Hear silent until a power cut (Kaiba, ASMedia, 0.12.4; project notes on
+ * the router chip). Windows (FUN_000341e4 / FUN_000343d8) enables only at
  * count 0 and drains it to 0 at device stop. Release ours to 0 here.
  */
 #define AE9_XRAM_STREAM0C_REFS	AE9_XRAM_STREAM_REFS(0x0c)	/* 0x07ac */
@@ -1693,11 +1707,11 @@ static int ae9_stream18_drain(struct creative_chip *chip, const char *why)
  * also adds to it by itself: a converter bind that connects stream 0x05
  * (node 0x02, host audio) or 0x0b (node 0x0a, What U Hear) takes a 0x0c
  * reference, and only the disconnect that takes that stream to 0 gives it
- * back (bank 2 D529 / D69E; .tmp/notes/63b). Our extra host reference on
+ * back (bank 2 D529 / D69E; project notes). Our extra host reference on
  * 0x05 (until 0.12.6) could make the last decrement a host stop, which never
  * releases 0x0c, so 0x0c gained a reference in some sessions; shutdown
  * stopped it once, blindly, and the next start-up tail added +1 on top
- * (Joe 4 -> 5, Kaiba 3 -> 6). Windows reads and drains 0x18 and 0x0c at
+ * (3xHelix 4 -> 5, Kaiba 3 -> 6). Windows reads and drains 0x18 and 0x0c at
  * every device stop (FUN_000343d8; 0x07ac read 1 at 26/26 stops) and never
  * enables 0x05. So: at shutdown and before the start-up tail, drain every
  * stream we or our binds can hold (0x05 first, it holds 0x0c; 0x0c last).
@@ -2112,6 +2126,7 @@ static void creative_ae9_post_fw(struct creative_chip *chip)
 	unsigned int dbg = 0;
 	int ret;
 
+	AE9_HOOK(chip, post_fw, chip);
 	/*
 	 * No DBGCNTL writes here: the verb log shows dspload_image() already
 	 * starts the DSP exactly as Windows does (read 0xfff83cf0, write
@@ -2652,7 +2667,7 @@ static const struct file_operations creative_dbg_fops = {
  * Every head-unit frame's outcome (creative_spi_frame_win), for debugfs
  * state: counted only, no register access and no log line. The poll's
  * occasional "1/15 poll frames unanswered" follows host load (2026-11-18,
- * .tmp/hu-misses): most likely Windows' echo read after the f7 taking the
+ * project notes): most likely Windows' echo read after the f7 taking the
  * reply's f0 when we were held up. A miss record that says so: why "no f0",
  * the first skipped byte = the frame's command, the echo = f0.
  */
@@ -2836,8 +2851,14 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 	}
 	seq_printf(m, "BAR2 IDs at the bring-up: 0x8fc=0x%08x (DAC I2C, want 0x44570140), 0xcfc=0x%08x (UART, 0x44570110), 0x4=0x%08x (board, revision 0x%02x)\n",
 		   chip->bar2_id[0], chip->bar2_id[1], chip->bar2_id[2], chip->bar2_id[2] & 0xff);
+	AE9_CALL(chip, state_show, m, chip);
+	/* fx.direct and dsp_active are the AE-9's Direct Mode and DSP-mode
+	 * routing; a board without Direct Mode (the AE-7) plays in
+	 * DSP mode alone and never reads them */
 	seq_printf(m, "mode: %s, SBX %s, DSP routing %s, primed %d, halted %d, handshake %s\n",
-		   chip->fx.direct ? "Direct" : "DSP", chip->fx.sbx ? "on" : "off",
+		   ae9_has(chip, AE9_CAP_DIRECT) && chip->fx.direct ? "Direct" : "DSP",
+		   chip->fx.sbx ? "on" : "off",
+		   !ae9_has(chip, AE9_CAP_DIRECT) ? "n/a" :
 		   chip->dsp_active ? "up" : "down", chip->dsp_primed,
 		   chip->dsp_halted, chip->hs_ok ? "ok" : "not ok");
 	/* playback: the link format the open stream was prepared with and
@@ -3041,7 +3062,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 			cnt[dst - 0x40]++;
 			feeds++;
 			seq_printf(m, " %06x=%02x->%02x", 0x190000 + 4 * i, src, dst);
-			if (chip->fx.direct && (src & 0xe0) == 0xc0)
+			if (ae9_has(chip, AE9_CAP_DIRECT) && chip->fx.direct &&
+			    (src & 0xe0) == 0xc0)
 				bad++;
 		}
 		creative_dsp_chipio_addr_invalidate();
@@ -3053,8 +3075,8 @@ static int creative_dbg_state_show(struct seq_file *m, void *v)
 		 * playback: say which, from the driver's own state */
 		if (!feeds && chip->dsd_active)
 			seq_puts(m, " none (native DSD64: the I2S wrapper feeds the DAC, no router)");
-		else if (!feeds && chip->pb_format && chip->fx.direct &&
-			 chip->pcm_start_rate % 11025 == 0)
+		else if (!feeds && chip->pb_format && ae9_has(chip, AE9_CAP_DIRECT) &&
+			 chip->fx.direct && chip->pcm_start_rate % 11025 == 0)
 			seq_printf(m, " none (%u Hz: the 44.1 kHz family plays through the S/PDIF transmitter, not a DAC port)",
 				   chip->pcm_start_rate);
 		else if (!feeds)
@@ -3987,9 +4009,10 @@ static bool mic_boost_30;
 module_param(mic_boost_30, bool, 0444);
 MODULE_PARM_DESC(mic_boost_30, "Mic Gain: also offer +30 dB (the amp's top step; Windows stops at +20 dB; for quiet mics, normal speech clips) (0 = no, default; 1 = yes)");
 
-static unsigned int mic_boost_max(void)
+/* the AE-7's amp stops at step 2 (pin 0x12's input amp caps 0x00270200) */
+static unsigned int mic_boost_max(struct creative_chip *chip)
 {
-	return mic_boost_30 ? 3 : 2;
+	return mic_boost_30 && ae9_has(chip, AE9_CAP_AE9_MIC) ? 3 : 2;
 }
 
 static int mic_boost_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
@@ -3997,7 +4020,7 @@ static int mic_boost_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
 	ui->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	ui->count = 1;
 	ui->value.integer.min = 0;
-	ui->value.integer.max = mic_boost_max();
+	ui->value.integer.max = mic_boost_max(snd_kcontrol_chip(kc));
 	return 0;
 }
 
@@ -4022,7 +4045,7 @@ static void creative_ae9_mic_boost_apply(struct creative_chip *chip)
 static int mic_boost_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
 {
 	struct creative_chip *chip = snd_kcontrol_chip(kc);
-	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, mic_boost_max());
+	unsigned int v = clamp_t(long, uv->value.integer.value[0], 0, mic_boost_max(chip));
 
 	if (creative_ae9_dead(chip))
 		return -ENODEV;
@@ -4385,6 +4408,34 @@ static const struct snd_kcontrol_new answer_control = {
 	.get = answer_get,
 };
 
+/*
+ * "Card Model" (0.13.0): read-only, on every card, one item naming the
+ * board (its card shortname: "Sound Blaster AE-9", "Sound Blaster AE-7"),
+ * value always 0, so tools tell the boards apart from the control alone.
+ * Added last in the probe: no older control's numid moves.
+ */
+static int card_model_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *uinfo)
+{
+	struct creative_chip *chip = snd_kcontrol_chip(kc);
+	const char *name = chip->board->name;
+
+	return snd_ctl_enum_info(uinfo, 1, 1, &name);
+}
+
+static int card_model_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	uv->value.enumerated.item[0] = 0;
+	return 0;
+}
+
+static const struct snd_kcontrol_new card_model_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_CARD,
+	.name = "Card Model",
+	.access = SNDRV_CTL_ELEM_ACCESS_READ,
+	.info = card_model_info,
+	.get = card_model_get,
+};
+
 void creative_ae9_dead_notify(struct creative_chip *chip)
 {
 	if (chip->answer_ctl && chip->card && !chip->unloading)
@@ -4581,6 +4632,7 @@ static void creative_ae9_hu_controls_add(struct creative_chip *chip)
 {
 	int i;
 
+	AE9_HOOK(chip, controls_add, chip);
 	chip->hu_att = HU_ATT_DEFAULT;
 	chip->hu_att_out[0] = chip->hu_att_out[1] = HU_ATT_DEFAULT;
 	chip->hu_output = 0;		/* the boot replay selects speakers */
@@ -4640,6 +4692,7 @@ static void creative_ae9_hb_work(struct work_struct *work)
 
 	if (READ_ONCE(chip->unloading))
 		return;
+	AE9_HOOK(chip, tick, chip);
 	/* "Driver Health" [7]: at most every 30 s (cheap no-op otherwise) */
 	if (chip->dsp_done && (!chip->rt_free_at ||
 			       time_after(jiffies, chip->rt_free_at + 30 * HZ)))
@@ -4870,10 +4923,11 @@ static void ae9_bus_reset_quiesce(struct creative_chip *chip)
 }
 
 /*
- * "Card alive": after the bus reset, before the BAR2 init, the card's
+ * "Card alive": after the bus reset (the AE-7: none by default, so at the
+ * start of its bring-up), before the BAR2 init, the card's
  * read-only ID registers (BAR2 is a Synopsys DesignWare APB cluster, notes
- * 31): 0x8fc the DAC I2C block's IC_COMP_TYPE, "DW" + 0x0140 (DW_apb_i2c
- * v1.10a); 0xcfc the head-unit UART's CTR, 0x44570110 (DW_apb_uart); 0x4
+ * 31): 0x8fc the DAC I2C block's IC_COMP_TYPE, "DW" + 0x0140 (DW_apb_i2c;
+ * its version would be COMP_VERSION at 0x8f8, not read); 0xcfc the head-unit UART's CTR, 0x44570110 (DW_apb_uart); 0x4
  * the board ID, 0x7172 in the high half on the AE-9, its low byte the
  * board revision (0x0a, 0x0b on an ASMedia-bridged card). No side effects.
  * The I2C ID decides: read up to 10 times 10 ms apart until it's right; a
@@ -4904,6 +4958,12 @@ static int ae9_bar2_alive(struct creative_chip *chip)
 	if (id[0] == ~0U && id[1] == ~0U && id[2] == ~0U) {
 		chip->card_gone = true;
 		creative_ae9_dead_notify(chip);
+		/* a board with its own ID (the AE-7) does no bus reset by default */
+		if (chip->board && chip->board->bar2_id != AE9_BOARD_ID_AE9) {
+			dev_err(chip->dev, "card dropped off the bus (BAR2 ID check at bring-up): its registers read all-ones %u times; stopping\n",
+				tries);
+			return -ENODEV;
+		}
 		dev_err(chip->dev, "card dropped off the bus (BAR2 ID check after the bus reset): its registers read all-ones %u times; stopping\n",
 			tries);
 		return -ENODEV;
@@ -4918,6 +4978,19 @@ static int ae9_bar2_alive(struct creative_chip *chip)
 	if (id[1] != AE9_DW_UART_ID)
 		dev_warn(chip->dev, "BAR2 ID check: 0xcfc = 0x%08x, not the head-unit UART's 0x%08x\n",
 			 id[1], AE9_DW_UART_ID);
+	/*
+	 * Another board's own ID (the AE-7's 0x0081....): its bringup_check
+	 * gated on it before the bus reset; here it is only confirmed. The
+	 * I2C and UART IDs above are the DesignWare blocks' constants, the
+	 * same on every board with them (the AE-7's Windows start writes both
+	 * blocks).
+	 */
+	if (chip->board && chip->board->bar2_id != AE9_BOARD_ID_AE9) {
+		if (id[2] >> 16 != chip->board->bar2_id)
+			dev_warn(chip->dev, "BAR2 ID check: board ID 0x%08x, not the %s's (0x%04x....)\n",
+				 id[2], chip->board->name, chip->board->bar2_id);
+		return 0;
+	}
 	if (id[2] >> 16 != AE9_BOARD_ID_AE9)
 		dev_warn(chip->dev, "BAR2 ID check: board ID 0x%08x, not an AE-9's (0x%04x....)\n",
 			 id[2], AE9_BOARD_ID_AE9);
@@ -4930,6 +5003,11 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	bool do_reset = bus_reset != 0;
 	int ret, fret;
 
+	if (ae9_has_op(chip, bringup_check)) {
+		ret = chip->board->ops->bringup_check(chip, &do_reset);
+		if (ret < 0)
+			return ret;
+	}
 	creative_ae9_log_state(chip, "before bring-up");
 	chip->card_gone = false;
 	chip->card_hung = false;
@@ -5073,6 +5151,11 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		dev_warn(chip->dev, "codec 1 (DSP) not answering after the bus reset; trying the bring-up again\n");
 		return 0;
 	}
+	if (ae9_has_op(chip, codecs_check)) {
+		ret = chip->board->ops->codecs_check(chip);
+		if (ret < 0)
+			return ret;
+	}
 
 	/*
 	 * DSP standup, in the order the CA0132 requires:
@@ -5093,7 +5176,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	 * WINDOWS-CAPTURE-ANALYSIS.md sections 10-11). The read stays, so
 	 * the start-up sends the same verbs as before.
 	 */
-	{
+	if (ae9_has(chip, AE9_CAP_AE9_DIAG)) {
 		unsigned int sentinel = 0;
 
 		creative_dsp_chipio_read(chip, 0x800000, &sentinel);
@@ -5133,7 +5216,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	/* Check 0x801c after replay_init — in Windows capture the
 	 * audio loop starts during or right after init verbs via ICW.
 	 */
-	{
+	if (ae9_has(chip, AE9_CAP_AE9_DIAG)) {
 		unsigned int loop_val = 0;
 		creative_dsp_chipio_read(chip, 0x801c, &loop_val);
 		dev_info(chip->dev,
@@ -5165,8 +5248,9 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 		 * audio_loop_start confirmed the MCU is alive, we only
 		 * need ~500ms for the 8051 to settle after HELLO.
 		 */
-		queue_delayed_work(chip->wq, &chip->acm_work,
-				      msecs_to_jiffies(500));
+		if (ae9_has(chip, AE9_CAP_HEAD_UNIT))
+			queue_delayed_work(chip->wq, &chip->acm_work,
+					   msecs_to_jiffies(500));
 	}
 	/*
 	 * Capture-mined fact: the host driver owns the head-unit I2C
@@ -5180,14 +5264,14 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	/* Stream enable */
 	/* post_windows: the replay already set these up as Windows does;
 	 * the DSP I2C init's CMD=0x30 re-init cuts off the head unit */
-	if (!chip->dsp_done) {
+	if (!chip->dsp_done && ae9_has(chip, AE9_CAP_HEAD_UNIT)) {
 		dev_info(chip->dev, "init: stream enable\n");
 		writeb(0x3f, chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
 		wmb();
 	}
 
 	/* DSP I2C controller init */
-	if (!chip->dsp_done) {
+	if (!chip->dsp_done && ae9_has(chip, AE9_CAP_HEAD_UNIT)) {
 		dev_info(chip->dev, "init: DSP I2C\n");
 		creative_i2c_dsp_init(chip);
 	}
@@ -5310,6 +5394,8 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
+	chip->board = pdev->subsystem_device == CREATIVE_SUBSYS_AE7 ? &ae9_board_ae7 :
+		      &ae9_board_ae9;
 	chip->r51_sel = -1;	/* no router-chip parameter selected yet */
 	chip->rirb_send_wp = -1;
 	chip->rirb_wp0 = -1;
@@ -5411,13 +5497,11 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 
 	strscpy(chip->card->driver, CREATIVE_AE9_DRV_NAME,
 		sizeof(chip->card->driver));
-	/* an AE-9: ae9_board_lookup() let nothing else through */
-	strscpy(chip->card->shortname, "Sound Blaster AE-9",
-		sizeof(chip->card->shortname));
+	/* the board ae9_board_lookup() let through (an AE-7 only with ae7=1) */
+	strscpy(chip->card->shortname, chip->board->name, sizeof(chip->card->shortname));
 	snprintf(chip->card->longname, sizeof(chip->card->longname),
-		 "Creative Labs Sound Blaster AE-9 at 0x%llx irq %d",
-		 (unsigned long long)pci_resource_start(pdev, 0),
-		 pdev->irq);
+		 "Creative Labs %s at 0x%llx irq %d", chip->board->name,
+		 (unsigned long long)pci_resource_start(pdev, 0), pdev->irq);
 
 	/* PCM playback device (no interrupts — Windows-style) */
 	ret = creative_ae9_pcm_init(chip);
@@ -5426,14 +5510,19 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 
 	creative_ae9_hu_controls_add(chip);
 	chip->mic_boost = 1;
-	snd_ctl_add(chip->card, snd_ctl_new1(&mic_boost_control, chip));
+	if (ae9_has(chip, AE9_CAP_INPUTS))
+		snd_ctl_add(chip->card, snd_ctl_new1(&mic_boost_control, chip));
 	chip->mic_level = 99;	/* +9 dB, as Windows' capture blocks */
-	snd_ctl_add(chip->card, snd_ctl_new1(&mic_level_control, chip));
-	snd_ctl_add(chip->card, snd_ctl_new1(&dac_filter_control, chip));
+	if (ae9_has(chip, AE9_CAP_INPUTS))
+		snd_ctl_add(chip->card, snd_ctl_new1(&mic_level_control, chip));
+	if (ae9_has(chip, AE9_CAP_ES9038))
+		snd_ctl_add(chip->card, snd_ctl_new1(&dac_filter_control, chip));
 	creative_ae9_fx_init(chip);
-	creative_ae9_fx_controls_add(chip);
+	if (ae9_has(chip, AE9_CAP_SBX))
+		creative_ae9_fx_controls_add(chip);
 	chip->cv.sent_voicefx = chip->cv.sent_miceq = -1;
-	creative_ae9_cv_controls_add(chip);
+	if (ae9_has(chip, AE9_CAP_CV))
+		creative_ae9_cv_controls_add(chip);
 
 	/* IRQ before the card goes public: playback/capture need period
 	 * interrupts, so a failure is fatal; sync_irq lets ALSA synchronise
@@ -5459,6 +5548,10 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 		goto err_card;
 	}
 
+	AE9_CALL(chip, probe_done, chip);
+	ret = snd_ctl_add(chip->card, snd_ctl_new1(&card_model_control, chip));
+	if (ret < 0)
+		dev_warn(chip->dev, "Card Model control not added (%d)\n", ret);
 	ret = snd_card_register(chip->card);
 	if (ret < 0) {
 		dev_err(chip->dev, "snd_card_register failed: %d\n", ret);
@@ -5530,6 +5623,7 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 			writeb(rirbsts | RIRB_INT_RESPONSE,
 			       chip->hda_regs + AZX_REG_RIRBSTS);
 			wmb();
+			AE9_CALL(chip, rirb_irq, chip);
 		}
 		if (rirbsts & RIRB_INT_OVERRUN) {
 			/* Clear overrun, then resync RIRB */
@@ -5603,6 +5697,7 @@ static void creative_ae9_streams_down(struct creative_chip *chip)
 {
 	if (!chip->corb_buf || !chip->dsp_done)
 		return;
+	AE9_HOOK(chip, streams_down, chip);
 	/* a recording, or the mic monitor's hold of ADC 0x07 (no recording) */
 	if (chip->cap_start_sent || chip->cv.mon_bound) {
 		creative_ae9_capture_seq(chip, false);
@@ -5698,6 +5793,7 @@ static void ae9_cancel_timed_works(struct creative_chip *chip)
 	cancel_delayed_work_sync(&chip->spk_follow_work);
 	cancel_delayed_work_sync(&chip->hp_work);
 	cancel_delayed_work_sync(&chip->dsd_mute_work);	/* queued by the trigger */
+	AE9_CALL(chip, cancel_works, chip);
 }
 
 static void creative_ae9_stop_works(struct creative_chip *chip)
@@ -5797,6 +5893,7 @@ static int creative_ae9_suspend(struct device *dev)
 	/* streams_down re-sends the effects, which can queue hp_work */
 	cancel_delayed_work_sync(&chip->hp_work);
 	chip->dsp_active = false;
+	AE9_CALL(chip, quiesce, chip);
 	chip->suspended = true;
 	writel(0, chip->hda_regs + AZX_REG_INTCTL);
 	creative_ae9_corb_free(chip);
@@ -5880,6 +5977,7 @@ static void creative_ae9_resume_work(struct work_struct *work)
 		snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
 		return;
 	}
+	AE9_HOOK(chip, resumed, chip);
 
 	/* the heartbeat (started by the bring-up's ACM work) applies these */
 	chip->hu_dirty = 1;
@@ -5933,3 +6031,6 @@ static struct pci_driver creative_ae9_driver = {
 };
 
 module_pci_driver(creative_ae9_driver);
+
+/* the AE-7 (experimental): its core part, on this file's helpers */
+#include "creative_ae7_core.c"

@@ -80,13 +80,15 @@ noise, so set the source to Linear PCM.
 
 **"... Leaving it alone; if a driver_override or new_id sent it here, remove
 that" in the kernel log** (0.12.16+): the driver was pointed at a card that
-isn't an AE-9, usually by a copy of `00-ae9-override.rules` or
+isn't an AE-9 or an AE-7, usually by a copy of `00-ae9-override.rules` or
 `ae9-override.conf` edited for another card, or by hand through sysfs. The
 line names the card. The driver refuses it before touching it (nothing
 enabled, nothing written), but the override still keeps the card's own
 driver away. The AE-5, AE-5 Plus, Z, ZxR and Recon3D belong to the kernel's
-`snd_hda_intel` with its ca0132 codec driver; the AE-7 isn't supported by
-this driver. To give the card back, remove the edited rule from
+`snd_hda_intel` with its ca0132 codec driver (the AE-7 has its own line,
+below, and that driver hangs an AE-7 with an ASMedia bridge:
+[AE7.md](AE7.md#the-asmedia-bridge-and-the-kernels-driver)). To give
+the card back, remove the edited rule from
 `/etc/udev/rules.d/` or `/etc/modprobe.d/`, then (the address is the one in
 the log line):
 
@@ -99,6 +101,62 @@ A `new_id` entry goes away when the driver is unloaded
 (`sudo modprobe -r snd-hda-codec-creative-ae9`). Before 0.12.16 the driver
 didn't check and ran its AE-9 start-up on such a card, writing to the wrong
 registers: if that happened, power off fully once (quick fix 2).
+
+**"Sound Blaster AE-7 found: experimental support is off; see docs/AE7.md
+(run ae9-ae7-enable)" in the kernel log** (0.13.0+): an AE-7 was handed to
+this driver, but its AE-7 support isn't turned on (the `ae7` option is 0, the
+default). The driver leaves the card alone. On a **parked** AE-7 (support
+turned off on a card with an ASMedia bridge, or a bridge the script doesn't
+know: `ae9-ae7-enable --status` says "parked") this line is expected: the
+card is kept without a driver on purpose. To use the AE-7 with this driver,
+run `sudo ae9-ae7-enable` and reboot ([AE7.md](AE7.md)). To give it to the
+kernel's own driver, `sudo ae9-ae7-enable --disable --stock` and reboot, but
+only with a Tsi381 bridge: that driver hangs the PC at boot on an AE-7 with
+an ASMedia bridge (next entry). If you never ran the script, look for a
+copied or edited override rule as in the entry above.
+
+**The PC hangs at boot with an AE-7** (the start stops or freezes; the log,
+if you get one, shows `Watchdog detected hard LOCKUP` with `snd_hda_intel`,
+`azx_probe_work` or `snd_hdac_bus_init_cmd_io`). The kernel's own
+`snd_hda_intel` took an AE-7 with an ASMedia PCIe bridge (most AE-7s from
+2022 on). It has hung the whole PC, not just the sound, on every such card
+reported so far. To boot:
+
+1. At the GRUB menu (hold Shift or press Esc while the PC starts if it
+   doesn't show), press `e`, add `module_blacklist=snd_hda_intel` at the end
+   of the line that starts with `linux`, and boot with Ctrl+X or F10. With
+   systemd-boot (Pop!_OS), press `e` on the entry, add the same word at the
+   end, and press Enter.
+2. That lasts for that one boot and also turns off every other HD-Audio
+   device for it (the onboard sound, a graphics card's HDMI sound).
+3. Then, with this driver installed, either turn the AE-7 on
+   (`sudo ae9-ae7-enable`) or park it with no driver
+   (`sudo ae9-ae7-enable --disable`), and reboot normally. Without the
+   driver, `sudo bash scripts/ae9-ae7-enable --disable` from a copy of its
+   source parks it too
+   ([AE7.md](AE7.md#the-asmedia-bridge-and-the-kernels-driver)).
+
+**The volume jumps for a few seconds at login** (any card): the login
+screen (LightDM, GDM, ...) runs its own PipeWire and WirePlumber, which set
+the card's hardware volume ("Master") to their own level; when your desktop
+session starts, its WirePlumber restores yours. So for a few seconds at login
+the card can play at the login screen's level (on the AE-7 test card: -36
+dB). It's harmless: an ordinary volume change, and the driver checks each
+level it sends to the DAC as it does for yours.
+
+**DKMS fails on a clang-built kernel** (XanMod, CachyOS...; the build log
+`/var/lib/dkms/snd-hda-codec-creative-ae9/<version>/build/make.log` says
+`clang: not found` or `clang: command not found`): DKMS builds the driver for
+such a kernel with `LLVM=1`, which runs a plain `clang`. Since 0.13.0, when
+there is none, the build uses the clang version the kernel was built with:
+`clang-21` and `ld.lld-21` on the PATH, or else `/usr/lib/llvm-21/bin/` (for a
+kernel built with clang 21; the log's first line says which). If neither is
+there, the build stops with "is a clang-built kernel, but no clang ... was
+found" and the packages to install: on Debian, Ubuntu and Mint `sudo apt
+install clang-21 lld-21` (the version from that message), elsewhere the
+distribution's `clang` and `lld`. Then rebuild: `sudo dkms autoinstall -k
+<kernel>` or `sudo scripts/dkms-install.sh` again. Before 0.13.0 the build
+needed an unversioned `clang` (and `lld`) on the PATH.
 
 **SBX/EQ do nothing:** they work with Direct Mode off, at 48 or 96 kHz. A
 44.1 kHz stream keeps playing direct; `pw-metadata -n settings 0
@@ -121,7 +179,8 @@ WirePlumber versions, Driver Health) and `kernel-log.txt` (the driver's
 lines from this boot and the end of the last one, and IOMMU faults that
 point at the card). You get the
 files to read in `~/ae9-dumps/ae9-report-<time>/` and one
-`ae9-report-<time>.tar.gz` of them to attach.
+`ae9-report-<time>.tar.gz` of them to attach. Both work on an AE-7 too
+(0.13.0+).
 
 - Stop all audio first: while something plays it skips the chip readings,
   which can freeze the audio during playback.
@@ -144,7 +203,7 @@ files to read in `~/ae9-dumps/ae9-report-<time>/` and one
   those off at the next Direct Mode start.
 
 A quick health check any user can run, any time (0.12.11+):
-`amixer -c AE9 cget name='Driver Health'`. The first five of its nine
+`amixer -c AE9 cget name='Driver Health'` (`-c AE7` on an AE-7). The first five of its nine
 numbers (command timeouts, answers that never landed, answers from the wrong
 codec, unreadable ring pointer, DMA buffers kept) should be 0, and so should
 the ninth (late DAC I2C NACKs: DAC commands the DAC didn't acknowledge after
@@ -208,7 +267,11 @@ For more detail in the kernel log:
 - **"Refused to change power state from D0 to D3hot"** in the kernel log at
   every suspend: the PCI core asking the card (behind its bridge) to sleep,
   which it declines; harmless, a suspend cuts the card's power anyway and the
-  driver brings it back up at resume.
+  driver brings it back up at resume. The AE-7 logs it too.
+- **AE-7: "waiting for the DAC to lock to its S/PDIF input"** at the start
+  of a 44.1 or 88.2 kHz stream in Direct Mode is normal: at those rates the
+  DAC takes a moment to lock before the driver unmutes it (within about
+  1.5 s). The rest of the AE-7's known limits: [AE7.md](AE7.md#known-limits).
 - **Suspend blocked** by other programs stuck on network file I/O (seen with
   Plex reading from a CIFS share); not driver-related.
 

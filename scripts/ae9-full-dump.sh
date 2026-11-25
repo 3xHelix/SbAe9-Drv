@@ -1,7 +1,8 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 3xHelix
-# Everything we can read about the AE-9's state without changing anything:
+# Everything we can read about the AE-9's state without changing anything
+# (a Sound Blaster AE-7 on this driver too: the card is found by its driver):
 # ALSA stream and controls, PipeWire, driver parameters, HDA stream
 # registers, card (BAR2) registers, codec converter state, ChipIO (router,
 # I2S clocks, DSP DMA, DBGCNTL) and the driver's recent log.
@@ -54,33 +55,45 @@ P=/sys/module/snd_hda_codec_creative_ae9/parameters
 dbg() { echo "$1" > $CMD; cat $CMD; }
 asuser() { sudo -u "$U" XDG_RUNTIME_DIR=/run/user/$(id -u "$U") "$@"; }
 sec() { printf '\n===== %s =====\n' "$1"; }
-# the card's sysfs: sound card (cardN), its PCI device, and the PCI name
-# PipeWire uses (alsa_output.pci-0000_06_00.0.*)
-SCARD=$(readlink /proc/asound/AE9 2>/dev/null)
-DEV=$(readlink -f /sys/class/sound/$SCARD/device 2>/dev/null)
+# the card's sysfs: sound card (cardN, the one our driver registered), its
+# ALSA id (AE9, or AE7 for a Sound Blaster AE-7), its PCI device, and the
+# PCI name PipeWire uses (alsa_output.pci-0000_06_00.0.*)
+SCARD="" ID=AE9
+for c in /sys/class/sound/card[0-9]*; do
+	[ "$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)")" = snd-hda-codec-creative-ae9 ] || continue
+	SCARD=${c##*/}; ID=$(cat "$c/id"); break
+done
+[ -n "$SCARD" ] || echo "note: no card registered by the driver; the ALSA sections stay empty" >&2
+case $ID in AE7) BOARD=AE-7 ;; *) BOARD=AE-9 ;; esac
+DEV=$(readlink -f "/sys/class/sound/$SCARD/device" 2>/dev/null)
 ae9pci=$(basename "$DEV" | tr : _)
 
 {
-echo "# AE-9 full dump $(date -Is), kernel $(uname -r)"
+echo "# $BOARD full dump $(date -Is), kernel $(uname -r), card $ID ${SCARD:-(not registered)}"
 echo "# driver $(cat /sys/module/snd_hda_codec_creative_ae9/version) $(cat /sys/module/snd_hda_codec_creative_ae9/srcversion)"
 
 sec "ALSA playback stream"
-for f in hw_params sw_params status; do echo "--- $f"; cat /proc/asound/AE9/pcm0p/sub0/$f; done
+for f in hw_params sw_params status; do echo "--- $f"; cat "/proc/asound/$ID/pcm0p/sub0/$f"; done
 sec "ALSA capture streams and optical out"
 # every recording device and the optical out (the driver's device numbers),
 # "closed" when nothing has it open
-for d in "0c head unit mic (XLR/TRS jack + 3.5 mm mic jack)" "1c optical in" "2c What U Hear" \
-	 "3c head unit rear RCA in" "4p optical out"; do
+if [ "$ID" = AE7 ]; then
+	DEVS=("0c card Line-in / Mic-in jack" "2c What U Hear")
+else
+	DEVS=("0c head unit mic (XLR/TRS jack + 3.5 mm mic jack)" "1c optical in" "2c What U Hear"
+	      "3c head unit rear RCA in" "4p optical out")
+fi
+for d in "${DEVS[@]}"; do
 	n=${d%% *}
-	f=/proc/asound/AE9/pcm$n/sub0
-	echo "--- hw:AE9,${n%?} ${d#* }"
+	f=/proc/asound/$ID/pcm$n/sub0
+	echo "--- hw:$ID,${n%?} ${d#* }"
 	if [ "$(cat $f/status 2>/dev/null)" = closed ] || [ ! -r $f/status ]; then echo closed
 	else cat $f/hw_params $f/status 2>/dev/null; fi
 done
 
 sec "ALSA controls"
 # one line per control: name + values (enum item lists dropped; pairing lines two at a time broke on them)
-amixer -c AE9 contents 2>/dev/null | awk '/^numid=/{if(l)print l; sub(/numid=[0-9]+,iface=MIXER,/,""); l=$0; next}
+amixer -c "$ID" contents 2>/dev/null | awk '/^numid=/{if(l)print l; sub(/numid=[0-9]+,iface=MIXER,/,""); l=$0; next}
 	/: values=/{sub(/^ *: /,""); l=l"  "$0} END{if(l)print l}'
 
 sec "Driver parameters"
@@ -96,8 +109,8 @@ asuser pactl list sinks short
 # turned down or mapped away.
 asuser LC_ALL=C pactl list sink-inputs 2>/dev/null |
 	grep -E "Sink Input|Sink:|Corked|application.name|format\.|Volume:|Channel Map:"
-# what feeds each AE-9 output port: a channel with no link plays nothing
-echo "--- links into the AE-9 outputs (pw-link)"
+# what feeds each of the card's output ports: a channel with no link plays nothing
+echo "--- links into the $BOARD outputs (pw-link)"
 [ -n "$ae9pci" ] && asuser pw-link -l 2>/dev/null |
 	awk -v t="alsa_output.pci-$ae9pci." 'index($0, t) == 1 && /:playback_/ {p = 1; print; next}
 		/^ / && p {print; next} {p = 0}'
@@ -108,8 +121,9 @@ asuser pw-metadata -n settings 0 2>/dev/null | grep -E "rate|quantum"
 echo "--- pw-top (running nodes; ERR = PipeWire xruns per node)"
 timeout 4 sudo -u "$U" XDG_RUNTIME_DIR=/run/user/$(id -u "$U") pw-top -b -n 2 2>/dev/null |
 	awk '/^S +ID +QUANT/ {n++; if (n == 2) print; next} n == 2 && $1 == "R"'
-# without our profile set (89-ae9-pipewire.rules -> ACP_PROFILE_SET)
-# PipeWire offers only "stereo-fallback": no optical in, What U Hear, rear RCA
+# without our profile set (89-ae9-pipewire.rules / 89-ae7-pipewire.rules ->
+# ACP_PROFILE_SET) PipeWire offers only "stereo-fallback": no optical in,
+# What U Hear, rear RCA
 echo "--- card profile"
 udevadm info "/sys/class/sound/$SCARD" 2>/dev/null | grep -E "ACP_|PULSE_" | sed 's/^E: //'
 asuser LC_ALL=C pactl list cards 2>/dev/null |
@@ -124,7 +138,7 @@ echo "up $(cut -d. -f1 /proc/uptime) s, load $(cut -d' ' -f1-3 /proc/loadavg), s
 echo "cmdline: $(tr ' ' '\n' < /proc/cmdline | grep -vE '^(BOOT_IMAGE|root|resume|rd\.luks|rd\.lvm|cryptdevice|initrd)=' |
 	grep -vi uuid | tr '\n' ' ')"
 echo "--- driver options set in modprobe.d"
-grep -rsH -iE "ae9|creative" /etc/modprobe.d /usr/lib/modprobe.d /run/modprobe.d | grep -v ':#' | cut -c1-200 ||
+grep -rsH -iE "ae9|ae7|creative" /etc/modprobe.d /usr/lib/modprobe.d /run/modprobe.d | grep -v ':#' | cut -c1-200 ||
 	echo "(none)"
 echo "--- sound cards"
 cat /proc/asound/cards
@@ -157,16 +171,18 @@ else
 	echo "--- AER: off for this card (no AER service on root port $root: no AER capability there, the firmware kept AER, or pci=noaer): the AER counts above can't move; UESta/CESta (lspci) still show error bits"
 fi
 
-sec "HDA controller and playback stream SD4 (BAR0)"
+sec "HDA controller and playback stream SD4 (BAR0; the AE-9's stream layout)"
 for o in 0x08 0x0c 0x0e 0x20 0x24 0x40 0x4c 0x58 0x5c 0x100 0x104 0x108 0x10c 0x110 0x118 0x11c; do
 	printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"
 done
 echo "--- SD4 position x3 (should change while playing)"
 for i in 1 2 3; do dbg "r0 0x104" | grep -o '0x[0-9a-f]*$'; sleep 0.2; done | tr '\n' ' '; echo
-echo "--- capture streams: SD0 (hw:AE9,0 head unit mic: XLR/TRS + 3.5 mm mic jack), SD1 (hw:AE9,1 optical in), SD2 (hw:AE9,2 What U Hear), SD3 (hw:AE9,3 head unit rear RCA in)"
+echo "--- capture streams: SD0 (hw:AE9,0 head unit mic: XLR/TRS + 3.5 mm mic jack), SD1 (hw:AE9,1 optical in), SD2 (hw:AE9,2 What U Hear), SD3 (hw:AE9,3 head unit rear RCA in) (the AE-9's)"
 for o in 0x80 0x84 0x88 0x90 0xa0 0xa4 0xb0 0xc0 0xc4 0xd0 0xe0 0xe4 0xe8 0xf0; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
+if [ "$ID" != AE7 ]; then	# the AE-7 has no optical out on this driver
 echo "--- optical out stream SD6 (hw:AE9,4)"
 for o in 0x140 0x144 0x148 0x14c 0x150; do printf '%-6s %s\n' "$o" "$(dbg "r0 $o" | grep -o '= 0x[0-9a-f]*')"; done
+fi
 
 sec "Card registers (BAR2, the ones the driver logs at bring-up)"
 for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(dbg "r2 $o" | grep -o '= 0x[0-9a-f]*')"; done
@@ -182,10 +198,10 @@ for o in 0x4 0x1c 0x20c 0x304 0x320 0xc0c 0xc14; do printf '%-6s %s\n' "$o" "$(d
 # behind the reads' "wear", and since then about 20 dumps read the state
 # while audio played without a problem. Kept until a card test shows the
 # scan below is safe while playing too.
-playing=$(grep -lsE "^state: (RUNNING|DRAINING)" /proc/asound/AE9/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
+playing=$(grep -lsE "^state: (RUNNING|DRAINING)" /proc/asound/"$ID"/pcm*/sub*/status 2>/dev/null | tr '\n' ' ')
 if [ -n "$playing" ] && [ "${ALLOW_PLAYING_CHIPIO:-0}" != 1 ]; then
 sec "ChipIO sections skipped"
-echo "skipped: AE-9 stream(s) running ($playing). Stop playback and dump again for them."
+echo "skipped: $BOARD stream(s) running ($playing). Stop playback and dump again for them."
 else
 sec "ChipIO: I2S clocks, stream setup, SRC, router apply"
 for a in 0x189000 0x189004 0x189008 0x189024 0x189028 0x18b008 0x18a020 0x18a024 0x18a028 0x19042c; do
@@ -202,9 +218,10 @@ sec "ChipIO: I2S output check and power registers"
 for a in 0x189030 0x18902c 0x18b030 0x18b0a4 0x18b008; do
 	v=$(dbg "chipior $a" | grep -o '=0x[0-9a-f]*')
 	note=""
-	case $a in
-	0x189030) [ "$v" = "=0x81" ] && note="as usual (AE-9 0x81)" || note="<-- differs from the AE-9's usual 0x81" ;;
-	0x18902c) [ "$v" = "=0xf" ] && note="as usual (AE-9 0xf)" || note="<-- differs from the AE-9's usual 0xf" ;;
+	case $ID:$a in
+	AE7:*) ;;	# the notes are the AE-9's values
+	*:0x189030) [ "$v" = "=0x81" ] && note="as usual (AE-9 0x81)" || note="<-- differs from the AE-9's usual 0x81" ;;
+	*:0x18902c) [ "$v" = "=0xf" ] && note="as usual (AE-9 0xf)" || note="<-- differs from the AE-9's usual 0xf" ;;
 	esac
 	printf '%-9s %-12s %s\n' "$a" "$v" "$note"
 done
@@ -246,7 +263,10 @@ sec "Codec converter state (GET verbs; replies in the log section below)"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 # codec 1: DACs 0x02-0x04, 0x05, mic ADC 0x07, What U Hear ADC 0x0a;
 # codec 2: optical out 0x05, head unit rear RCA in ADC 0x08, optical in 0x09
-for cn in 1:0x02 1:0x03 1:0x04 1:0x05 1:0x07 1:0x0a 2:0x05 2:0x08 2:0x09; do
+CNODES="1:0x02 1:0x03 1:0x04 1:0x05 1:0x07 1:0x0a 2:0x05 2:0x08 2:0x09"
+# the AE-7: codec 1 only (no codec 2 on this driver), mic ADC 0x07, What U Hear 0x0a
+[ "$ID" = AE7 ] && CNODES="1:0x02 1:0x03 1:0x04 1:0x05 1:0x07 1:0x0a"
+for cn in $CNODES; do
 	for v in 0xa0000 0xf0600 0xf0500 0xf0d00; do	# format, stream/channel, power, digital conv
 		printf -v w '0x%x%02x%05x' ${cn%%:*} $((${cn#*:})) $((v))
 		echo "verb $w" > $CMD
@@ -273,7 +293,7 @@ echo "<5>ae9-full-dump: saved $OUT (driver $(cat /sys/module/snd_hda_codec_creat
 
 # --report: what the issue checklist asks for, beside the dump
 {
-echo "# AE-9 report $(date -Is)"
+echo "# $BOARD report $(date -Is)"
 echo "--- system"
 uname -r
 grep -E "^(PRETTY_NAME|VERSION_ID)=" /etc/os-release 2>/dev/null
@@ -293,7 +313,7 @@ fw=$(command -v ae9-get-firmware || echo "$REPO/scripts/ae9-get-firmware.sh")
 echo "--- audio stack"
 asuser pipewire --version 2>/dev/null | tail -1
 asuser wireplumber --version 2>/dev/null | tail -1
-amixer -c AE9 cget name='Driver Health' 2>/dev/null | tail -1 | sed 's/^ *: /Driver Health /'
+amixer -c "$ID" cget name='Driver Health' 2>/dev/null | tail -1 | sed 's/^ *: /Driver Health /'
 echo "--- card (lspci)"
 lspci -nnk -d 1102: 2>/dev/null
 } > "$RDIR/system.txt" 2>&1

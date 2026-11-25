@@ -90,6 +90,17 @@ head-unit poll, volume display and knob.
   the head unit's 3.5 mm headphone jack switches to headphones, unplugging
   back to speakers. Off, plugs only log.
 
+### Sound Blaster AE-7 (experimental)
+
+- `ae7` (0): the experimental AE-7 support ([AE7.md](AE7.md)). 0 = an AE-7
+  handed to the driver is left alone, with one line in the kernel log (a
+  parked AE-7 gets this line if the driver is offered it); 1 = the driver
+  runs it. `sudo ae9-ae7-enable` sets 1 for you (in
+  `/etc/modprobe.d/ae7-override.conf`, next to the file that hands the card
+  to this driver); setting the option alone doesn't hand the card over. The
+  test kits' values 2 to 5 are treated as 1 in 0.13.0, with one line in the
+  kernel log. The AE-9 ignores it. Since 0.13.0.
+
 ## For the card's PCIe bridge
 
 Automatic choices that depend on the PCIe bridge in front of the card (an
@@ -157,6 +168,18 @@ a stray setting can't break a normal start) and is writable at runtime.
 - `rirb_inject_us` (300): how long `rirb_inject` hides a reply, in µs; over
   100000 its command times out. A hidden reply is dropped, as never landed,
   once the reply ring has moved 128 entries past it.
+
+Two more, for the Sound Blaster AE-7 (since 0.13.0). They act on an AE-7
+that `ae7=1` runs, without `debug`:
+
+- `ae7_test` (0): the test kits' narrower levels. 0 = as `ae7=1`; 1 =
+  identify the card and stop (the controller reset and the codec's IDs
+  only); 2 = stereo in DSP mode only; 3 = 6 channels in DSP mode only.
+- `ae7_lanes` (Windows' `e0,e1,e4,e5,e2,e3`; writable at runtime): which of
+  the chip's DAC ports the DSP's six output lanes go to, for the Rear and
+  C/Sub jacks. A permutation of `e0` to `e5` with the front pair kept on
+  `e0,e1`; anything else is ignored with a warning. Takes effect at the next
+  stream start in DSP mode.
 
 ## Removed in 0.12.15
 

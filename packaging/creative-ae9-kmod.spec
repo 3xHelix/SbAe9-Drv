@@ -10,7 +10,7 @@
 %global srcname SbAe9-Drv
 
 Name:           %{kmod_name}-kmod
-Version:        0.12.17
+Version:        0.13.0
 Release:        1%{?dist}
 Summary:        Kernel module for the Creative Sound Blaster AE-9
 License:        GPL-2.0-or-later
@@ -31,6 +31,8 @@ DSP and the ACM head unit): playback up to 384 kHz, 5.1, SBX effects through
 the DSP, recording, optical in/out, What U Hear, and the head unit's display,
 knob and buttons. Works behind both bridges the card ships with (IDT and
 ASMedia).
+Sound Blaster AE-7 support (experimental, opt-in: ae9-ae7-enable in the
+creative-ae9 package).
 
 This package contains the kmod module (snd-hda-codec-creative-ae9).
 
@@ -55,6 +57,22 @@ done
 %{?akmod_install}
 
 %changelog
+* Wed Nov 25 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.13.0-1
+- Driver 0.13.0 "AE-7 experimental": Sound Blaster AE-7 support
+  (experimental, opt-in: ae9-ae7-enable). With it on, the driver runs an
+  AE-7 (ae7=1): stereo and 5.1 playback, DSP mode at 48 kHz, Direct Mode
+  at 44.1-384 kHz, mic, What U Hear, SBX and CrystalVoice. Off by default:
+  an AE-7 stays with the in-tree driver until ae9-ae7-enable is run. Off
+  again (ae9-ae7-enable --disable, which removing the creative-ae9 package
+  also runs with it on), an AE-7 with an ASMedia bridge, or one the script
+  doesn't recognise, is left with no driver (parked): the in-tree driver
+  hangs ASMedia AE-7s at boot. New read-only "Card Model" control on every
+  card. The AE-7's PipeWire
+  profile set and udev rule are installed for everyone (they match only
+  an AE-7 this driver runs); its opt-in files go to
+  /usr/share/creative-ae9/ae7/. ae9-reload and ae9-full-dump work on
+  either card; the AE-9-only tools leave an AE-7 alone.
+
 * Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.17-1
 - Driver 0.12.17: DAC register reads are single (0.12.16's status checks
   made the triple read unnecessary); Driver Health has a 9th value, late

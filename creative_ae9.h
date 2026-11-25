@@ -23,6 +23,7 @@
 #include <linux/bitmap.h>
 #include <sound/core.h>
 #include <sound/hda_register.h>
+#include "creative_ae9_board.h"	/* the board layer: the AE-9, the AE-7 */
 
 /*
  * MMIO trace hook (module param mmio_log, needs verb_log): every
@@ -60,8 +61,8 @@ static inline void ae9_writel(u32 v, volatile void __iomem *a)
 #define writel(v, a)	ae9_writel((v), (a))
 
 #define CREATIVE_AE9_DRV_NAME		"snd-hda-codec-creative-ae9"
-#define CREATIVE_AE9_DRV_VERSION	"0.12.17"
-#define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 HDA controller"
+#define CREATIVE_AE9_DRV_VERSION	"0.13.0"
+#define CREATIVE_AE9_DRV_DESC		"Creative Sound Blaster AE-9 (and AE-7, experimental) HDA controller"
 
 /* ------------------------------------------------------------------ */
 /* PCI BAR assignment (varies by device variant)			  */
@@ -582,6 +583,9 @@ struct creative_chip {
 	/* the card's BAR2 ID registers at the last bring-up (core.c
 	 * ae9_bar2_alive(): 0x8fc, 0xcfc, 0x4; last, so no field above moves) */
 	u32			bar2_id[3];
+	/* the board (creative_ae9_board.h): last, so no field above moves */
+	const struct ae9_board	*board;
+	struct ae7_state	ae7;
 };
 
 /*
@@ -819,7 +823,6 @@ int creative_dsp_ca0113_list(struct creative_chip *chip, const u8 (*cmds)[3],
 			     size_t n, const char *what);
 int creative_dsp_ca0113_list_quiet(struct creative_chip *chip,
 				   const u8 (*cmds)[3], size_t n);
-u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2]);
 
 /* ------------------------------------------------------------------ */

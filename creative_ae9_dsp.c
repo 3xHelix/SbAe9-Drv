@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (c) 2026 3xHelix
-// Contains code adapted from the Linux kernel's sound/pci/hda/patch_ca0132.c:
+// Contains code adapted from the Linux kernel's CA0132 driver
+// (sound/hda/codecs/ca0132.c, sound/pci/hda/patch_ca0132.c in older kernels):
 //   Copyright (c) 2011, Creative Technology Ltd.
 //   Based on patch_ca0110.c, Copyright (c) 2008 Takashi Iwai <tiwai@suse.de>
 // and from Creative's own ca0132 build ("0.73_kernel18", GPL).
 //
 // Creative AE-9 CA0132 DSP firmware download (ChipIO / DSPIO / SCP / dspxfr).
 //
-// Ported/adapted from the mainline sound/pci/hda/patch_ca0132.c DSP machinery.
+// Ported/adapted from the mainline CA0132 driver's DSP machinery.
 // The verb transport uses our ICW immediate-command path (creative_ae9_icw_
 // send_verb) on the main codec (CAD 1):
 //   - ChipIO  via WIDGET_CHIP_CTRL (node 0x15)
@@ -1279,7 +1280,6 @@ int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
 	for (i = 0; i < count && !chip->card_gone; i++) {
 		struct scp_msg m = { 0 };
 		u32 want, hdr = 0, data[SCP_MAX_DATA_WORDS] = { 0 };
-		unsigned int polls = 0;
 		ktime_t t0;
 		s64 t_ann;
 		int n, tries = 0;
@@ -1294,7 +1294,6 @@ int creative_dsp_scp_probe(struct creative_chip *chip, unsigned int mid,
 		while ((int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) <= 0 &&
 		       ktime_us_delta(ktime_get(), t0) < 500000) {
 			creative_ae9_corb_scan_unsol(chip);	/* no verb, as Windows */
-			polls++;
 			usleep_range(100, 200);
 		}
 		t_ann = (int)(atomic_read(&chip->scp_unsol) - chip->scp_unsol_done) > 0 ?
@@ -1723,7 +1722,7 @@ static bool hpeq_disarm(struct creative_chip *chip, unsigned int chan)
 
 /*
  * The port answer is a bit mask of the ports handed out. Every upload
- * that read back right got two neighbouring ports: 0x300 (Joe), 0x30
+ * that read back right got two neighbouring ports: 0x300 (3xHelix), 0x30
  * (Kaiba), 0x3 (the boot overlay, Windows too). Both single-port
  * answers (0x10, 0x1; Kaiba 2026-11-08) never landed.
  */
@@ -1940,7 +1939,7 @@ int creative_dsp_hpeq_upload(struct creative_chip *chip, const char *name)
 	 * A read only counts if the channels busy before the upload are still
 	 * set: a glitched read of 0 (they happen, note 58) took "our bit off"
 	 * for the end of the transfer and the stream was stopped after ~4 ms
-	 * of the ~11 the 4 KB need (Kaiba: HD 280 Pro 3 of 3, Joe: P5,
+	 * of the ~11 the 4 KB need (Kaiba: HD 280 Pro 3 of 3, 3xHelix: P5,
 	 * ATH-M50; note 60). Done = our bit off in 2 valid reads in a row,
 	 * at least 11 ms after RUN, and the stream past the whole buffer.
 	 */
@@ -3005,7 +3004,7 @@ static bool dspload_is_loaded(struct creative_chip *chip)
 
 /*
  * The DACs' I2C bus: BAR2 0x800 is a Synopsys DW_apb_i2c (0x8fc =
- * 0x44570140, v1.10a; .tmp/notes/31 §1). The CA0113 front end (0x204-0x210)
+ * 0x44570140, v1.10a; project notes). The CA0113 front end (0x204-0x210)
  * drives it; after each phase of a DAC command Windows reads three of its
  * read-to-clear registers, STOP_DET, TX_ABRT, then all interrupts, in that
  * order. 0x854 bit 0 = the transfer was aborted, on the AE-9 an I2C NACK:
@@ -3213,7 +3212,7 @@ static int ca0113_cmd(struct creative_chip *chip, u8 group, u8 reg, u8 val,
  * 0x800001, 0x800003 or 0x800005 there depending on the last transaction;
  * our fixed 0x800005 is what it sends after a write. Bits 2:1 are the byte
  * count: 1 (0x...3) for a read, 2 (0x...5) for a write. 28 coldboot
- * captures, 329 reads (.tmp/ca0113-readstart).
+ * captures, 329 reads (project notes).
  *
  * After each phase Windows reads the I2C status as after a write (0x860,
  * 0x854, 0x840: after the register phase's wait, and before the last 0x208
@@ -3282,13 +3281,6 @@ int creative_dsp_ca0113_read_checked(struct creative_chip *chip, u8 group, u8 re
 		return -ENODEV;
 	if (res != CA0113_ACK)
 		return -EIO;
-	return raw[1] & 0xff;
-}
-
-/* the same, unchecked: the byte, raw[] = the read's two 0x208 values */
-u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 raw[2])
-{
-	creative_dsp_ca0113_read_checked(chip, group, reg, raw);
 	return raw[1] & 0xff;
 }
 
@@ -3839,6 +3831,7 @@ void creative_ae9_cv_apply(struct creative_chip *chip)
 
 	if (!chip->dsp_done)
 		return;
+	AE9_CALL(chip, fx_lock, chip, true);	/* a board's lock before replay_mutex */
 	mutex_lock(&chip->replay_mutex);
 	/* Windows' order for every change (cap4 s8): Voice Morphing, Noise
 	 * Reduction + 0x47/0x00, Echo Cancellation, Smart Volume, Mic EQ */
@@ -3918,6 +3911,7 @@ void creative_ae9_cv_apply(struct creative_chip *chip)
 	dev_info(chip->dev, "Voice Clarity %s (Acoustic Echo Cancellation %d, Noise Reduction %d, Smart Volume %d; Mic EQ %s; Voice Morphing %s)\n",
 		 cv->on ? "on" : "off", cv->fx[0], cv->fx[1], cv->fx[2],
 		 cv_miceq[cv->miceq].name, cv_voicefx[cv->voicefx].name);
+	AE9_CALL(chip, fx_lock, chip, false);
 }
 
 /* private_value: 0 master, 1-3 effects, 4 Voice Morphing, 5 Mic EQ */
@@ -4110,8 +4104,9 @@ static const struct snd_kcontrol_new mic_monitor_control = {
 
 int creative_ae9_cv_controls_add(struct creative_chip *chip)
 {
-	snd_ctl_add(chip->card, snd_ctl_new1(&mic_monitor_control, chip));
-	{
+	if (ae9_has(chip, AE9_CAP_MIC_MON))	/* the DSP's mic monitor: the AE-9's */
+		snd_ctl_add(chip->card, snd_ctl_new1(&mic_monitor_control, chip));
+	if (ae9_has(chip, AE9_CAP_MIC_MON)) {
 		struct snd_kcontrol *kc = snd_ctl_new1(&mic_monitor_used_control, chip);
 
 		if (kc)

@@ -2,6 +2,118 @@
 
 Driver for the Creative Sound Blaster AE-9 (out of tree). Pre-releases,
 tested on two cards (IDT bridge `10e3:8111`; ASMedia bridge `1b21:1080` since 0.9.8).
+Since 0.13.0 also the Sound Blaster AE-7, experimental and opt-in (tested on
+one card).
+
+## 0.13.0 (2026-11-25)
+AE-7 experimental: the Sound Blaster AE-7 runs on this driver, opt-in. 🧪
+
+Works with **SbAe9-SBC v0.24.0** and **SbAe9-AudioMon v0.5.0**.
+
+**Big kudos to [s3boun3t](https://github.com/s3boun3t)**: the AE-7 support
+exists because of him. His early AE-7 work in his fork, the Windows
+captures of his card, eleven rounds of test kits and three release
+candidates, each with thorough logs and reports (he also pinned down the
+DKMS bug on clang-built kernels). Thank you! 🙌
+
+- **Sound Blaster AE-7, experimental and opt-in.** The AE-7 (PCI
+  `1102:0010`, subsystem `0x0081`) has the AE-9's DSP chip and uses the
+  same firmware, with its own DAC and Audio Control Module; the driver now
+  has its start-up, outputs and volume as Windows does them on an AE-7.
+  Tested on one card, by [s3boun3t](https://github.com/s3boun3t), through
+  eleven rounds of test kits. On that card:
+  - playback on the headphones (the Audio Control Module) and the Front
+    jack, picked with "Head Unit Output", each keeping its own volume;
+  - DSP mode at 48 kHz; Direct Mode ("Direct Mode Switch") at 44.1, 48,
+    88.2, 96, 192 and 384 kHz, stereo;
+  - a 6-channel stream and "Speaker Config" (2.0 to 5.1) in DSP mode: the
+    front pair is proven, the subwoofer (LFE) channel was felt through
+    the C/Sub jack, **the Rear jack and the C/Sub jack's center channel
+    haven't been confirmed by ear yet**;
+  - "Master Playback Volume" (0-180, -90 to 0 dB in 0.5 dB steps, the
+    DAC's own), "Headphone Gain", "DAC Filter";
+  - a safety gate: the DAC unmutes only after the volume it was sent reads
+    back on both channels;
+  - the mic (the Line-in / Mic-in jack) at 44.1/48/96 kHz with "Capture
+    Volume" and "Mic Gain Capture Volume"; What U Hear at 44.1/48 kHz;
+  - SBX (Surround, Crystalizer, Bass, Dialog Plus, Smart Volume), the EQ,
+    Scout Mode, headphone virtualization; CrystalVoice (Voice Clarity, echo
+    cancellation, noise reduction, mic Smart Volume, Mic EQ, Voice
+    Morphing). On the AE-7 "Headphone Virtualization Switch" stays on
+    (setting it off changes nothing; a mixer snaps back): turn SBX Surround
+    off, or use Direct Mode, for headphones without virtualization, as in
+    Creative's software;
+  - jack detection on the Front, Rear, Headphone / Headset-out and Line-in
+    / Mic-in jacks ("Card ... Plugged", read-only);
+  - reloads, warm reboots and suspend, Windows' recovery cycle included.
+
+  Not yet: Line-In mode, mic monitor, optical out, the LED, DSD64, DSP mode
+  at other rates than 48 kHz, Bass Redirect and the speakers' levels. All
+  of it: [docs/AE7.md](docs/AE7.md).
+- **`ae9-ae7-enable` turns it on.** The packages ship the AE-7's two
+  hand-over files inactive (in `/usr/share/creative-ae9/ae7/`);
+  `sudo ae9-ae7-enable` copies them into `/etc/udev/rules.d/` and
+  `/etc/modprobe.d/`, then you reboot. `--status` shows what's installed and
+  whether an AE-7 is there and bound, `--disable` takes them out again (what
+  the AE-7 gets then: next point), and `--remove-kit-files` clears a test
+  kit's leftovers.
+- **Turning the AE-7 support off doesn't hand an AE-7 with an ASMedia
+  bridge back to the kernel's own driver**, which has hung the PC at boot
+  on every such card reported (most AE-7s from 2022 on). Turning it off
+  (`ae9-ae7-enable --disable`, removing the package with it on,
+  `dkms-install.sh --remove`, `restore-stock-audio.sh`) *parks* such a card,
+  or one behind a bridge the script doesn't recognise: no driver, kept so by
+  `/etc/udev/rules.d/00-ae7-park.rules` and `/etc/modprobe.d/ae7-park.conf`,
+  which stay after the driver is removed. An AE-7 with the older Tsi381
+  bridge goes back to the kernel's driver; `--disable --stock` (and
+  `restore-stock-audio.sh --stock`) hands any AE-7 there on purpose, and
+  `--status` shows each AE-7's bridge ([docs/AE7.md](docs/AE7.md#going-back)).
+- **New module option `ae7`** (0 by default): 0 = an AE-7 handed to the
+  driver is refused, with one line in the kernel log ("Sound Blaster AE-7
+  found: experimental support is off; see docs/AE7.md (run
+  ae9-ae7-enable)"); 1 = the driver runs it. The test kits' 2 to 5 are
+  treated as 1 in this release, with one line in the log.
+- **The AE-7's PipeWire profile** (stereo, 5.1 with Direct Mode off, the
+  mic, What U Hear) and its udev rule are installed for everyone, and act
+  only on an AE-7 this driver runs. The -36 dB safe start volume covers the
+  AE-7 too, and the optional desktop names don't call AE-7 devices "AE-9".
+- **"Card Model" on every card:** a read-only card control with the card's
+  name ("Sound Blaster AE-9" or "Sound Blaster AE-7"), for apps that show a
+  card's own controls (`amixer -c AE9 cget iface=CARD,name='Card Model'`).
+- **The scripts know both cards.** `ae9-reload` and `ae9-full-dump` find
+  the card by its driver (`AE9` or `AE7`); the AE-9-only extras leave an
+  AE-7 alone; `restore-stock-audio.sh` also removes the AE-7 files and any
+  test-kit leftovers, and clears an AE-7's driver override (not a parked
+  one's); it rebuilds the initramfs with the distribution's own tool
+  (update-initramfs or mkinitcpio where there is one; before, dracut only).
+- **For AE-9 owners:** nothing to do. The AE-7 code is now part of every
+  build; on an AE-9 it isn't used, and the AE-9 gets the same commands as
+  with 0.12.17 (checked on an AE-9: every step of a full card session sent
+  the same commands). Card id `AE9`, the same defaults and controls plus
+  "Card Model"; 22 module options (the new `ae7`).
+- **One Creative card per PC** is the supported setup: an AE-9 and an AE-7
+  in one PC haven't been tested together, and some debug and global state
+  is shared between cards (for a later release).
+- **DKMS on a clang-built kernel** (XanMod, CachyOS...) with no plain
+  `clang` installed (Mint with only `clang-21`: "clang: not found"): the
+  build now uses the kernel's own clang version, `clang-21` and `ld.lld-21`
+  on the PATH or `/usr/lib/llvm-21/bin/`, and otherwise stops with the
+  packages to install ([TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#quick-fixes)).
+  GCC-built kernels build as before.
+- **The firmware is unchanged:** `ae9-get-firmware` takes it from
+  Creative's AE-9 installer or from a `CtxHda.sys`, for either card.
+- Tested: on the AE-7, the test kits behind this release on s3boun3t's card
+  (board revision 0x09, ASMedia bridge, Linux Mint 22, XanMod 7.3,
+  WirePlumber 0.4.17, IOMMU on and off): every rate above played clean,
+  0 DAC NACKs and 0 command timeouts in the saved states, What U Hear
+  within 0.1 dB of the source at 48 kHz (0.3 dB low at 44.1 kHz), three
+  suspends back clean, CrystalVoice back after a wake; on the release
+  candidate: DKMS built on five kernels (three of Mint's, and XanMod 7.2
+  and 7.3, which are clang-built) with no local workaround, the subwoofer
+  channel felt through the C/Sub jack, and turning the support off parked
+  the card, live and through a reboot, then gave it back after turning it
+  on again. On the AE-9: the full card session (the same commands as
+  0.12.17) and the release build's checks.
 
 ## 0.12.17 (2026-11-21)
 Under the hood again: sturdier card resets, and a few new readouts. 🔧

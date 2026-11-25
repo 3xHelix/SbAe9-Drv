@@ -19,6 +19,11 @@
 # So with a stream running it needs --playing, and even then it skips the
 # router table and reads only the DSP registers the driver itself reads.
 # ROUTER=1 adds the router table anyway; EXTRA="0x... 0x..." adds addresses.
+# the AE-9 only: on a Sound Blaster AE-7 (experimental) it has nothing to work on
+if [ ! -e /proc/asound/AE9 ] && [ -e /proc/asound/AE7 ]; then
+	echo "ae9-dsp-snapshot: for the AE-9 only; this PC's card is a Sound Blaster AE-7 (for a report: sudo ae9-full-dump --report)" >&2
+	exit 1
+fi
 CMD=/sys/kernel/debug/creative_ae9/cmd
 SAMPLES=${SAMPLES:-4}
 GAP=${GAP:-0.25}

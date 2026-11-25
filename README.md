@@ -6,29 +6,61 @@ An out-of-tree Linux kernel driver for the **Creative Sound Blaster AE-9**
 (CA0132 "Sound Core3D" DSP + its detachable ACM head unit). The kernel's own
 `snd_hda_intel` + `snd_hda_codec_ca0132` drivers don't support this card;
 this one does, by doing what Creative's Windows driver does, step by step.
+Since v0.13.0 it also runs the **Sound Blaster AE-7**, experimental and
+opt-in.
 
-**Latest: v0.12.17** (2026-11-21) · [Changelog](CHANGELOG.md) ·
+**Latest: v0.13.0** (2026-11-25) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
-Pre-releases, tested on two cards.
+Pre-releases, tested on two AE-9s and one AE-7.
 
-## New in v0.12.17: sturdier card resets
+## New in v0.13.0: Sound Blaster AE-7 (experimental)
 
-Another quiet one. It's mostly about the moments the driver resets the card
-(a start-up retry, a resume from sleep), and what it can tell you:
+The AE-7 runs on this driver now: **experimental, opt-in, and tested on one
+card so far** ([s3boun3t](https://github.com/s3boun3t)'s, through eleven
+rounds of test kits). On that card:
 
-- **Nothing in flight during a bus reset:** any stream or command DMA still
-  running is stopped first.
-- **A card that didn't come back is refused cleanly:** after the reset the
-  driver reads the controller's ID registers before it trusts the card.
-- **Driver Health has a 9th number:** DAC commands a DAC refused after
-  start-up. 0 on a healthy card; SbAe9-AudioMon v0.4.11 shows it.
-- **DAC reads are single** now that every DAC command is checked.
+- **Playback** on the headphones and the Front jack, DSP mode at 48 kHz, and
+  **Direct Mode** straight to the DAC at 44.1, 48, 88.2, 96, 192 and
+  384 kHz.
+- **A 5.1 stream and Speaker Config.** The front pair is proven and the
+  subwoofer channel was felt through the C/Sub jack; the Rear jack and the
+  center channel haven't been confirmed by ear yet.
+- **SBX, the EQ, Scout Mode, headphone virtualization and CrystalVoice**,
+  with the AE-9's controls (on the AE-7 the headphone virtualization switch
+  stays on; SBX Surround off or Direct Mode give headphones without it, as in
+  Creative's software).
+- **The mic** (44.1/48/96 kHz), **What U Hear**, jack detection, a DAC that
+  unmutes only after the volume reads back, and clean reloads, reboots and
+  suspend.
 
-Plus a clearer bridge log and new debugfs readouts for the card's DMA FIFO.
-We also tried letting the playback pointer run ahead to cover the DMA's
-read-ahead, and dropped it: on this card it can't be made safe (details in
-the [changelog](CHANGELOG.md)). Nothing to set up, nothing changes in how
-you use it.
+**A huge thank-you to [s3boun3t](https://github.com/s3boun3t)**, who did the
+heavy lifting for the AE-7: his own early AE-7 work in his fork, the Windows
+captures of his card, and eleven rounds of test kits and three release
+candidates run on it, each sent back with careful logs and reports (he
+diagnosed the DKMS bug himself, and made his own subwoofer test file to
+prove the C/Sub jack). This release is his as much as ours. 🙌
+
+Not yet: Line-In mode, mic monitor, optical out, the LED and DSD64. The
+driver leaves an AE-7 alone until you turn it on:
+
+```sh
+sudo ae9-ae7-enable      # then reboot
+```
+
+**Careful:** the kernel's own driver has hung the PC at boot on every AE-7
+with an ASMedia bridge reported so far (most cards from 2022 on).
+[docs/AE7.md](docs/AE7.md#the-asmedia-bridge-and-the-kernels-driver) says
+how to check yours and how to boot a PC that hangs. Turning the AE-7
+support off leaves such a card (or one with a bridge the script doesn't
+know) with no driver instead of handing it back.
+
+Everything else (firmware, checking it works, going back, what to send
+when it doesn't): **[docs/AE7.md](docs/AE7.md)**. AE-7 reports are very
+welcome.
+
+**For AE-9 owners:** nothing to do. Every card now has a read-only "Card
+Model" control (the card's name, for apps), and the driver has a new `ae7`
+option the AE-9 ignores. One Creative card per PC is the supported setup.
 
 ## 💣 Native DSD64, on by default
 
@@ -84,8 +116,9 @@ Creative stops at DSD64 too. Those files still play, as PCM.
 - **[SbAe9-AudioMon](https://github.com/3xHelix/SbAe9-AudioMon)**: level
   meters for every AE-9 input and output, with a debug log.
 
-Driver v0.12.17 works with SbAe9-SBC v0.23.0 and SbAe9-AudioMon v0.4.11. Older
-app versions still work, with fewer controls. Earlier pairings are in the
+Driver v0.13.0 works with **SbAe9-SBC v0.24.0** and
+**SbAe9-AudioMon v0.5.0**. Older app versions still
+work on the AE-9, with fewer controls. Earlier pairings are in the
 [changelog](CHANGELOG.md).
 
 ## Hardware
@@ -98,6 +131,9 @@ app versions still work, with fewer controls. Earlier pairings are in the
 - Tested on Fedora 44 (kernels 7.2 and 7.3) on an AMD system, and the
   packages on Ubuntu 24.04 to 26.10, Debian 13, openSUSE and AlmaLinux 10
   (kernels 6.8 to 7.3). No `iommu=pt` needed.
+- **Sound Blaster AE-7** (experimental, opt-in): PCI `1102:0010`, subsystem
+  `0x0081`. Tested on one card (ASMedia bridge) on Linux Mint 22 with a
+  XanMod 7.3 kernel. See [docs/AE7.md](docs/AE7.md).
 
 To see which bridge your card has:
 
@@ -150,7 +186,7 @@ Download `creative-ae9-dkms_<version>-1_all.deb` from the
 [latest release](https://github.com/3xHelix/SbAe9-Drv/releases), then:
 
 ```sh
-sudo apt install ./creative-ae9-dkms_0.12.17-1_all.deb innoextract
+sudo apt install ./creative-ae9-dkms_0.13.0-1_all.deb innoextract
 ```
 
 Secure Boot: `sudo mokutil --import /var/lib/dkms/mok.pub` once, then
@@ -196,8 +232,9 @@ It installs the DSP image and the AE-9 overlay (checked against the size and
 SHA-256 of the firmware this driver is tested with: `90ba1de2…` and `ecc0740b…`) plus Sound Blaster Command's 32
 headphone profiles. It also takes an unpacked installer folder, the AE-Series
 driver installer on its own, or just `CtxHda.sys` from a Windows install.
-`ae9-get-firmware --check` shows what's installed. (The `ctefx-desktop.bin`
-in linux-firmware is a different image, for the AE-5/AE-7.)
+`ae9-get-firmware --check` shows what's installed. The AE-7 uses the same
+files. (The `ctefx-desktop.bin` in linux-firmware is a different image, for
+the kernel's own driver.)
 
 ## Using it
 
@@ -238,6 +275,7 @@ Known issues and more help: **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 ## More docs
 
 - [docs/USING.md](docs/USING.md): every feature and control.
+- [docs/AE7.md](docs/AE7.md): the Sound Blaster AE-7 (experimental).
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): quick fixes, reporting a problem, known issues.
 - [docs/INSTALL-FROM-SOURCE.md](docs/INSTALL-FROM-SOURCE.md): DKMS/source install, manual firmware, testing a build.
 - [docs/OPTIONS.md](docs/OPTIONS.md): module options.
@@ -259,8 +297,15 @@ This driver stands on other people's work:
   S/PDIF routing, the stream 0x05 setup, the reverse-engineering notes on
   the head unit's serial link, the DAC filters, and the ASMedia bridge's
   register-write lockup (the key to the ASMedia fix).
-- **[s3boun3t/ae9_build](https://github.com/s3boun3t/ae9_build)**: the AE-9
-  MMIO init sequence and the head unit (ACM) init, adapted here.
+- **[s3boun3t](https://github.com/s3boun3t)**
+  ([linux-ae9](https://github.com/s3boun3t/linux-ae9), formerly
+  [ae9_build](https://github.com/s3boun3t/ae9_build)): the AE-9 MMIO init
+  sequence and the head unit (ACM) init, adapted here. Also fixes and
+  suggestions adopted into this driver, the routing questions behind the
+  +30 dB option, side-by-side comparisons and the PipeWire 1.6.8 find. And
+  the AE-7 support: his early AE-7 work in his fork, the Windows captures of
+  his AE-7, and the testing of every AE-7 test kit on his card. Without him
+  there'd be no AE-7 support.
 - **Creative's own CA0132 Linux build** ("0.73_kernel18", GPL), shared with
   the project: the AE-9 output, mic and speaker setup sequences.
 - **Kaiba**: tested the ASMedia-bridge AE-9, round after round, until it

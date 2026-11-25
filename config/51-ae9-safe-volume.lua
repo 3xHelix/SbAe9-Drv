@@ -11,10 +11,11 @@
 -- the output, or, for an output it has none for, its default (-24 dB).
 --
 -- WirePlumber 0.4 can't set that default for one card, only for all of
--- them: with this file, ANY output WirePlumber has no saved volume for
--- starts at -36 dB instead of -24 dB (quieter, never louder). Volumes you
--- set are still saved and restored as usual. Don't want it? Delete it, or
--- override it with your own ~/.config/wireplumber/main.lua.d/51-ae9-safe-volume.lua.
+-- them (the AE-7, experimental, too): with this file, ANY output
+-- WirePlumber has no saved volume for starts at -36 dB instead of -24 dB
+-- (quieter, never louder). Volumes you set are still saved and restored
+-- as usual. Don't want it? Delete it, or override it with your own
+-- ~/.config/wireplumber/main.lua.d/51-ae9-safe-volume.lua.
 --
 -- Volumes here are linear: -36 dB = 10^(-36/20) = 0.0158
 -- (WirePlumber 0.4's own default is 0.4^3 = 0.064, -24 dB).

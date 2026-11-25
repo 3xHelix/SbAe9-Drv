@@ -43,6 +43,12 @@ install -Dm644 "$SRC/config/ae9-modules-load.conf" "$R/usr/lib/modules-load.d/cr
 # PipeWire profile set (stereo duplex + 5.1)
 install -Dm644 "$SRC/config/89-ae9-pipewire.rules" "$R/usr/lib/udev/rules.d/89-ae9-pipewire.rules"
 install -Dm644 "$SRC/config/creative-ae9.conf" "$R/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae9.conf"
+# the Sound Blaster AE-7 (experimental): its profile set, active for an AE-7
+# this driver runs; the opt-in pair inactive until ae9-ae7-enable
+install -Dm644 "$SRC/config/89-ae7-pipewire.rules" "$R/usr/lib/udev/rules.d/89-ae7-pipewire.rules"
+install -Dm644 "$SRC/config/creative-ae7.conf" "$R/usr/share/alsa-card-profile/mixer/profile-sets/creative-ae7.conf"
+install -Dm644 "$SRC/config/ae7/00-ae7-override.rules" "$R/usr/share/creative-ae9/ae7/00-ae7-override.rules"
+install -Dm644 "$SRC/config/ae7/ae7-override.conf" "$R/usr/share/creative-ae9/ae7/ae7-override.conf"
 install -Dm644 "$SRC/config/50-ae9-safe-volume.conf" "$R/usr/share/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf"
 # WirePlumber 0.4 (Ubuntu 24.04, Debian 12) reads Lua, not the .conf; 0.5
 # warns about a .lua: the postinst links it into main.lua.d for 0.4 only
@@ -55,6 +61,7 @@ install -Dm755 "$SRC/scripts/ae9-read-stress.sh" "$R/usr/bin/ae9-read-stress"
 install -Dm755 "$SRC/scripts/ae9-optical-passthrough" "$R/usr/bin/ae9-optical-passthrough"
 install -Dm755 "$SRC/scripts/ae9-reload.sh" "$R/usr/bin/ae9-reload"
 install -Dm755 "$SRC/scripts/ae9-hp-profile" "$R/usr/bin/ae9-hp-profile"
+install -Dm755 "$SRC/scripts/ae9-ae7-enable" "$R/usr/bin/ae9-ae7-enable"
 install -d "$R/usr/share/creative-ae9/examples"
 install -m 644 "$SRC"/extract_firmware.py "$SRC"/extract_overlay.py "$SRC"/extract_hpeq.py "$R/usr/share/creative-ae9/"
 for f in ae9-options.conf 60-ae9-headroom.conf 61-ae9-names.conf ae9-optical-in.conf ae9-what-u-hear.conf ae9-rear-rca-in.conf ae9-clean-mic.conf; do
@@ -70,6 +77,7 @@ gzip -9n "$R/usr/share/doc/$PKG/changelog"
 	echo "$PKG ($VER-1) unstable; urgency=medium"
 	echo
 	echo "  * Driver $VER; upstream changes in changelog.gz."
+	case $VER in 0.13.0) echo "  * Sound Blaster AE-7 support (experimental, opt-in: ae9-ae7-enable)." ;; esac
 	echo
 	echo " -- 3xHelix <86426476+3xHelix@users.noreply.github.com>  $(LC_ALL=C date -R)"
 } | gzip -9n > "$R/usr/share/doc/$PKG/changelog.Debian.gz"
@@ -108,7 +116,8 @@ Description: Creative Sound Blaster AE-9 driver (DKMS)
  Out-of-tree Linux driver for the Creative Sound Blaster AE-9: playback up
  to 384 kHz, 5.1, SBX/DSP effects and EQ, speaker setup, headphone profiles,
  recording, optical in and out, What U Hear and the ACM head unit. Both card
- versions (IDT and ASMedia bridge).
+ versions (IDT and ASMedia bridge). Sound Blaster AE-7 support
+ (experimental, opt-in: ae9-ae7-enable).
  .
  DKMS builds the module for every installed kernel with headers. The DSP
  firmware is Creative's and not included: run ae9-get-firmware with
@@ -163,6 +172,14 @@ case "\$1" in
 remove|upgrade|deconfigure)
 	dkms remove -m $MOD -v $VER --all >/dev/null 2>&1 || true ;;
 esac
+# removal, not upgrade, with the AE-7 opt-in on: turn it off. An AE-7 not
+# behind a Tsi381 bridge (ASMedia: the in-tree driver hangs it), or one not
+# visible right now, is parked; a Tsi381 one goes back to the in-tree driver.
+# The /etc files are ae9-ae7-enable's, not the package's: the park files
+# stay after removal and purge.
+if [ "\$1" = remove ] && { [ -e /etc/modprobe.d/ae7-override.conf ] || [ -e /etc/udev/rules.d/00-ae7-override.rules ]; }; then
+	/usr/bin/ae9-ae7-enable --disable || true
+fi
 exit 0
 EOF
 cat > "$R/DEBIAN/postrm" <<'EOF'

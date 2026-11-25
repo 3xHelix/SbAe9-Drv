@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2026 3xHelix
+# Give the Sound Blaster AE-7 its own PipeWire profile set (stereo, 5.1, mic,
+# What U Hear: config/creative-ae7.conf) when snd-hda-codec-creative-ae9
+# drives it (experimental, opt-in: ae9-ae7-enable). Installed for everyone
+# next to 89-ae9-pipewire.rules: DRIVERS== keeps it off an AE-7 that the
+# in-tree driver (snd_hda_intel + ca0132) runs, whose devices differ.
+SUBSYSTEM=="sound", ACTION=="change", KERNEL=="card*", ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0010", ATTRS{subsystem_device}=="0x0081", DRIVERS=="snd-hda-codec-creative-ae9", ENV{ACP_PROFILE_SET}="creative-ae7.conf"

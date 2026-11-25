@@ -635,7 +635,7 @@ static void ae9_boot_checks_log(struct creative_chip *chip, u32 f05, const int r
  * passes, each checked again. Windows does it every time; we skipped it,
  * and each warm re-start got riskier until the DSP broke (2026-11-09: 0/34
  * bad on the 1st warm re-start, 50 % from the 6th;
- * .tmp/unicorn/reprobe/SUMMARY.md). In since 0.12.4 (the warm_reset option
+ * re-probe test runs, project notes). In since 0.12.4 (the warm_reset option
  * until 0.12.12).
  */
 static void ae9_recovery(struct creative_chip *chip, u32 f05, int ramp[AE9_RAMP_N])
@@ -1655,6 +1655,7 @@ void creative_ae9_predownload(struct creative_chip *chip)
 	int ramp[AE9_RAMP_N];
 	u32 f05;
 
+	AE9_HOOK(chip, predownload, chip);
 	pre_codecs_found(&c);
 	ae9_codec2_wake(chip);
 	pre_codec2_reset(&c);
@@ -2558,3 +2559,6 @@ void creative_ae9_tail_resend(struct creative_chip *chip, struct ae9_tail *t)
 	kfree(t->retry);
 	t->retry = NULL;
 }
+
+/* the AE-7 (experimental): its seq part, on this file's helpers */
+#include "creative_ae7_seq.c"

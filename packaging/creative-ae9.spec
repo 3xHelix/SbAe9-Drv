@@ -6,7 +6,7 @@
 %global srcname SbAe9-Drv
 
 Name:           creative-ae9
-Version:        0.12.17
+Version:        0.13.0
 Release:        1%{?dist}
 Summary:        Creative Sound Blaster AE-9 driver: boot setup, firmware helper, tools
 License:        GPL-2.0-or-later
@@ -35,6 +35,9 @@ Everything around the AE-9 kernel module except the module itself:
   read-only Fedora Atomic systems)
 - ae9-full-dump: the state dump for bug reports
 - ae9-dsp-snapshot, ae9-read-stress: DSP and chip-read checks for reports
+- Sound Blaster AE-7 support (experimental, opt-in: ae9-ae7-enable): the
+  AE-7's PipeWire profile set (only for an AE-7 this driver runs) and the
+  opt-in files ae9-ae7-enable copies to /etc
 
 The firmware itself is Creative's and not included.
 
@@ -50,6 +53,12 @@ install -D -m 644 config/ae9-override.conf %{buildroot}%{_modprobedir}/ae9-overr
 install -D -m 644 config/ae9-omit.conf %{buildroot}%{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
 install -D -m 644 config/ae9-modules-load.conf %{buildroot}%{_prefix}/lib/modules-load.d/creative-ae9.conf
 install -D -m 644 config/creative-ae9.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+# the Sound Blaster AE-7 (experimental): its profile set, active for an AE-7
+# this driver runs; the opt-in pair inactive until ae9-ae7-enable
+install -D -m 644 config/89-ae7-pipewire.rules %{buildroot}%{_udevrulesdir}/89-ae7-pipewire.rules
+install -D -m 644 config/creative-ae7.conf %{buildroot}%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae7.conf
+install -D -m 644 config/ae7/00-ae7-override.rules %{buildroot}%{_datadir}/%{name}/ae7/00-ae7-override.rules
+install -D -m 644 config/ae7/ae7-override.conf %{buildroot}%{_datadir}/%{name}/ae7/ae7-override.conf
 install -D -m 644 config/50-ae9-safe-volume.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
 # no 51-ae9-safe-volume.lua: Fedora's WirePlumber 0.5 reads the .conf and
 # only warns about a .lua ("Old configuration file detected")
@@ -60,6 +69,7 @@ install -D -m 755 scripts/ae9-read-stress.sh %{buildroot}%{_bindir}/ae9-read-str
 install -D -m 755 scripts/ae9-optical-passthrough %{buildroot}%{_bindir}/ae9-optical-passthrough
 install -D -m 755 scripts/ae9-reload.sh %{buildroot}%{_bindir}/ae9-reload
 install -D -m 755 scripts/ae9-hp-profile %{buildroot}%{_bindir}/ae9-hp-profile
+install -D -m 755 scripts/ae9-ae7-enable %{buildroot}%{_bindir}/ae9-ae7-enable
 install -D -m 644 extract_firmware.py %{buildroot}%{_datadir}/%{name}/extract_firmware.py
 install -D -m 644 extract_overlay.py %{buildroot}%{_datadir}/%{name}/extract_overlay.py
 install -D -m 644 extract_hpeq.py %{buildroot}%{_datadir}/%{name}/extract_hpeq.py
@@ -77,6 +87,15 @@ if [ "$1" -eq 1 ]; then
 	echo "(needs innoextract; or point it at CtxHda.sys), then power the PC fully off and on."
 fi
 
+%preun
+# removal, not upgrade, with the AE-7 opt-in on: turn it off. An AE-7 not
+# behind a Tsi381 bridge (ASMedia: the in-tree driver hangs it), or one not
+# visible right now, is parked; a Tsi381 one goes back to the in-tree driver.
+# The /etc files are ae9-ae7-enable's, not ours: the park files stay.
+if [ "$1" -eq 0 ] && { [ -e /etc/modprobe.d/ae7-override.conf ] || [ -e /etc/udev/rules.d/00-ae7-override.rules ]; }; then
+	%{_bindir}/ae9-ae7-enable --disable || :
+fi
+
 %postun
 udevadm control --reload >/dev/null 2>&1 || :
 
@@ -85,10 +104,12 @@ udevadm control --reload >/dev/null 2>&1 || :
 %doc README.md CHANGELOG.md docs
 %{_udevrulesdir}/00-ae9-override.rules
 %{_udevrulesdir}/89-ae9-pipewire.rules
+%{_udevrulesdir}/89-ae7-pipewire.rules
 %{_modprobedir}/ae9-override.conf
 %{_prefix}/lib/dracut/dracut.conf.d/ae9-omit.conf
 %{_prefix}/lib/modules-load.d/creative-ae9.conf
 %{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae9.conf
+%{_datadir}/alsa-card-profile/mixer/profile-sets/creative-ae7.conf
 %dir %{_datadir}/wireplumber
 %dir %{_datadir}/wireplumber/wireplumber.conf.d
 %{_datadir}/wireplumber/wireplumber.conf.d/50-ae9-safe-volume.conf
@@ -99,9 +120,25 @@ udevadm control --reload >/dev/null 2>&1 || :
 %{_bindir}/ae9-optical-passthrough
 %{_bindir}/ae9-reload
 %{_bindir}/ae9-hp-profile
+%{_bindir}/ae9-ae7-enable
 %{_datadir}/%{name}/
 
 %changelog
+* Wed Nov 25 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.13.0-1
+- Driver 0.13.0 "AE-7 experimental": Sound Blaster AE-7 support
+  (experimental, opt-in: ae9-ae7-enable). With it on, the driver runs an
+  AE-7 (ae7=1): stereo and 5.1 playback, DSP mode at 48 kHz, Direct Mode
+  at 44.1-384 kHz, mic, What U Hear, SBX and CrystalVoice. Off by default:
+  an AE-7 stays with the in-tree driver until ae9-ae7-enable is run. Off
+  again (--disable, or package removal with it on), an AE-7 with an ASMedia
+  bridge, or one the script doesn't recognise, is left with no driver
+  (parked): the in-tree driver hangs ASMedia AE-7s at boot. New read-only
+  "Card Model" control on every card. The AE-7's PipeWire
+  profile set and udev rule are installed for everyone (they match only
+  an AE-7 this driver runs); its opt-in files go to
+  /usr/share/creative-ae9/ae7/. ae9-reload and ae9-full-dump work on
+  either card; the AE-9-only tools leave an AE-7 alone.
+
 * Sat Nov 21 2026 3xHelix <86426476+3xHelix@users.noreply.github.com> - 0.12.17-1
 - Driver 0.12.17: DAC register reads are single (0.12.16's status checks
   made the triple read unnecessary); Driver Health has a 9th value, late

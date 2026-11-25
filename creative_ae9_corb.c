@@ -370,6 +370,7 @@ static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
 	creative_ae9_vlog(res, fl, true);
 	if ((fl & 0xf) == 1 && ((res >> 21) & 0x1f) == 0x16)
 		atomic_inc(&chip->scp_unsol);
+	AE9_CALL(chip, unsol, chip, res, fl);
 }
 
 /*

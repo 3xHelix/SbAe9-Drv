@@ -13,6 +13,11 @@
 # Reading the chip while audio plays can freeze the audio until a full
 # power-off (2026-11-07: router reads during playback killed codec 1), so
 # with a stream running it needs --playing.
+# the AE-9 only: on a Sound Blaster AE-7 (experimental) it has nothing to work on
+if [ ! -e /proc/asound/AE9 ] && [ -e /proc/asound/AE7 ]; then
+	echo "ae9-read-stress: for the AE-9 only; this PC's card is a Sound Blaster AE-7 (for a report: sudo ae9-full-dump --report)" >&2
+	exit 1
+fi
 CMD=/sys/kernel/debug/creative_ae9/cmd
 PLAYING_OK=0
 [ "${1:-}" = --playing ] && { PLAYING_OK=1; shift; }

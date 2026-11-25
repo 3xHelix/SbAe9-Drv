@@ -37,7 +37,8 @@ want_for() {	# headroom for a rate: the first tier at or above it
 	echo "$last"
 }
 
-# the AE-9 analog output node (stereo or 5.1 profile): "id name headroom",
+# the AE-9 analog output node (stereo or 5.1 profile; never a Sound Blaster
+# AE-7's, which this isn't measured for): "id name headroom",
 # where headroom is what PipeWire uses now (while open). Since 0.12 the
 # optical output is an AE-9 sink too, so match the analog one by name
 # (as 61-ae9-names.conf does); without the card profile set, take the
@@ -50,6 +51,7 @@ try:
     for o in json.load(sys.stdin):
         p = (o.get("info") or {}).get("props") or {}
         if (p.get("alsa.driver_name") != "snd_hda_codec_creative_ae9"
+                or p.get("alsa.card_name") != "Sound Blaster AE-9"
                 or p.get("media.class") != "Audio/Sink"):
             continue
         name = p.get("node.name") or ""
@@ -79,6 +81,9 @@ force_rate() {
 }
 
 say "table: $TABLE"
+# the AE-9 only (HW and node_info): with only an AE-7 it idles, as with no card
+[ -e /proc/asound/AE9 ] || [ ! -e /proc/asound/AE7 ] ||
+	say "this PC's card is a Sound Blaster AE-7: nothing to do (the AE-9 only)"
 preset=""	# "node-id value" we preset for the forced rate while idle
 seen=""		# rate of the open we last checked
 tick=0

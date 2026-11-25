@@ -1,9 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (c) 2026 3xHelix
-# Reload the AE-9 driver in one go: stop what holds the card (PipeWire,
-# WirePlumber, the AE-9 helper services, alsa-state), unload and load the
-# driver, wait for the card, start everything again. For a card that
+# Reload the AE-9 driver in one go (a Sound Blaster AE-7 on it too: the
+# card is found by its driver, ALSA id AE9 or AE7): stop what holds the card
+# (PipeWire, WirePlumber, the AE-9 helper services, alsa-state), unload and
+# load the driver, wait for the card, start everything again. For a card that
 # "stopped answering", or to pick up new driver options. Packaged as
 # ae9-reload.
 #
@@ -39,7 +40,7 @@ for a in "$@"; do
 	case $a in
 	--check) CHECK=1 ;;
 	--force) FORCE=1 ;;
-	-h|--help) sed -n '4,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
 	esac
 done
@@ -94,12 +95,24 @@ pw_restore() {	# once PipeWire answers again (up to 10 s)
 	echo "PipeWire settings set again: ${pw_saved[*]}"
 }
 
-card_nodes() {	# the AE-9's device files, while its card exists
-	local c; c=$(readlink /proc/asound/AE9 2>/dev/null) || return
-	c=${c#card}
+card_sys() {	# the sound card our driver registered (/sys/class/sound/cardN)
+	local c
+	for c in /sys/class/sound/card[0-9]*; do
+		[ "$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)")" = "$MOD" ] || continue
+		echo "$c"; return 0
+	done
+	return 1
+}
+card_id() {	# its ALSA id: AE9, or AE7 for a Sound Blaster AE-7
+	local c; c=$(card_sys) || return 1
+	cat "$c/id"
+}
+card_nodes() {	# the card's device files, while it exists
+	local c; c=$(card_sys) || return
+	c=${c##*/card}
 	ls /dev/snd/controlC"$c" /dev/snd/pcmC"$c"D* /dev/snd/hwC"$c"D* 2>/dev/null
 }
-holders() {	# processes holding the AE-9 (fuser -v lines), none = empty
+holders() {	# processes holding the card (fuser -v lines), none = empty
 	local n; n=$(card_nodes); [ -n "$n" ] || return 0
 	local f=fuser	# without sudo, only your own processes show
 	[ -z "$SU" ] || ! sudo -n true 2>/dev/null || f="sudo fuser"
@@ -109,7 +122,7 @@ holders() {	# processes holding the AE-9 (fuser -v lines), none = empty
 
 if [ $CHECK = 1 ]; then
 	[ -d "$SYSMOD" ] && echo "driver: $(cat $SYSMOD/version 2>/dev/null) loaded" || echo "driver: not loaded"
-	[ -e /proc/asound/AE9 ] && echo "card: registered" || echo "card: not registered"
+	id=$(card_id) && echo "card: registered ($id)" || echo "card: not registered"
 	h=$(holders); echo "holding the card:"; echo "${h:-  nothing}"
 	exit 0
 fi
@@ -166,7 +179,7 @@ fi
 
 h=$(holders)
 if [ -n "$h" ] && [ $FORCE = 0 ]; then
-	echo "Still holding the AE-9 (close these, or use --force):"; echo "$h"
+	echo "Still holding the card (close these, or use --force):"; echo "$h"
 	restart; exit 1
 fi
 
@@ -179,9 +192,35 @@ fi
 echo "loading the driver (the card's start-up takes 10-25 s)..."
 $SU modprobe $MOD || { echo "modprobe $MOD failed" >&2; restart; exit 1; }
 
+# An AE-7 with its support off (parked, or never turned on) gets no card:
+# the driver leaves it alone on purpose. Without an AE-9 there's nothing
+# to wait for, and nothing for a power-off to fix.
+ae7_off=0
+if [ "$(cat "$SYSMOD/parameters/ae7" 2>/dev/null)" = 0 ]; then
+	n9=0; n7=0
+	for d in /sys/bus/pci/devices/*; do
+		[ "$(cat "$d/vendor" 2>/dev/null):$(cat "$d/device" 2>/dev/null)" = 0x1102:0x0010 ] || continue
+		case $(cat "$d/subsystem_device" 2>/dev/null) in
+		0x0071) n9=$((n9 + 1)) ;;
+		0x0081) n7=$((n7 + 1)) ;;
+		esac
+	done
+	[ $n9 = 0 ] && [ $n7 -gt 0 ] && ae7_off=1
+fi
+if [ $ae7_off = 1 ]; then
+	restart
+	cat >&2 <<'MSG'
+The driver is loaded, but its AE-7 support is off, so it leaves the AE-7
+alone (no card). That's on purpose, not a fault: see
+  ae9-ae7-enable --status
+and docs/AE7.md to turn the support on (sudo ae9-ae7-enable, then reboot).
+MSG
+	exit 1
+fi
+
 ok=0
 for ((i = 0; i < WAIT; i++)); do
-	if [ -e /proc/asound/AE9 ]; then ok=1; break; fi
+	if card_id >/dev/null; then ok=1; break; fi
 	if $SU journalctl -k --since "@$t" --no-pager -o cat 2>/dev/null | \
 	   grep -q 'creative-ae9.*\(not registering the card\|probe with driver .* failed\)'; then
 		break
@@ -191,8 +230,9 @@ done
 restart
 
 if [ $ok = 1 ]; then
-	ans=$(amixer -c AE9 cget name='Card Answering' 2>/dev/null | sed -n 's/.*: values=//p')
-	echo "done: driver $(cat $SYSMOD/version 2>/dev/null), card back${ans:+ (Card Answering: $ans)}"
+	id=$(card_id)
+	ans=$(amixer -c "$id" cget name='Card Answering' 2>/dev/null | sed -n 's/.*: values=//p')
+	echo "done: driver $(cat $SYSMOD/version 2>/dev/null), card $id back${ans:+ (Card Answering: $ans)}"
 else
 	cat >&2 <<'MSG'
 The driver loaded, but the card didn't start (its DSP stayed busy).
